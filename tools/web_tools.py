@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 网页工具 —— 让 Agent 能搜索互联网和读取网页内容
 
@@ -16,10 +17,13 @@
 """
 
 import re
+import logging
 import requests
 from typing import Optional
 from urllib.parse import urlparse
 from .base_tool import BaseTool
+
+logger = logging.getLogger('hello_agent')
 
 
 # ============================================================
@@ -225,6 +229,7 @@ class WebFetchTool(BaseTool):
         except requests.ConnectionError:
             return f"❌ 无法连接: {url}"
         except Exception as e:
+            logger.error(f"请求失败: {e}", exc_info=True)
             return f"❌ 请求失败: {type(e).__name__}: {e}"
 
         # ---- 3. 检测编码 ----

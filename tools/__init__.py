@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 tools 包 —— Agent 工具系统
 

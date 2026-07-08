@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 core 包 —— Agent 核心组件
 

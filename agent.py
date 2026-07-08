@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Agent 主程序 —— 把 LLM + 工具串起来的"智能体指挥官"
 
@@ -32,9 +33,11 @@ import sys
 import platform
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
+import logging
 
 from core import HelloAgentsLLM
 from core.debug import (
+    logger, setup_logging,
     set_debug, is_debug,
     log_messages, log_llm_response,
     log_tool_call, log_tool_result,
@@ -335,6 +338,7 @@ class Agent:
                 f"{json.dumps(tool.parameters, ensure_ascii=False, indent=2)}"
             )
         except Exception as e:
+            logger.error(f"工具 '{tool_name}' 执行失败: {e}", exc_info=True)
             return f"❌ 工具出错: {type(e).__name__}: {e}"
 
     # ============================================================
@@ -343,14 +347,6 @@ class Agent:
 
     # ============================================================
     # 对话历史管理
-    # ============================================================
-
-    def clear_history(self):
-        """清空对话历史，但保留系统提示词"""
-        self.messages = []
-
-    # ============================================================
-    # 核心运行方法
     # ============================================================
 
     def run(self, user_input: str, verbose: bool = True) -> str:
@@ -392,8 +388,14 @@ class Agent:
             log_messages(step, self.messages, f"第 {step} 步 → 发送给 LLM")
 
             # --- 调用 LLM ---
-            response = self.llm.think(self.messages, temperature=0)
+            try:
+                response = self.llm.think(self.messages, temperature=0)
+            except Exception as e:
+                logger.error(f"LLM 调用失败: {e}", exc_info=True)
+                return f"❌ LLM 调用失败: {e}"
+
             if not response:
+                logger.warning("LLM 返回空响应")
                 return "❌ LLM 调用失败"
 
             # 调试：打印 LLM 返回
@@ -474,37 +476,62 @@ class Agent:
     def stream_run(self, user_input: str):
         """逐步输出 Agent 的思考过程"""
         max_steps = self.max_steps
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": user_input},
-        ]
+        
+        # 初始化对话历史
+        if not self.messages:
+            self.messages.append({"role": "system", "content": self.system_prompt})
+        self.messages.append({"role": "user", "content": user_input})
+        
         yield f"🤖 {self.name}（最大 {max_steps} 步）\n"
         for step in range(1, max_steps + 1):
             yield f"\n── 第 {step}/{max_steps} 步 ──\n"
-            response = self.llm.think(messages, temperature=0)
+            
+            try:
+                response = self.llm.think(self.messages, temperature=0)
+            except Exception as e:
+                logger.error(f"LLM 调用失败: {e}", exc_info=True)
+                yield f"❌ LLM 调用失败: {e}\n"
+                return
+            
             if not response:
                 yield "❌ LLM 调用失败\n"
                 return
             parsed = parse_react_response(response)
             if parsed["thought"]:
                 yield f"💭 {parsed['thought']}\n"
-            if parsed["final_answer"] and not parsed["action"]:
+            
+            actions = parsed.get("actions", [])
+            
+            # 如果有最终答案且没有待执行的工具
+            if parsed["final_answer"] and not actions:
                 yield f"\n✅ {parsed['final_answer']}\n"
                 return
-            if parsed["action"]:
-                tool_name = parsed["action"]
-                input_str = parsed["action_input"] or "{}"
+            
+            # 如果有工具调用
+            if actions:
+                # 流式模式只执行第一个工具
+                action = actions[0]
+                tool_name = action["name"]
+                input_str = action.get("input", "{}")
                 yield f"🛠️  {TAG_ACTION}: {tool_name}\n"
-                observation = self._execute_tool(tool_name, input_str)
+                
+                try:
+                    observation = self._execute_tool(tool_name, input_str)
+                except Exception as e:
+                    logger.error(f"工具执行失败: {e}", exc_info=True)
+                    observation = f"工具执行失败: {e}"
+                
                 yield f"📊 {observation[:500]}\n"
 
-                messages.append({"role": "assistant", "content": response})
-                messages.append({
+                self.messages.append({"role": "assistant", "content": response})
+                self.messages.append({
                     "role": "user",
                     "name": "tool_result",
                     "content": self._format_tool_result(tool_name, input_str, observation),
                 })
             else:
+                # 没有工具调用，直接返回响应
+                self.messages.append({"role": "assistant", "content": response.strip()})
                 yield f"💬 {response}\n"
                 return
         yield f"\n⚠️ 已达最大步数 {max_steps}\n"
@@ -524,6 +551,9 @@ def create_agent(
     debug: bool = False,
 ) -> Agent:
     """一行创建 Agent（含 read/write/edit/grep/glob/bash + search/web_fetch）"""
+    # 初始化日志系统
+    setup_logging(debug=debug)
+
     if debug:
         set_debug(True)
     llm = HelloAgentsLLM(model=model, api_key=api_key, base_url=base_url)

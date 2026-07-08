@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 内置工具实现 —— Agent CLI 基础工具集
 
@@ -37,10 +38,13 @@ import sys
 import platform
 import shutil
 import subprocess
+import logging
 import requests
 from pathlib import Path
 from typing import List
 from .base_tool import BaseTool
+
+logger = logging.getLogger('hello_agent')
 
 
 # ============================================================
@@ -199,6 +203,7 @@ class ReadTool(BaseTool):
         except PermissionError:
             return f"❌ 权限不足：无法读取文件 -> {file_path}"
         except Exception as e:
+            logger.error(f"读取文件失败: {e}", exc_info=True)
             return f"❌ 读取文件失败: {type(e).__name__}: {e}"
 
 
@@ -272,6 +277,7 @@ class WriteTool(BaseTool):
         except IsADirectoryError:
             return f"❌ 错误：{file_path} 是一个目录，无法写入"
         except Exception as e:
+            logger.error(f"写入文件失败: {e}", exc_info=True)
             return f"❌ 写入文件失败: {type(e).__name__}: {e}"
 
 
@@ -368,6 +374,7 @@ class EditTool(BaseTool):
         except PermissionError:
             return f"❌ 权限不足：无法修改文件 -> {file_path}"
         except Exception as e:
+            logger.error(f"编辑文件失败: {e}", exc_info=True)
             return f"❌ 编辑文件失败: {type(e).__name__}: {e}"
 
 
@@ -514,6 +521,7 @@ class GrepTool(BaseTool):
             return "\n".join(parts)
 
         except Exception as e:
+            logger.error(f"搜索失败: {e}", exc_info=True)
             return f"❌ 搜索失败: {type(e).__name__}: {e}"
 
 
@@ -621,6 +629,7 @@ class GlobTool(BaseTool):
             return "\n".join(parts)
 
         except Exception as e:
+            logger.error(f"文件查找失败: {e}", exc_info=True)
             return f"❌ 文件查找失败: {type(e).__name__}: {e}"
 
 
@@ -806,6 +815,7 @@ class BashTool(BaseTool):
         except OSError as e:
             return f"❌ 系统错误: {e}"
         except Exception as e:
+            logger.error(f"命令执行异常: {e}", exc_info=True)
             return f"❌ 命令执行异常: {type(e).__name__}: {e}"
 
 
@@ -864,6 +874,7 @@ class CalculatorTool(BaseTool):
         except SyntaxError:
             return f"❌ 表达式语法错误: {expression}"
         except Exception as e:
+            logger.error(f"计算失败: {e}", exc_info=True)
             return f"❌ 计算失败: {e}"
 
     def _safe_eval(self, node, funcs):
@@ -1140,6 +1151,7 @@ class PythonTool(BaseTool):
         except subprocess.TimeoutExpired:
             return "⏰ Python 执行超时（15 秒）"
         except Exception as e:
+            logger.error(f"Python 执行失败: {e}", exc_info=True)
             return f"❌ Python 执行失败: {e}"
 
 
@@ -1224,6 +1236,7 @@ class HttpTool(BaseTool):
         except json.JSONDecodeError:
             return f"❌ JSON 解析失败: {url}"
         except Exception as e:
+            logger.error(f"请求失败: {e}", exc_info=True)
             return f"❌ 请求失败: {type(e).__name__}: {e}"
 
 

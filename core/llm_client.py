@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 LLM 客户端模块 —— 与各种大语言模型 API 通信的核心组件
 
@@ -33,11 +34,14 @@ LLM 客户端模块 —— 与各种大语言模型 API 通信的核心组件
 """
 
 import os
+import logging
 from pathlib import Path
 from typing import List, Dict, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
+
+logger = logging.getLogger('hello_agent')
 
 
 # ============================================================
@@ -261,7 +265,7 @@ class HelloAgentsLLM:
         """
         # 显示调用信息（区分本地/云端）
         mode_tag = "🏠 本地" if self.llm_type == "local" else "☁️ 云端"
-        print(f"  ▶ {mode_tag} {self.model}（{self.base_url}）")
+        logger.info(f"▶ {mode_tag} {self.model}（{self.base_url}）")
 
         try:
             response = self.client.chat.completions.create(
@@ -278,9 +282,10 @@ class HelloAgentsLLM:
                     if not chunk.choices:
                         continue
                     content = chunk.choices[0].delta.content or ""
+                    # 流式输出直接打印到控制台（不使用 logging）
                     print(content, end="", flush=True)
                     collected.append(content)
-                print()
+                print()  # 换行
                 return "".join(collected)
             else:
                 # ---- 非流式模式 ----
@@ -288,7 +293,7 @@ class HelloAgentsLLM:
                 return content
 
         except Exception as e:
-            print(f"\n  ❌ LLM 调用失败: {type(e).__name__}: {e}")
+            logger.error(f"LLM 调用失败: {type(e).__name__}: {e}", exc_info=True)
             return None
 
     # ============================================================
