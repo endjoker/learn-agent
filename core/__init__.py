@@ -10,7 +10,9 @@ core 包 —— Agent 核心组件
 """
 
 from .llm_client import HelloAgentsLLM
+from .system_prompt import SystemPrompt
 
 __all__ = [
     "HelloAgentsLLM",
+    "SystemPrompt",
 ]

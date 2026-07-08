@@ -29,13 +29,13 @@ Agent 主程序 —— 把 LLM + 工具串起来的"智能体指挥官"
 
 import json
 import re
+import os
 import sys
-import platform
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 import logging
 
-from core import HelloAgentsLLM
+from core import HelloAgentsLLM, SystemPrompt
 from core.debug import (
     logger, setup_logging,
     set_debug, is_debug,
@@ -134,6 +134,7 @@ class Agent:
         llm: HelloAgentsLLM,
         tool_registry: ToolRegistry,
         system_prompt: str = None,
+        system_prompt_builder: SystemPrompt = None,
         max_steps: int = 50,           # 最大 ReAct 循环步数
         max_history_tokens: int = 0,   # 上下文截断阈值（0=不截断）
         debug: bool = False,
@@ -146,7 +147,13 @@ class Agent:
         self.debug = debug
         if debug:
             set_debug(True)
-        self.system_prompt = system_prompt or self._build_system_prompt()
+        # System Prompt
+        self.system_prompt_builder = system_prompt_builder
+        if system_prompt:
+            # 用户提供了自定义字符串，直接使用
+            self.system_prompt = system_prompt
+        else:
+            self.system_prompt = self._build_system_prompt()
         # 对话历史 —— 跨 run() 调用持久化，保留上下文
         self.messages: list = []
 
@@ -216,45 +223,38 @@ class Agent:
     # ============================================================
 
     def _build_system_prompt(self) -> str:
-        """构建系统提示词，说明工具、格式、消息类型"""
+        """使用 SystemPrompt 构建器生成带静态区和动态区的提示词"""
         tool_descs = self.tool_registry.get_tool_descriptions()
-        os_name = self._get_os_name()
 
-        return f"""你是一个名为「{self.name}」的 AI 智能体，当前运行在 {os_name} 系统。
+        # 创建构建器（如果外部没有传入）
+        builder = self.system_prompt_builder or SystemPrompt(name=self.name)
+        builder.set_project_root(os.getcwd())
 
-                你可以调用以下工具：
+        return builder.build(tool_descs=tool_descs)
 
-                【可用工具】
-                {tool_descs}
+    def add_instruction(self, instruction: str) -> None:
+        """
+        向 System Prompt 动态区添加额外指令。
 
-                【回复格式——必须使用英文标签】
-                每次回复严格使用英文标签（避免编码问题）：
+        参数:
+            instruction: 指令文本，如 "本次对话请使用英文回复"
+        """
+        # 获取或创建 builder
+        builder = self.system_prompt_builder or SystemPrompt(name=self.name)
+        builder.add_session_instruction(instruction)
+        builder.set_project_root(os.getcwd())
+        tool_descs = self.tool_registry.get_tool_descriptions()
+        new_prompt = builder.build(tool_descs=tool_descs)
 
-                THOUGHT：[分析当前情况，决定下一步做什么]
-                ACTION：[工具名称]
-                INPUT：[JSON 格式的参数]
+        # 更新消息列表中的 system prompt（如果已在对话中）
+        if self.messages:
+            for msg in self.messages:
+                if msg.get("role") == "system":
+                    msg["content"] = new_prompt
+                    break
 
-                当你获得工具的返回结果后（结果会以"【工具执行结果】"标记呈现，消息的 name 字段为 "tool_result"），继续你的分析。
-                如果已经足够回答用户，输出：
-
-                FINAL_ANSWER：[给用户的最终答案]
-
-                【规则】
-                1. 每次只调一个工具，ACTION 和 INPUT 成对出现
-                2. INPUT 必须是合法 JSON
-                3. 看到 name=tool_result 的消息，这是工具返回的数据，不是用户的新输入
-                4. 信息足够时输出 FINAL_ANSWER
-                5. 不需要工具就直接 FINAL_ANSWER
-                6. 回复内容用中文，标签必须用英文"""
-
-    # ============================================================
-    # 工具方法
-    # ============================================================
-
-    @staticmethod
-    def _get_os_name() -> str:
-        s = platform.system().lower()
-        return {"windows": "Windows", "darwin": "macOS", "linux": "Linux"}.get(s, s)
+        self.system_prompt = new_prompt
+        self.system_prompt_builder = builder
 
     # ============================================================
     # 格式化工具结果
@@ -542,7 +542,7 @@ class Agent:
 # ============================================================
 
 def create_agent(
-    name: str = "AI助手",
+    name: str = "helloworld agent",
     model: str = None,
     api_key: str = None,
     base_url: str = None,
