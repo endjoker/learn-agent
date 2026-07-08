@@ -57,18 +57,22 @@ TAG_ACTION = "ACTION"
 TAG_INPUT = "INPUT"
 TAG_FINAL = "FINAL_ANSWER"
 
-# 正则匹配 THOUGHT
+# 正则匹配 THOUGHT（不区分大小写）
 _THOUGHT_RE = re.compile(
     rf"(?:{TAG_THOUGHT}|思考)[：:]\s*(.*?)"
     rf"(?=\n*(?:{TAG_ACTION}|行动)[：:]|\n*(?:{TAG_FINAL}|最终回答)[：:]|$)",
-    re.DOTALL
+    re.DOTALL | re.IGNORECASE
 )
 
-# 正则匹配 ACTION + INPUT（用 findall 捕获全部）
+# 正则匹配 ACTION + INPUT（用 findall 捕获全部，不区分大小写）
+# INPUT 使用前瞻边界匹配，支持嵌套 JSON
 _ACTION_RE = re.compile(
-    rf"(?:{TAG_ACTION}|行动)[：:]\s*(\w+)\s*(?:\n|$)"
-    rf"(?:\s*(?:{TAG_INPUT}|输入)[：:]\s*(\{{.*?\}})\s*)?",
-    re.DOTALL
+    rf"(?:{TAG_ACTION}|行动)[：:]\s*\[?(\w+)\]?\s*(?:\n|$)"
+    rf"(?:\s*(?:{TAG_INPUT}|输入)[：:]\s*"
+    rf"(.+?)"
+    rf"(?=\s*(?:\n(?:{TAG_ACTION}|行动)[：:]|\n(?:{TAG_FINAL}|最终回答)[：:]|$))"
+    rf")?",
+    re.DOTALL | re.IGNORECASE
 )
 
 
@@ -81,11 +85,11 @@ def parse_react_response(response: str) -> dict:
     # 1. FINAL_ANSWER
     final_answer = None
     m = re.search(
-        rf"(?:{TAG_FINAL}|最终回答)[：:]\s*(.*?)$",
-        response, re.DOTALL
+        rf"(?:{TAG_FINAL}|最终回答)[：:]\s*(.*)",
+        response, re.DOTALL | re.IGNORECASE
     )
     if m:
-        final_answer = m.group(1).strip()
+        final_answer = m.group(1).strip().rstrip('\n')
 
     # 2. 所有 THOUGHT
     thought = None
@@ -286,28 +290,39 @@ class Agent:
         合并多个工具的执行结果为一个消息
 
         参数:
-            results: [(tool_name, tool_input, observation), ...]
+            results: [(tool_name, tool_input, observation, is_error), ...]
 
         返回:
             合并后的格式化文本
         """
         if len(results) == 1:
             # 单个工具直接走原有格式
-            name, inp, obs = results[0]
+            name, inp, obs, _ = results[0]
             return Agent._format_tool_result(name, inp, obs)
 
-        parts = [f"【批量工具执行结果】（共 {len(results)} 个工具）", ""]
-        for i, (name, inp, obs) in enumerate(results, 1):
-            MAX_OBS = 3000
+        # 统计
+        ok_count = sum(1 for _, _, _, err in results if not err)
+        fail_count = sum(1 for _, _, _, err in results if err)
+
+        parts = [f"【批量工具执行结果】共 {len(results)} 个工具"]
+        if ok_count:
+            parts[0] += f"，✅ {ok_count} 个成功"
+        if fail_count:
+            parts[0] += f"，❌ {fail_count} 个失败"
+        parts.append("")
+
+        for i, (name, inp, obs, is_error) in enumerate(results, 1):
+            MAX_OBS = 5000
             if len(obs) > MAX_OBS:
-                obs = obs[:MAX_OBS] + f"\n……（截断，共 {len(obs)} 字符）"
-            parts.append(f"  ─── 第 {i} 个工具: {name} ───")
+                obs = obs[:MAX_OBS + 100] + f"\n……（截断，共 {len(obs)} 字符）"
+            mark = "❌" if is_error else "✅"
+            parts.append(f"  ─── 工具 {i}/{len(results)}: {mark} {name} ───")
             parts.append(f"  输入: {inp[:200]}")
             parts.append(f"  返回:\n{obs}")
             parts.append("")
 
         parts.append("【批量执行完毕】\n\n"
-                     "以上是所有工具的执行结果，请综合分析后继续。\n"
+                     "以上是所有工具的执行结果（✅ 成功 / ❌ 失败），请综合分析后继续。\n"
                      "信息足够 → FINAL_ANSWER；需要更多 → 继续 ACTION + INPUT")
         return "\n".join(parts)
 
@@ -409,8 +424,15 @@ class Agent:
             parsed = parse_react_response(response)
             actions = parsed.get("actions", [])
 
+            # 调试：打印解析结果
+            log_info(
+                f"解析结果: actions={len(actions)}, "
+                f"final_answer={'有' if parsed['final_answer'] else '无'}"
+            )
+
             # --- FINAL_ANSWER（仅在没有待执行的工具时返回） ---
-            if parsed["final_answer"] and not actions:
+            if parsed["final_answer"] and not action:
+                log_info("→ 走 FINAL_ANSWER 分支")
                 self.messages.append({"role": "assistant", "content": parsed["final_answer"]})
                 if verbose:
                     print(f"\n  ✅ 结论（{step} 步）")
@@ -419,6 +441,7 @@ class Agent:
 
             # --- 批量 ACTION（支持多个工具并发执行） ---
             if actions:
+                log_info(f"→ 走 ACTIONS 分支: {len(actions)} 个工具")
                 n = len(actions)
 
                 if verbose:
@@ -438,17 +461,31 @@ class Agent:
                     }
                     for future in as_completed(future_map):
                         action = future_map[future]
-                        obs = future.result()
-                        results.append((action["name"], action["input"], obs))
+                        try:
+                            obs = future.result()
+                            is_error = obs.startswith("❌")
+                        except Exception as e:
+                            obs = f"❌ 工具执行异常: {type(e).__name__}: {e}"
+                            is_error = True
+                        results.append((action["name"], action["input"], obs, is_error))
+
+                # 统计成功/失败
+                ok_count = sum(1 for _, _, _, err in results if not err)
+                fail_count = sum(1 for _, _, _, err in results if err)
 
                 # 调试：打印每个工具返回
-                for name, _, obs in results:
+                for name, _, obs, _ in results:
                     log_tool_result(step, name, obs)
 
                 if verbose:
-                    for name, _, obs in results:
+                    status = f"✅ {ok_count} 成功" if ok_count else ""
+                    if fail_count:
+                        status += f"，❌ {fail_count} 失败" if status else f"❌ {fail_count} 失败"
+                    print(f"  📊 执行完毕: {status}")
+                    for name, _, obs, is_err in results:
                         short = obs[:200].replace("\n", " ")
-                        print(f"  📊 {name} → {short}{'...' if len(obs) > 200 else ''}")
+                        prefix = "❌" if is_err else "✅"
+                        print(f"    {prefix} {name} → {short}{'...' if len(obs) > 200 else ''}")
 
                 # ====== 只添加一条 assistant + 一条合并的 tool_result ======
                 self.messages.append({"role": "assistant", "content": response})
@@ -459,10 +496,15 @@ class Agent:
                 })
 
             else:
+                log_info("→ 走 ELSE 分支（无 Action 无 FinalAnswer）")
                 if verbose:
-                    print(f"  💬 直接回复")
-                self.messages.append({"role": "assistant", "content": response.strip()})
-                return response.strip()
+                    print(f"  💬 直接回复（无标签）")
+                # 无标签时仍将 LLM 回复作为最终答案返回
+                answer = response.strip()
+                self.messages.append({"role": "assistant", "content": answer})
+                if verbose:
+                    print(f"  🤖 {answer}")
+                return answer
 
         return (
             f"⚠️ 已达最大步数（{max_steps} 步），任务可能未完成。\n"
