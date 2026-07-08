@@ -12,7 +12,7 @@
     registry.register_tool(WebFetchTool())
 
 依赖：
-    pip install duckduckgo_search requests beautifulsoup4
+    pip install ddgs requests beautifulsoup4
 """
 
 import re
@@ -70,11 +70,11 @@ class WebSearchTool(BaseTool):
 
         # 源 1：DuckDuckGo
         try:
-            from duckduckgo_search import DDGS
+            from ddgs import DDGS
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=max_results))
         except ImportError:
-            errors.append("duckduckgo_search 未安装")
+            errors.append("ddgs 未安装 (pip install ddgs)")
         except Exception as e:
             errors.append(f"DuckDuckGo: {e}")
 
