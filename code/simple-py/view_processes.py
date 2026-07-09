@@ -1,5 +1,0 @@
-#!/usr/bin/env python3
-import psutil
-
-for proc in psutil.process_iter(['pid', 'name']):
-    print(proc.info)

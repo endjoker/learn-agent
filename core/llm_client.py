@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 LLM 客户端模块 —— 与各种大语言模型 API 通信的核心组件
 
@@ -7,41 +6,20 @@ LLM 客户端模块 —— 与各种大语言模型 API 通信的核心组件
   2. 本地模型（Ollama、LM Studio、vLLM、llama.cpp 等）
 
 通过 .env 配置：
-    # 基础配置
-    LLM_TYPE=cloud            # cloud = 云端, local = 本地模型
-    LLM_MODEL_ID=gemma4       # 模型名称
-
-    # 云端用：API Key 必填
+    LLM_TYPE=cloud              # cloud / local
+    LLM_MODEL_ID=deepseek-v4-flash
     LLM_API_KEY=sk-xxx
-
-    # 本地用：可通过 LLM_PROVIDER 自动补全地址
-    LLM_PROVIDER=ollama       # ollama / lm_studio / vllm / llama_cpp
-    # 或手动指定地址（优先级高于自动补全）
-    LLM_BASE_URL=http://localhost:11434/v1
-
-使用方式：
-    from core import HelloAgentsLLM
-
-    # 从 .env 自动加载
-    llm = HelloAgentsLLM()
-
-    # 手动指定（覆盖 .env）
-    llm = HelloAgentsLLM(
-        llm_type="local",
-        provider="ollama",
-        model="gemma4",
-    )
+    LLM_BASE_URL=https://api.deepseek.com
+    LLM_CONTEXT_LENGTH=1048576  # 可选，自动检测时无需设置
 """
 
 import os
-import logging
+import re
 from pathlib import Path
 from typing import List, Dict, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
-
-logger = logging.getLogger('hello_agent')
 
 
 # ============================================================
@@ -71,7 +49,7 @@ LOCAL_PROVIDERS = {
     "ollama": {
         "name": "Ollama",
         "base_url": "http://localhost:11434/v1",
-        "api_key": "ollama",  # Ollama 不校验 key，但不能为空
+        "api_key": "ollama",
         "desc": "最易用的本地模型运行工具，支持 Gemma/Llama/Qwen 等",
     },
     "lm_studio": {
@@ -96,19 +74,101 @@ LOCAL_PROVIDERS = {
 
 
 def list_local_providers() -> str:
-    """列出所有支持的本地服务提供商（给用户看）"""
+    """列出所有支持的本地服务提供商"""
     lines = ["支持的本地模型服务:"]
     for key, info in LOCAL_PROVIDERS.items():
         lines.append(f"  {key:12s} → {info['base_url']:35s} ({info['desc']})")
     return "\n".join(lines)
 
 
-def detect_provider_from_url(base_url: str) -> Optional[str]:
-    """根据 base_url 自动匹配对应的提供商名称"""
-    for key, info in LOCAL_PROVIDERS.items():
-        if info["base_url"] in base_url:
-            return key
-    return None
+# ============================================================
+# 模型上下文长度映射表
+# ============================================================
+#
+# 根据模型名称自动匹配上下文长度。
+# 匹配规则：小写 + 模糊匹配（包含关键词）。
+# 越靠前的规则优先级越高。
+
+_MODEL_CONTEXT_MAP = [
+    # DeepSeek 系列
+    (r"deepseek.*v4|deepseek.*flash", 1048576),
+    (r"deepseek.*v3|deepseek.*r1", 131072),
+    (r"deepseek", 131072),
+
+    # Gemma 系列
+    (r"gemma.*4|gemma4", 262144),
+    (r"gemma.*3|gemma3", 131072),
+    (r"gemma", 8192),
+
+    # GPT 系列
+    (r"gpt-4o|gpt4o", 131072),
+    (r"gpt-4", 32768),
+    (r"gpt-3\.5|gpt3\.5", 16384),
+
+    # Claude 系列
+    (r"claude.*opus|claude3.*opus", 200000),
+    (r"claude.*sonnet|claude3.*sonnet", 200000),
+    (r"claude.*haiku|claude3.*haiku", 200000),
+    (r"claude", 100000),
+
+    # Qwen 系列
+    (r"qwen.*2\.5|qwen2\.5", 131072),
+    (r"qwen.*max|qwen-max", 32768),
+    (r"qwen.*plus|qwen-plus", 131072),
+    (r"qwen", 32768),
+
+    # Llama 系列
+    (r"llama.*3\.1|llama3\.1", 131072),
+    (r"llama.*3|llama3", 8192),
+    (r"llama.*2|llama2", 4096),
+    (r"llama", 8192),
+
+    # Mistral 系列
+    (r"mistral.*large|mistral-large", 131072),
+    (r"mistral|mixtral", 32768),
+
+    # Yi 系列
+    (r"yi.*1\.5|yi1\.5|yi-1\.5", 131072),
+    (r"yi-34b|yi-6b|yi", 4096),
+
+    # GLM / ChatGLM 系列
+    (r"glm-4|chatglm-4", 131072),
+    (r"glm-3|chatglm-3", 32768),
+    (r"chatglm", 32768),
+
+    # Kimi / Moonshot
+    (r"moonshot|kimi", 131072),
+
+    # Ornith 等自定义模型
+    (r"ornith", 204800),
+
+    # 默认
+]
+
+
+def detect_context_length(model_name: Optional[str], default: int = 32768) -> int:
+    """
+    根据模型名称自动检测上下文长度
+
+    匹配规则：小写后按正则匹配，返回第一个匹配的值。
+    未匹配时返回默认值。
+
+    参数:
+        model_name: 模型名称，如 "deepseek-v4-flash"、"gpt-4"
+        default:    未匹配时的默认值
+
+    返回:
+        上下文长度（token 数）
+    """
+    if not model_name:
+        return default
+
+    name_lower = model_name.lower()
+    for pattern, ctx_len in _MODEL_CONTEXT_MAP:
+        if re.search(pattern, name_lower):
+            return ctx_len
+
+    return default
 
 
 # ============================================================
@@ -123,18 +183,10 @@ class HelloAgentsLLM:
       - 云端 (LLM_TYPE=cloud)  ：需要 API Key，校验严格
       - 本地 (LLM_TYPE=local)  ：API Key 可选，自动补全服务地址
 
-    使用方式：
-        # .env 自动加载
-        llm = HelloAgentsLLM()
-
-        # 本地模型快捷方式
-        llm = HelloAgentsLLM(provider="ollama", model="gemma4")
-
-        # 手动指定全部参数
-        llm = HelloAgentsLLM(
-            model="gemma4",
-            base_url="http://localhost:11434/v1",
-        )
+    上下文长度自动检测：
+      - 根据模型名称从内置映射表匹配
+      - 可通过 LLM_CONTEXT_LENGTH 环境变量覆盖
+      - 用于 Agent 上下文截断阈值的自动计算
     """
 
     def __init__(
@@ -145,66 +197,73 @@ class HelloAgentsLLM:
         timeout: Optional[int] = None,
         llm_type: Optional[str] = None,
         provider: Optional[str] = None,
+        context_length: Optional[int] = None,
     ):
         """
         初始化 LLM 客户端
 
-        参数优先级：传入参数 > 环境变量 > 预置默认值
+        参数优先级：传入参数 > 环境变量 > 模型自动检测 > 默认值
 
         参数:
             model:    模型名称，如 "gemma4"、"deepseek-v4-flash"
-                     （环境变量: LLM_MODEL_ID）
             api_key:  API 密钥。本地模型通常不需要
-                     （环境变量: LLM_API_KEY）
-            base_url: API 服务地址。本地模型可通过 provider 自动补全
-                     （环境变量: LLM_BASE_URL）
+            base_url: API 服务地址
             timeout:  请求超时秒数，默认 60
-                     （环境变量: LLM_TIMEOUT）
-            llm_type: "cloud" 或 "local"，控制校验策略
-                     （环境变量: LLM_TYPE，默认 cloud）
-            provider: 本地服务提供商。设置后自动补全 base_url 和 api_key
-                     支持: ollama / lm_studio / vllm / llama_cpp
-                     （环境变量: LLM_PROVIDER）
+            llm_type: "cloud" 或 "local"
+            provider: 本地服务提供商：ollama / lm_studio / vllm / llama_cpp
+            context_length: 模型上下文窗口大小（token）
+                     默认自动检测，环境变量 LLM_CONTEXT_LENGTH 可覆盖
         """
-        # ---- 读取配置（参数 > 环境变量 > 默认值） ----
-        provider_name = provider or os.getenv("LLM_PROVIDER") or ""
+        # ---- 获取模型名称 ----
         self.model = model or os.getenv("LLM_MODEL_ID")
+        model_prefix = f"{self.model}_" if self.model else ""
+
+        # ---- 读取 model-prefixed 参数（优先），后备通用变量 ----
+        def _get(key: str, default=None):
+            """先读 {model}_{key}，再读 {key}"""
+            return os.getenv(f"{model_prefix}{key}") or os.getenv(key) or default
+
+        # 提供者：用于本地模型判断
+        provider_name = provider or _get("PROVIDER", "")
         self.provider = provider_name
 
-        # ---- 判断模式：local / cloud ----
-        # 指定了 provider 自动视为 local，否则从环境变量读，默认 cloud
+        # ---- 判断模式 ----
         if provider_name:
             self.llm_type = "local"
         else:
-            self.llm_type = (llm_type or os.getenv("LLM_TYPE") or "cloud").lower()
+            self.llm_type = (llm_type or _get("TYPE") or "cloud").lower()
 
-        # ---- 处理 base_url ----
-        # 优先级：传入参数 > provider 预置（更具体）> 环境变量 > 报错
+        # ---- base_url：传参 > {model}_BASE_URL > provider 默认 > LLM_BASE_URL ----
         if base_url:
             self.base_url = base_url
+        elif _get("BASE_URL"):
+            self.base_url = _get("BASE_URL")
         elif provider_name and provider_name in LOCAL_PROVIDERS:
             self.base_url = LOCAL_PROVIDERS[provider_name]["base_url"]
-        elif os.getenv("LLM_BASE_URL"):
-            self.base_url = os.getenv("LLM_BASE_URL")
         else:
             self.base_url = None
 
-        # ---- 处理 api_key ----
-        # 优先级：传入参数 > 环境变量 > provider 预置 > 本地兜底
+        # ---- api_key：传参 > {model}_API_KEY > LLM_API_KEY > provider 默认 > 兜底 ----
         if api_key is not None:
             api_key_value = api_key
+        elif _get("API_KEY"):
+            api_key_value = _get("API_KEY")
         elif self.llm_type == "local" and provider_name in LOCAL_PROVIDERS:
-            # 本地模式 + 已知 provider：用预置 key
             api_key_value = LOCAL_PROVIDERS[provider_name]["api_key"]
-        elif os.getenv("LLM_API_KEY"):
-            api_key_value = os.getenv("LLM_API_KEY")
         elif self.llm_type == "local":
-            # 本地模式 + 未知 provider + 没有环境变量：用占位 key
             api_key_value = "not-needed"
         else:
             api_key_value = ""
 
-        # ---- 处理 timeout ----
+        # ---- 上下文长度：传参 > {model}_CONTEXT_LENGTH > 自动检测 ----
+        if context_length is not None:
+            self.context_length = context_length
+        elif _get("CONTEXT_LENGTH"):
+            self.context_length = int(_get("CONTEXT_LENGTH"))
+        else:
+            self.context_length = detect_context_length(self.model)
+
+        # ---- 超时 ----
         timeout_value = timeout or int(os.getenv("LLM_TIMEOUT", "60"))
 
         # ---- 参数校验 ----
@@ -222,7 +281,6 @@ class HelloAgentsLLM:
                 missing.append("LLM_BASE_URL（API服务地址）")
         if self.llm_type == "cloud" and not api_key_value:
             missing.append("LLM_API_KEY（云端模式必填，本地模式可忽略）")
-
         if self.llm_type == "cloud" and not self.base_url:
             missing.append("LLM_BASE_URL（API服务地址）")
 
@@ -232,7 +290,6 @@ class HelloAgentsLLM:
                 + "\n".join(f"  - {m}" for m in missing)
                 + f"\n\n当前模式: {self.llm_type}"
                 + (f"\n提供商: {provider_name}" if provider_name else "")
-                + "\n\n💡 提示：本地模型用 provider='ollama' 自动补全配置"
             )
 
         # ---- 创建 OpenAI 客户端 ----
@@ -254,18 +311,9 @@ class HelloAgentsLLM:
     ) -> Optional[str]:
         """
         让 LLM 思考并返回响应
-
-        参数:
-            messages:    对话消息列表
-            temperature: 温度参数（0~1），Agent 默认用 0
-            stream:      是否流式输出，默认 True
-
-        返回:
-            LLM 响应文本，出错返回 None
         """
-        # 显示调用信息（区分本地/云端）
         mode_tag = "🏠 本地" if self.llm_type == "local" else "☁️ 云端"
-        logger.info(f"▶ {mode_tag} {self.model}（{self.base_url}）")
+        print(f"  ▶ {mode_tag} {self.model}（{self.base_url}）")
 
         try:
             response = self.client.chat.completions.create(
@@ -276,24 +324,21 @@ class HelloAgentsLLM:
             )
 
             if stream:
-                # ---- 流式模式 ----
                 collected = []
                 for chunk in response:
                     if not chunk.choices:
                         continue
                     content = chunk.choices[0].delta.content or ""
-                    # 流式输出直接打印到控制台（不使用 logging）
                     print(content, end="", flush=True)
                     collected.append(content)
-                print()  # 换行
+                print()
                 return "".join(collected)
             else:
-                # ---- 非流式模式 ----
                 content = response.choices[0].message.content
                 return content
 
         except Exception as e:
-            logger.error(f"LLM 调用失败: {type(e).__name__}: {e}", exc_info=True)
+            print(f"\n  ❌ LLM 调用失败: {type(e).__name__}: {e}")
             return None
 
     # ============================================================
@@ -303,7 +348,38 @@ class HelloAgentsLLM:
     def __str__(self) -> str:
         mode = "本地" if self.llm_type == "local" else "云端"
         prov = f" [{self.provider}]" if self.provider else ""
-        return f"HelloAgentsLLM({mode}{prov}, model={self.model})"
+        return f"HelloAgentsLLM({mode}{prov}, model={self.model}, ctx={self.context_length})"
 
     def __repr__(self) -> str:
         return f"<HelloAgentsLLM type={self.llm_type} model='{self.model}'>"
+
+
+# ============================================================
+# 独立测试
+# ============================================================
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("  LLM 客户端测试")
+    print("=" * 50)
+
+    print(f"\n{list_local_providers()}\n")
+
+    # 测试上下文长度自动检测
+    test_models = [
+        "deepseek-v4-flash", "deepseek-r1", "gpt-4o", "gpt-4",
+        "gemma4", "qwen2.5-32b", "claude-sonnet-4", "llama3.1-70b",
+        "mistral-large", "glm-4", "moonshot-v1",
+        "unknown-model",
+    ]
+    print("上下文长度检测:")
+    for m in test_models:
+        ctx = detect_context_length(m)
+        print(f"  {m:30s} → {ctx}")
+
+    # 测试初始化
+    try:
+        llm = HelloAgentsLLM()
+        print(f"\n  ✅ 当前: {llm}")
+    except ValueError as e:
+        print(f"\n  ⚠️  配置不完整: {e}")

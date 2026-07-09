@@ -36,6 +36,7 @@ from typing import Optional
 import logging
 
 from core import HelloAgentsLLM, SystemPrompt
+from core.llm_client import detect_context_length
 from core.debug import (
     logger, setup_logging,
     set_debug, is_debug,
@@ -44,6 +45,7 @@ from core.debug import (
     log_info,
     enable_with_agent,
 )
+from core.permission import PermissionChecker, ALLOW, ASK, DENY
 from tools import BaseTool, ToolRegistry
 from tools.builtin_tools import register_all_tools
 from tools.web_tools import register_web_tools
@@ -142,13 +144,19 @@ class Agent:
         max_steps: int = 50,           # 最大 ReAct 循环步数
         max_history_tokens: int = 0,   # 上下文截断阈值（0=不截断）
         debug: bool = False,
+        permission_checker: PermissionChecker = None,
     ):
         self.name = name
         self.llm = llm
         self.tool_registry = tool_registry
         self.max_steps = max_steps
-        self.max_history_tokens = max_history_tokens
+        # 上下文截断阈值：0 时取模型上下文长度的一半（留一半给回复）
+        if max_history_tokens == 0:
+            self.max_history_tokens = max(llm.context_length // 2, 4096)
+        else:
+            self.max_history_tokens = max_history_tokens
         self.debug = debug
+        self.permission = permission_checker or PermissionChecker()
         if debug:
             set_debug(True)
         # System Prompt
@@ -220,7 +228,10 @@ class Agent:
             agent.switch_llm(model="gpt-4", base_url="https://api.openai.com", llm_type="cloud")
         """
         self.llm = HelloAgentsLLM(**kwargs)
+        # 根据新模型的上下文长度自动更新截断阈值
+        self.max_history_tokens = max(self.llm.context_length // 2, 4096)
         print(f"  ✅ 已切换模型: {self.llm}")
+        print(f"  📐 上下文: {self.llm.context_length} tokens | 截断: {self.max_history_tokens} tokens")
 
     # ============================================================
     # 系统提示词
@@ -431,7 +442,7 @@ class Agent:
             )
 
             # --- FINAL_ANSWER（仅在没有待执行的工具时返回） ---
-            if parsed["final_answer"] and not action:
+            if parsed["final_answer"] and not actions:
                 log_info("→ 走 FINAL_ANSWER 分支")
                 self.messages.append({"role": "assistant", "content": parsed["final_answer"]})
                 if verbose:
@@ -452,22 +463,80 @@ class Agent:
                 for a in actions:
                     log_tool_call(step, a["name"], a["input"])
 
-                # 并发执行所有工具
+                # ===== 权限检查：对每个工具做 allow/ask/deny 判断 =====
+                checked_actions = []  # 通过检查的：[(name, input)]
+                denied_actions = []   # 被拒绝的：[(name, input, reason)]
+
+                for a in actions:
+                    tool_name = a["name"]
+                    input_str = a["input"]
+                    try:
+                        params = json.loads(input_str) if input_str else {}
+                    except json.JSONDecodeError:
+                        params = {}
+
+                    level = self.permission.check(tool_name, params)
+
+                    if level == ALLOW:
+                        checked_actions.append(a)
+
+                    elif level == DENY:
+                        reason = f"权限不足，操作已被系统拒绝"
+                        denied_actions.append((tool_name, input_str, reason))
+                        print(f"  ⛔ {tool_name}: {reason}")
+
+                    elif level == ASK:
+                        # 显示要执行的操作，等待用户确认
+                        print(f"\n  ❓ 需要确认: {tool_name}")
+                        for k, v in params.items():
+                            v_str = str(v)[:120]
+                            print(f"     {k}: {v_str}")
+                        print(f"  ─────────────────────────────")
+                        print(f"  A = 本次会话工作区内全部放行")
+                        print(f"  Y = 允许本次操作")
+                        print(f"  N = 拒绝本次操作")
+                        print(f"  S = 跳过本次操作")
+                        prompt_text = input(f"  请选择 [A/Y/N/S] (默认Y) ").strip().lower()
+
+                        if prompt_text == "a":
+                            # 工作区全放行
+                            self.permission.allow_workspace()
+                            checked_actions.append(a)
+                            print(f"  ✅ 工作区内操作已全部放行（本会话有效）")
+                        elif prompt_text in ("", "y", "yes", "是"):
+                            print(f"  ✅ 已允许")
+                            checked_actions.append(a)
+                        elif prompt_text == "s":
+                            reason = f"用户选择跳过"
+                            denied_actions.append((tool_name, input_str, reason))
+                            print(f"  ⏭️  已跳过")
+                        else:
+                            reason = f"用户已拒绝"
+                            denied_actions.append((tool_name, input_str, reason))
+                            print(f"  ⏭️  已拒绝")
+
+                # ===== 并发执行通过权限检查的工具 =====
                 results = []
-                with ThreadPoolExecutor(max_workers=min(n, 5)) as pool:
-                    future_map = {
-                        pool.submit(self._execute_tool, a["name"], a["input"]): a
-                        for a in actions
-                    }
-                    for future in as_completed(future_map):
-                        action = future_map[future]
-                        try:
-                            obs = future.result()
-                            is_error = obs.startswith("❌")
-                        except Exception as e:
-                            obs = f"❌ 工具执行异常: {type(e).__name__}: {e}"
-                            is_error = True
-                        results.append((action["name"], action["input"], obs, is_error))
+                if checked_actions:
+                    m = len(checked_actions)
+                    with ThreadPoolExecutor(max_workers=min(m, 5)) as pool:
+                        future_map = {
+                            pool.submit(self._execute_tool, a["name"], a["input"]): a
+                            for a in checked_actions
+                        }
+                        for future in as_completed(future_map):
+                            action = future_map[future]
+                            try:
+                                obs = future.result()
+                                is_error = obs.startswith("❌")
+                            except Exception as e:
+                                obs = f"❌ 工具执行异常: {type(e).__name__}: {e}"
+                                is_error = True
+                            results.append((action["name"], action["input"], obs, is_error))
+
+                # ===== 被拒绝的也加入结果 =====
+                for tool_name, input_str, reason in denied_actions:
+                    results.append((tool_name, input_str, f"⏭️ 跳过: {reason}", True))
 
                 # 统计成功/失败
                 ok_count = sum(1 for _, _, _, err in results if not err)
@@ -591,6 +660,7 @@ def create_agent(
     max_steps: int = 30,
     max_history_tokens: int = 0,
     debug: bool = False,
+    permission: bool = True,
 ) -> Agent:
     """一行创建 Agent（含 read/write/edit/grep/glob/bash + search/web_fetch）"""
     # 初始化日志系统
@@ -602,11 +672,16 @@ def create_agent(
     registry = ToolRegistry()
     register_all_tools(registry)
     register_web_tools(registry)
+
+    # 权限管理
+    checker = PermissionChecker() if permission else None
+
     return Agent(
         name=name, llm=llm, tool_registry=registry,
         max_steps=max_steps,
         max_history_tokens=max_history_tokens,
         debug=debug,
+        permission_checker=checker,
     )
 
 
@@ -638,7 +713,8 @@ def start_interactive_shell(debug: bool = False):
     # 显示当前模型和工具
     print(f"\n🤖 {agent.name}")
     print(f"📡 当前模型: {agent.llm}")
-    print(f"📦 {agent.tool_registry.count()} 个工具:")
+    perm_status = f"🛡️  权限管理: {'启用' if agent.permission else '关闭'}"
+    print(f"📦 {agent.tool_registry.count()} 个工具 | {perm_status}")
     for t in agent.tool_registry.list_tools():
         print(f"   ✅ {t.name}")
 
@@ -659,29 +735,18 @@ def start_interactive_shell(debug: bool = False):
                 cmd = parts[1] if len(parts) > 1 else ""
 
                 if cmd == "list" or cmd == "ls":
-                    # 列出支持的服务商
                     from core.llm_client import LOCAL_PROVIDERS
                     print(f"\n  本地服务商:")
                     for k, v in LOCAL_PROVIDERS.items():
                         print(f"    {k:12s} → {v['base_url']}")
-                    print(f"  云端: cloud <模型名> <API地址>")
 
-                elif cmd == "cloud":
-                    # /model cloud <model> [base_url]
-                    cloud_model = parts[2] if len(parts) > 2 else None
-                    cloud_url = parts[3] if len(parts) > 3 else None
-                    kwargs = {"llm_type": "cloud", "model": cloud_model}
-                    if cloud_url:
-                        kwargs["base_url"] = cloud_url
-                    agent.switch_llm(**kwargs)
-
-                elif cmd in ("ollama", "lm_studio", "vllm", "llama_cpp"):
-                    # /model ollama gemma4
-                    provider = cmd
-                    model_name = parts[2] if len(parts) > 2 else None
+                elif cmd == "local":
+                    # /model local <model_name>
+                    local_model = parts[2] if len(parts) > 2 else None
+                    provider = os.getenv("LLM_PROVIDER") or "ollama"
                     kwargs = {"provider": provider}
-                    if model_name:
-                        kwargs["model"] = model_name
+                    if local_model:
+                        kwargs["model"] = local_model
                     agent.switch_llm(**kwargs)
 
                 elif cmd == "":
@@ -689,7 +754,8 @@ def start_interactive_shell(debug: bool = False):
                     print(f"  📡 {agent.llm}")
 
                 else:
-                    print(f"  ❓ 未知服务商 '{cmd}'。输入 /model list 查看可用选项")
+                    # /model <model_name> → 切换云端模型（其他参数从 .env 读）
+                    agent.switch_llm(model=cmd, llm_type="cloud")
 
                 continue
 

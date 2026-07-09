@@ -27,10 +27,11 @@
 
 - **ReAct 循环** — 思考(THOUGHT) → 行动(ACTION) → 观察 → 循环直到给出最终回答
 - **多工具并发** — 一次输出多个 ACTION，并发执行，合并结果，减少上下文开销
-- **动态步数估算** — 根据任务自动估算最大执行步数
+- **三级权限管理** — allow/ask/deny，工作区路径检测，bash 命令分类，A/Y/N/S 交互
+- **模型配置** — `.env` 按模型名前缀分组，切换模型自动匹配参数和上下文长度
 - **模型切换** — 运行时通过 `/model` 命令在线切换模型
 - **调试日志** — `--debug` 参数开启，显示 Agent 与 LLM 的完整通信
-- **连续对话** — 跨多轮对话保留历史上下文
+- **连续对话** — 跨多轮对话保留历史上下文，自动截断防超限
 - **云端+本地** — 支持云端 API（OpenAI/DeepSeek）和本地模型（Ollama/LM Studio/vLLM/llama.cpp）
 
 ## 🚀 快速开始
@@ -62,23 +63,20 @@ pip install -r requirements.txt
 
 ### 配置
 
-复制 `.env` 文件并填写你的 API 配置：
+`.env` 文件按模型名前缀分组配置：
 
 ```env
-# 云端模式（DeepSeek 示例）
-LLM_API_KEY="your-api-key"
-LLM_BASE_URL="https://api.deepseek.com"
-LLM_MODEL_ID="deepseek-v4-flash"
+# 当前使用的模型
+LLM_MODEL_ID=deepseek-v4-flash
 
-# 本地模式（Ollama 示例）
-# LLM_PROVIDER=ollama
-# LLM_MODEL_ID=gemma4
+# deepseek-v4-flash 配置
+deepseek-v4-flash_BASE_URL=https://api.deepseek.com
+deepseek-v4-flash_API_KEY=sk-xxx
+deepseek-v4-flash_CONTEXT_LENGTH=1048576
 
-# 本地模式（手动指定）
-# LLM_TYPE=local
-# LLM_MODEL_ID=gemma4
-# LLM_BASE_URL=http://localhost:11434/v1
-# LLM_API_KEY=not-needed
+# 本地模型配置（通过 /model local gemma4 切换）
+gemma4_PROVIDER=ollama
+gemma4_CONTEXT_LENGTH=262144
 ```
 
 ### 启动
@@ -105,8 +103,9 @@ hello-agent/
 │
 ├── core/                    # 核心组件
 │   ├── __init__.py
-│   ├── llm_client.py        # LLM 客户端（云端/本地模型适配）
-│   └── debug.py             # 调试日志模块（带时间戳的 DEBUG 输出）
+│   ├── llm_client.py        # LLM 客户端（云端/本地模型适配，模型前缀参数读取）
+│   ├── debug.py             # 调试日志模块（带时间戳的 DEBUG 输出）
+│   └── permission.py        # 权限管理模块（allow/ask/deny 三级）
 │
 ├── tools/                   # 工具系统
 │   ├── __init__.py
@@ -130,8 +129,8 @@ hello-agent/
 |:----|:-----|
 | `/model` | 查看当前模型 |
 | `/model list` | 列出支持的本地服务商 |
-| `/model ollama gemma4` | 切换到本地 Ollama + Gemma4 |
-| `/model cloud gpt-4 https://...` | 切换到云端指定模型 |
+| `/model local gemma4` | 切换到本地模型 |
+| `/model deepseek-v4-flash` | 切换到云端模型 |
 | `/clear` | 清空对话历史 |
 | `/help` | 显示帮助信息 |
 | `exit` | 退出程序 |
@@ -199,11 +198,11 @@ registry.register_tool(MyTool())
 
 | 变量 | 说明 | 默认值 |
 |:----|:-----|:------|
-| `LLM_API_KEY` | API 密钥（云端必填，本地可选） | — |
-| `LLM_BASE_URL` | API 服务地址 | — |
-| `LLM_MODEL_ID` | 模型名称 | — |
-| `LLM_TYPE` | 模式：`cloud` 或 `local` | `cloud` |
-| `LLM_PROVIDER` | 本地服务商：`ollama` / `lm_studio` / `vllm` / `llama_cpp` | — |
+| `LLM_MODEL_ID` | 当前使用的模型名称 | `deepseek-v4-flash` |
+| `{model}_BASE_URL` | 模型专属 API 地址 | `https://api.deepseek.com` |
+| `{model}_API_KEY` | 模型专属 API 密钥 | — |
+| `{model}_CONTEXT_LENGTH` | 模型上下文窗口大小 | `1048576` |
+| `{model}_PROVIDER` | 本地模型服务商 | `ollama` |
 | `LLM_TIMEOUT` | 请求超时秒数 | `60` |
 
 ## 🧪 调试模式
@@ -236,6 +235,15 @@ agent = create_agent(debug=True)
 - [x] 连续对话历史
 - [x] 调试日志系统（带时间戳）
 - [x] 中文友好的注释和交互
+- [x] 网页搜索（search + web_fetch）
+- [x] 数学计算器（calculate）
+- [x] 笔记/记忆系统（notes）
+- [x] 文件管理（file_mgr）
+- [x] Python 代码执行（python）
+- [x] HTTP 请求（http）
+- [x] 三级权限管理（PermissionChecker）
+- [x] 多工具并发执行（ThreadPoolExecutor）
+- [x] 模型前缀参数配置（`{model}_KEY` 模式）
 
 ## 📄 许可证
 

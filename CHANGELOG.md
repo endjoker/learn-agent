@@ -1,6 +1,41 @@
 # 更新日志
 
-## 2026-07-08 代码优化
+## 2026-07-09 权限管理 & 调用链 & 网页工具
+
+**新增：**
+- 新增 `core/permission.py`：三级权限模块（allow/ask/deny）
+  - 按工具和工作区路径动态判断权限
+  - A/Y/N/S 交互式确认，A 选项可一次性放行工作区
+  - bash 命令自动分类：只读命令放行、写命令确认、危险命令拒绝
+- 新增 `tools/web_tools.py`：网页搜索和抓取工具
+  - `search` — 基于 DuckDuckGo/Bing 的网页搜索，无需 API Key
+  - `web_fetch` — 读取指定网页正文内容
+- 新增 6 个内置工具到 `tools/builtin_tools.py`
+  - `calculate` — 安全数学计算（支持 sqrt、len、列表等）
+  - `datetime` — 获取当前日期/时间
+  - `notes` — 跨对话笔记存储
+  - `file_mgr` — 文件管理（ls/copy/move/delete/mkdir）
+  - `python` — 执行 Python 代码片段
+  - `http` — HTTP 请求（GET/POST）
+
+**调用链优化：**
+- 支持多 ACTION 并发执行：`ThreadPoolExecutor` 并发运行多个独立工具
+- 合并结果为一条消息，减少 LLM 往返次数和上下文开销
+
+**模型配置重构：**
+- `.env` 改为按 `{模型名}_` 前缀匹配参数，每种模型独立配置
+- 新增 `detect_context_length()` 根据模型名匹配上下文长度
+- 切换模型时自动更新截断阈值（上下文一半）
+- 简化命令：`/model <name>` 云端、`/model local <name>` 本地
+
+**权限控制：**
+- 默认启用（`create_agent(permission=True)`）
+- 工作区内读操作放行，写操作确认，区外操作 ask/deny
+- 危险操作（rm -rf / 等）直接拒绝
+
+**其他：**
+- `.gitignore` 增加 `code/`、`__pycache__`、编辑器配置等忽略规则
+- 新增 `requirements.txt` 项目依赖清单
 
 **Bug 修复：**
 - 修复 `stream_run` 方法中的错误引用（`parsed["action"]` → `parsed["actions"]`），流式模式现在可以正常工作

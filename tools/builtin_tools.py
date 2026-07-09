@@ -861,6 +861,7 @@ class CalculatorTool(BaseTool):
         # 额外允许的函数和常量
         _ALLOWED_FUNCS = {
             "abs": abs, "round": round, "int": int, "float": float,
+            "len": len, "str": str, "min": min, "max": max, "sum": sum,
             "sqrt": math.sqrt, "sin": math.sin, "cos": math.cos,
             "tan": math.tan, "log": math.log, "log10": math.log10,
             "exp": math.exp, "ceil": math.ceil, "floor": math.floor,
@@ -900,6 +901,26 @@ class CalculatorTool(BaseTool):
             if node.id in funcs:
                 return funcs[node.id]
             raise ValueError(f"不允许的名称: {node.id}")
+        elif isinstance(node, ast.List):
+            return [self._safe_eval(el, funcs) for el in node.elts]
+        elif isinstance(node, ast.Tuple):
+            return tuple(self._safe_eval(el, funcs) for el in node.elts)
+        elif isinstance(node, ast.Set):
+            return {self._safe_eval(el, funcs) for el in node.elts}
+        elif isinstance(node, ast.Dict):
+            return {
+                self._safe_eval(k, funcs): self._safe_eval(v, funcs)
+                for k, v in zip(node.keys, node.values)
+            }
+        elif isinstance(node, ast.Subscript):
+            value = self._safe_eval(node.value, funcs)
+            if isinstance(node.slice, ast.Constant):
+                return value[node.slice.value]
+            elif isinstance(node.slice, ast.Index):
+                return value[self._safe_eval(node.slice.value, funcs)]
+            elif isinstance(node.slice, ast.Slice):
+                return value[self._safe_eval(node.slice.lower, funcs):self._safe_eval(node.slice.upper, funcs)]
+            return value[node.slice]
         else:
             raise ValueError(f"不支持的表达式类型: {type(node).__name__}")
 
