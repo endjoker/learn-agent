@@ -1,5 +1,34 @@
 # 更新日志
 
+## 2026-07-11 会话持久化 & MessageStore
+
+**新增：**
+- 新增 `core/message_store.py`：消息存储模块
+  - `save_session()` — 全量覆写会话文件
+  - `load_session_data()` — 从字典恢复会话
+  - `list_session_files()` — 列出所有已保存会话
+  - `delete_session_file()` — 删除指定会话
+  - 消息变更通知回调（`on_update`，为 UI 预留）
+- 新增 `sessions/` 目录，存放会话 JSON 文件
+- 新增 `--resume <id>` / `--resume last` 命令行参数
+  - `--resume last` 按文件修改时间取最新会话
+- 新增交互式命令：`/session`（info/list/save/delete）
+- 新增 `/stats` 命令查看上下文占用统计
+- 新增 `--help` 参数显示使用帮助
+
+**优化：**
+- `run()` 每次对话结束后自动保存会话
+- `/clear` 先保存再清空，保留文件历史
+- `create_agent()` 新增 `provider` 参数，支持恢复本地模型会话
+- 启动界面精简，不再列出 14 个工具
+- 工具描述增加跨平台说明
+
+**Bug 修复：**
+- 修复 `load_session_data()` 列表引用断裂导致 resume 后消息不保存
+  - 改用 `clear() + extend()` 保持列表对象不变
+- 修复 `--resume last` 误入单轮模式的问题
+- 修复 `list_session_files()` 按文件名而非修改时间排序
+
 ## 2026-07-09 权限管理 & 调用链 & 网页工具
 
 **新增：**

@@ -32,6 +32,8 @@
 - **模型切换** — 运行时通过 `/model` 命令在线切换模型
 - **调试日志** — `--debug` 参数开启，显示 Agent 与 LLM 的完整通信
 - **连续对话** — 跨多轮对话保留历史上下文，自动截断防超限
+- **会话持久化** — 自动保存到文件，支持 `--resume` 恢复和 `/session` 管理
+- **上下文监控** — `/stats` 命令实时查看 token 占用和消息统计
 - **云端+本地** — 支持云端 API（OpenAI/DeepSeek）和本地模型（Ollama/LM Studio/vLLM/llama.cpp）
 
 ## 🚀 快速开始
@@ -85,6 +87,10 @@ gemma4_CONTEXT_LENGTH=262144
 # 交互式命令行模式
 python agent.py
 
+# 恢复历史会话
+python agent.py --resume a7f3e2c9
+python agent.py --resume last
+
 # 直接提问
 python agent.py "帮我看看当前目录有什么文件"
 
@@ -131,6 +137,10 @@ hello-agent/
 | `/model list` | 列出支持的本地服务商 |
 | `/model local gemma4` | 切换到本地模型 |
 | `/model deepseek-v4-flash` | 切换到云端模型 |
+| `/session` | 查看/管理会话 |
+| `/session list` | 列出所有历史会话 |
+| `/session save` | 保存当前会话 |
+| `/stats` | 查看上下文占用统计 |
 | `/clear` | 清空对话历史 |
 | `/help` | 显示帮助信息 |
 | `exit` | 退出程序 |

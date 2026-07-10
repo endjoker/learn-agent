@@ -45,6 +45,7 @@ from core.debug import (
     log_info,
     enable_with_agent,
 )
+from core.message_store import MessageStore
 from core.permission import PermissionChecker, ALLOW, ASK, DENY
 from tools import BaseTool, ToolRegistry
 from tools.builtin_tools import register_all_tools
@@ -162,12 +163,19 @@ class Agent:
         # System Prompt
         self.system_prompt_builder = system_prompt_builder
         if system_prompt:
-            # 用户提供了自定义字符串，直接使用
             self.system_prompt = system_prompt
         else:
             self.system_prompt = self._build_system_prompt()
-        # 对话历史 —— 跨 run() 调用持久化，保留上下文
-        self.messages: list = []
+        # 消息存储 —— 管理历史 + 上下文统计
+        self.store = MessageStore(
+            max_tokens=self.max_history_tokens,
+        )
+        self.messages = self.store.messages  # 指向同一列表，现有代码兼容
+        # 保存当前模型配置到 store（用于会话持久化）
+        self.store.model_id = self.llm.model or ""
+        self.store.model_provider = getattr(self.llm, "provider", "") or ""
+        self.store.model_base_url = getattr(self.llm, "base_url", "") or ""
+        self.store.model_llm_type = getattr(self.llm, "llm_type", "") or ""
 
     # ============================================================
     # 对话历史管理
@@ -217,7 +225,8 @@ class Agent:
 
     def clear_history(self):
         """清空对话历史，但保留系统提示词"""
-        self.messages = []
+        self.store.clear()
+        # self.messages 通过引用同步，不用重新赋值
 
     def switch_llm(self, **kwargs):
         """
@@ -448,6 +457,7 @@ class Agent:
                 if verbose:
                     print(f"\n  ✅ 结论（{step} 步）")
                     print(f"  🤖 {parsed['final_answer']}")
+                self.store.save_session()
                 return parsed["final_answer"]
 
             # --- 批量 ACTION（支持多个工具并发执行） ---
@@ -573,8 +583,10 @@ class Agent:
                 self.messages.append({"role": "assistant", "content": answer})
                 if verbose:
                     print(f"  🤖 {answer}")
+                self.store.save_session()
                 return answer
 
+        self.store.save_session()
         return (
             f"⚠️ 已达最大步数（{max_steps} 步），任务可能未完成。\n"
             f"建议拆分子任务，或用 create_agent(max_steps=50) 增加上限。"
@@ -657,18 +669,17 @@ def create_agent(
     model: str = None,
     api_key: str = None,
     base_url: str = None,
+    provider: str = None,
     max_steps: int = 30,
     max_history_tokens: int = 0,
     debug: bool = False,
     permission: bool = True,
 ) -> Agent:
     """一行创建 Agent（含 read/write/edit/grep/glob/bash + search/web_fetch）"""
-    # 初始化日志系统
     setup_logging(debug=debug)
-
     if debug:
         set_debug(True)
-    llm = HelloAgentsLLM(model=model, api_key=api_key, base_url=base_url)
+    llm = HelloAgentsLLM(model=model, api_key=api_key, base_url=base_url, provider=provider)
     registry = ToolRegistry()
     register_all_tools(registry)
     register_web_tools(registry)
@@ -689,34 +700,62 @@ def create_agent(
 # 交互式 CLI
 # ============================================================
 
-def start_interactive_shell(debug: bool = False):
+def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
     """启动交互式命令行，支持 /model 切换模型"""
-    print("\n╔════════════════════════════════════════════╗")
-    print("║   🚀 HelloAgent 交互式命令行               ║")
+    print("\n╔═══════════════════════════════════════════════╗")
+    print("║   🚀 HelloAgent 交互式命令行                  ║")
     if debug:
-        print("║   🐛 调试模式已开启                        ║")
-    print("║                                              ║")
-    print("║   /model        查看当前模型                 ║")
-    print("║   /model list   列出支持的本地服务商          ║")
-    print("║   /model ollama gemma4   切换到本地模型      ║")
-    print("║   /model cloud xxx url   切换到云端模型      ║")
-    print("║   /help         显示帮助                     ║")
-    print("║   exit          退出                         ║")
-    print("╚════════════════════════════════════════════╝")
-    try:
-        agent = create_agent(debug=debug)
-    except ValueError as e:
-        print(f"\n❌ 创建失败: {e}")
-        print("   检查 .env 中 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL_ID")
-        sys.exit(1)
+        print("║   🐛 调试模式已开启                           ║")
+    print("║                                                 ║")
+    print("║   /model             查看当前模型               ║")
+    print("║   /model list        列出本地服务商             ║")
+    print("║   /model <name>      切换到云端模型             ║")
+    print("║   /model local <name> 切换到本地模型            ║")
+    print("║   /session           查看/管理会话              ║")
+    print("║   /stats             查看上下文占用             ║")
+    print("║   /clear             清空对话历史               ║")
+    print("║   /help              显示帮助                   ║")
+    print("║   exit               退出                       ║")
+    print("╚═══════════════════════════════════════════════╝")
 
-    # 显示当前模型和工具
+    # ---- 恢复会话 or 新建 ----
+    if resume_session_id:
+        from pathlib import Path
+        from core.message_store import DEFAULT_SESSION_DIR
+        session_file = Path(DEFAULT_SESSION_DIR) / f"{resume_session_id}.json"
+        if not session_file.exists():
+            print(f"\n❌ 未找到会话: {resume_session_id}")
+            print(f"   尝试: python agent.py --resume <session_id>")
+            print(f"   或:  /session list 查看已有会话")
+            sys.exit(1)
+
+        with open(session_file, "r", encoding="utf-8") as f:
+            session_data = json.load(f)
+
+        # 用会话中的模型配置创建 Agent
+        agent = create_agent(
+            debug=debug,
+            model=session_data.get("model_id"),
+            provider=session_data.get("model_provider") or None,
+        )
+        # 恢复消息到 store（不含 system，由后续插入）
+        agent.store.load_session_data(session_data)
+        # 在 index 0 插入新的 system prompt
+        agent.messages.insert(0, {"role": "system", "content": agent.system_prompt})
+        print(f"\n📂 已恢复会话: {resume_session_id}（{session_data.get('message_count', 0)} 条消息）")
+    else:
+        try:
+            agent = create_agent(debug=debug)
+        except ValueError as e:
+            print(f"\n❌ 创建失败: {e}")
+            print("   检查 .env 中 LLM_MODEL_ID / LLM_CLOUD_API_KEY / LLM_CLOUD_BASE_URL")
+            sys.exit(1)
+
+    # 显示当前状态
     print(f"\n🤖 {agent.name}")
-    print(f"📡 当前模型: {agent.llm}")
+    print(f"📡 当前模型: {agent.llm}  |  session: {agent.store.session_id}")
     perm_status = f"🛡️  权限管理: {'启用' if agent.permission else '关闭'}"
-    print(f"📦 {agent.tool_registry.count()} 个工具 | {perm_status}")
-    for t in agent.tool_registry.list_tools():
-        print(f"   ✅ {t.name}")
+    print(f"📦 {agent.tool_registry.count()} 个工具就绪 | {perm_status}")
 
     while True:
         try:
@@ -759,10 +798,57 @@ def start_interactive_shell(debug: bool = False):
 
                 continue
 
+            # ---- /session ----
+            if u.startswith("/session"):
+                parts = u.split()
+                cmd = parts[1] if len(parts) > 1 else ""
+
+                if cmd == "" or cmd == "info":
+                    s = agent.store
+                    print(f"\n  session: {s.session_id}")
+                    print(f"  模型: {s.model_id or '未知'}")
+                    print(f"  消息: {len(s)} 条")
+                    print(f"  创建: {s.session_id}")
+
+                elif cmd == "list":
+                    from core.message_store import MessageStore
+                    sessions = MessageStore.list_session_files()
+                    if not sessions:
+                        print("  📭 暂无已保存的会话")
+                    else:
+                        print(f"\n  已保存的会话（共 {len(sessions)} 个）:")
+                        for s in sessions:
+                            print(f"    {s['session_id']}  {s['model_id']:20s}  {s['message_count']:3d} 条  {s['created_at'][:16]}")
+
+                elif cmd == "save":
+                    path = agent.store.save_session()
+                    print(f"  ✅ 已保存: {path}")
+
+                elif cmd == "delete":
+                    target = parts[2] if len(parts) > 2 else None
+                    if target:
+                        from core.message_store import MessageStore
+                        if MessageStore.delete_session_file(target):
+                            print(f"  🗑️  已删除会话: {target}")
+                        else:
+                            print(f"  ❌ 未找到会话: {target}")
+                    else:
+                        print("  ❓ 用法: /session delete <session_id>")
+
+                else:
+                    print("  ❓ 用法: /session [info|list|save|delete]")
+                continue
+
+            # ---- /stats ----
+            if u.startswith("/stats"):
+                print(f"\n{agent.store.format_stats()}")
+                continue
+
             # ---- /clear ----
             if u.startswith("/clear"):
+                agent.store.save_session()  # 先保存当前历史到文件
                 agent.clear_history()
-                print(f"  🗑️  对话历史已清空")
+                print(f"  🗑️  当前上下文已清空（历史仍保存在会话文件中）")
                 continue
 
             # ---- /help ----
@@ -770,8 +856,12 @@ def start_interactive_shell(debug: bool = False):
                 print("\n  命令:")
                 print("    /model              查看当前模型")
                 print("    /model list         列出可用服务商")
-                print("    /model ollama xxx   切换本地模型")
-                print("    /model cloud xxx    切换云端模型")
+                print("    /model <name>       切换到云端模型")
+                print("    /model local <name> 切换到本地模型")
+                print("    /session            查看/管理会话")
+                print("    /session list       列出所有会话")
+                print("    /session save       保存当前会话")
+                print("    /stats              查看上下文占用统计")
                 print("    /clear              清空对话历史")
                 print("    /help               显示此帮助")
                 print("    exit                退出")
@@ -792,14 +882,65 @@ def start_interactive_shell(debug: bool = False):
 # ============================================================
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    flags = [a for a in sys.argv[1:] if a.startswith("--")]
-    debug_mode = "--debug" in flags
+    # --help 或 -h 显示帮助信息
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("用法: python agent.py [参数] [问题]")
+        print()
+        print("参数:")
+        print("  --help, -h         显示此帮助")
+        print("  --debug            开启调试日志")
+        print("  --resume <id>      恢复指定会话")
+        print("  --resume last      恢复最新会话")
+        print()
+        print("示例:")
+        print("  python agent.py                    启动交互模式")
+        print("  python agent.py --debug            启动交互模式（带调试）")
+        print("  python agent.py --resume a7f3e2c9  恢复指定会话")
+        print("  python agent.py --resume last      恢复最新会话")
+        print('  python agent.py "帮我看看目录"      直接提问，不进入交互模式')
+        sys.exit(0)
 
-    if args:
-        query = " ".join(args)
+    # 参数解析
+    debug_mode = "--debug" in sys.argv
+    resume_id = None
+
+    if "--resume" in sys.argv:
+        idx = sys.argv.index("--resume")
+        if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("--"):
+            raw = sys.argv[idx + 1]
+            if raw == "last":
+                from core.message_store import MessageStore
+                sessions = MessageStore.list_session_files()
+                if sessions:
+                    resume_id = sessions[0]["session_id"]
+                    print(f"📂 恢复最新会话: {resume_id}")
+                else:
+                    print("❌ 没有已保存的会话")
+                    sys.exit(1)
+            else:
+                resume_id = raw
+
+    # 非 -- 开头的参数作为直接提问（排除 --resume 的值）
+    resume_vals = [resume_id] if resume_id else []
+    if "--resume" in sys.argv:
+        ri = sys.argv.index("--resume")
+        if ri + 1 < len(sys.argv):
+            resume_vals.append(sys.argv[ri + 1])  # 也排除 "last" 原始值
+    query_args = [a for a in sys.argv[1:]
+                  if not a.startswith("--")
+                  and a not in resume_vals]
+
+    if query_args:
+        query = " ".join(query_args)
         agent = create_agent(debug=debug_mode)
         result = agent.run(query)
         print(f"\n🤖 {agent.name}:\n{result}")
+        # 单轮测试不保留会话文件
+        import os
+        from core.message_store import DEFAULT_SESSION_DIR
+        session_file = os.path.join(DEFAULT_SESSION_DIR, f"{agent.store.session_id}.json")
+        if os.path.exists(session_file):
+            os.remove(session_file)
+        sys.exit(0)
     else:
-        start_interactive_shell(debug=debug_mode)
+        start_interactive_shell(debug=debug_mode, resume_session_id=resume_id)
