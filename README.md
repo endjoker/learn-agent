@@ -32,8 +32,9 @@
 - **模型切换** — 运行时通过 `/model` 命令在线切换模型
 - **调试日志** — `--debug` 参数开启，显示 Agent 与 LLM 的完整通信
 - **连续对话** — 跨多轮对话保留历史上下文，自动截断防超限
-- **会话持久化** — 自动保存到文件，支持 `--resume` 恢复和 `/session` 管理
-- **上下文监控** — `/stats` 命令实时查看 token 占用和消息统计
+- **会话持久化** — 每轮对话自动保存到 `sessions/{id}.json`，全量覆写，不丢失历史
+- **会话恢复** — `--resume <id>` 恢复指定会话，`--resume last` 按修改时间取最新会话
+- **上下文监控** — `/stats` 命令实时查看 token 占用、消息统计和按角色分布
 - **云端+本地** — 支持云端 API（OpenAI/DeepSeek）和本地模型（Ollama/LM Studio/vLLM/llama.cpp）
 
 ## 🚀 快速开始
@@ -110,8 +111,10 @@ hello-agent/
 ├── core/                    # 核心组件
 │   ├── __init__.py
 │   ├── llm_client.py        # LLM 客户端（云端/本地模型适配，模型前缀参数读取）
+│   ├── message_store.py     # 消息存储模块（持久化、上下文统计、会话管理）
 │   ├── debug.py             # 调试日志模块（带时间戳的 DEBUG 输出）
-│   └── permission.py        # 权限管理模块（allow/ask/deny 三级）
+│   ├── permission.py        # 权限管理模块（allow/ask/deny 三级）
+│   └── system_prompt.py     # System Prompt 构建器（静态区/动态区）
 │
 ├── tools/                   # 工具系统
 │   ├── __init__.py
@@ -120,9 +123,8 @@ hello-agent/
 │   ├── builtin_tools.py     # 内置工具（12 个：文件操作+计算+笔记+HTTP 等）
 │   └── web_tools.py         # 网页工具（search + web_fetch）
 │
-└── code/                    # 学习笔记（可选）
-    └── learn/
-        └── plan-1.md
+└── sessions/                # 会话文件（.gitignore）
+    └── *.json               # 自动保存的会话数据
 ```
 
 ## 💻 使用指南
@@ -254,6 +256,12 @@ agent = create_agent(debug=True)
 - [x] 三级权限管理（PermissionChecker）
 - [x] 多工具并发执行（ThreadPoolExecutor）
 - [x] 模型前缀参数配置（`{model}_KEY` 模式）
+- [x] 消息存储模块（MessageStore）
+- [x] 会话持久化（save/load/delete 全量覆写）
+- [x] 会话恢复（`--resume <id>` / `--resume last`）
+- [x] 会话管理命令（`/session info/list/save/delete`）
+- [x] 上下文占用统计（`/stats`）
+- [x] 消息变更通知回调（`on_update`，为 UI 预留）
 
 ## 📄 许可证
 
