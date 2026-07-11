@@ -1,5 +1,37 @@
 # 更新日志
 
+## 2026-07-12 跨会话记忆系统 & BM25 检索
+
+**新增：**
+- 新增 `memory/` 包：跨会话长期记忆系统
+  - `MemoryManager` — 记忆保存（upsert 语义，同会话同天合并）、BM25 检索、权重管理
+  - 自动归档每轮对话到 `memory/daily/index.json` + `daily/YYYY-MM-DD.md`
+  - 归档时过滤工具执行结果和 ACTION/INPUT，保留用户提问和 LLM 推理/回答
+- 新增 `tools/memory_tools.py`：`memory_search` + `memory_update` 工具
+- 新增 `memory/memory.md`：记忆配置引用，由 SystemPrompt 动态加载到 LLM
+- 新增 `code/simple-py/clear_memory.py`：记忆清理脚本（支持单条/批量/全部清除）
+- 新增 `log/` 目录：`--debug` 模式调试信息写入文件，控制台保持 INFO
+
+**检索优化：**
+- BM25 算法（`rank_bm25`）替代子串匹配，支持中英文混合搜索
+- 引入 `jieba` 中文分词，解决中文无空格分词问题
+- 排序公式：`score = BM25 × 10 + weight + date_numeric / 100000`
+- 权重自动递增（命中 +1），`weight < -5` 自动隐藏（软删除）
+
+**ReAct 解析增强：**
+- 新增 `_normalize_tags()` 预处理，支持 XML 风格标签 `<THOUGHT>` 等
+- INPUT 正则边界增加 THOUGHT 标记，防止跨行捕获
+- 清理模型特殊 token（`<|im_end|>` 等），防止混入工具参数
+
+**其他改进：**
+- `save_conversation()` 改为 upsert 语义（同 `session_id` + 同 `date` 合并到一条记忆）
+- 权重命中自动递增，`memory_update` 保留供 LLM 手动降权
+- `/session delete` 支持批量删除（`/session delete id1 id2 ...`）
+- `/clear` 后记忆走新条目，不覆盖清空前的内容
+- 调试日志改为文件输出，控制台不再刷屏
+- `CLAUDE.md` 加入 Plan-Then-Execute 行为准则
+- `memory-plan.md` 补充后续混合搜索（BM25 + 语义向量 + RRF）方案
+
 ## 2026-07-11 会话持久化 & MessageStore
 
 **新增：**

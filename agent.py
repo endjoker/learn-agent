@@ -50,6 +50,7 @@ from core.permission import PermissionChecker, ALLOW, ASK, DENY
 from tools import BaseTool, ToolRegistry
 from tools.builtin_tools import register_all_tools
 from tools.web_tools import register_web_tools
+from memory import MemoryManager
 
 
 # ============================================================
@@ -73,10 +74,50 @@ _ACTION_RE = re.compile(
     rf"(?:{TAG_ACTION}|行动)[：:]\s*\[?(\w+)\]?\s*(?:\n|$)"
     rf"(?:\s*(?:{TAG_INPUT}|输入)[：:]\s*"
     rf"(.+?)"
-    rf"(?=\s*(?:\n(?:{TAG_ACTION}|行动)[：:]|\n(?:{TAG_FINAL}|最终回答)[：:]|$))"
+    rf"(?=\s*(?:\n(?:{TAG_ACTION}|行动)[：:]|\n(?:{TAG_FINAL}|最终回答)[：:]|\n(?:{TAG_THOUGHT}|思考)[：:]|$))"
     rf")?",
     re.DOTALL | re.IGNORECASE
 )
+
+
+def _normalize_tags(text: str) -> str:
+    """
+    将 XML 风格标签标准化为 ReAct 解析器支持的格式
+
+    处理格式：
+      <THOUGHT>...</THOUGHT>    →  THOUGHT：...
+      <ACTION>...</ACTION>      →  ACTION：...
+      <INPUT>...</INPUT>        →  INPUT：...
+      <FINAL_ANSWER>...</FINAL_ANSWER>  →  FINAL_ANSWER：...
+
+    同时清理模型生成的特殊 token 标记（如 <|im_end|> 等），
+    防止混入工具参数导致 JSON 解析失败。
+    """
+    # 清理特殊 token 标记
+    text = re.sub(r"<\|[\w_]+\|>", "", text)
+
+    # 标准化 XML 风格标签
+    text = re.sub(
+        r"<\s*THOUGHT\s*>\s*(.*?)\s*<\s*/\s*THOUGHT\s*>",
+        r"THOUGHT：\1",
+        text, flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(
+        r"<\s*ACTION\s*>\s*(.*?)\s*<\s*/\s*ACTION\s*>",
+        r"ACTION：\1",
+        text, flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(
+        r"<\s*INPUT\s*>\s*(.*?)\s*<\s*/\s*INPUT\s*>",
+        r"INPUT：\1",
+        text, flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(
+        r"<\s*FINAL_ANSWER\s*>\s*(.*?)\s*<\s*/\s*FINAL_ANSWER\s*>",
+        r"FINAL_ANSWER：\1",
+        text, flags=re.DOTALL | re.IGNORECASE,
+    )
+    return text.strip()
 
 
 def parse_react_response(response: str) -> dict:
@@ -85,6 +126,9 @@ def parse_react_response(response: str) -> dict:
       { thought, actions: [{name, input}], final_answer }
     actions 可能包含多个工具调用（分批执行+合并结果）
     """
+    # 0. 标准化标签格式（支持 XML 风格的 <THOUGHT> 等标签）
+    response = _normalize_tags(response)
+
     # 1. FINAL_ANSWER
     final_answer = None
     m = re.search(
@@ -146,6 +190,7 @@ class Agent:
         max_history_tokens: int = 0,   # 上下文截断阈值（0=不截断）
         debug: bool = False,
         permission_checker: PermissionChecker = None,
+        memory: MemoryManager = None,  # 跨会话记忆系统（可选）
     ):
         self.name = name
         self.llm = llm
@@ -158,6 +203,7 @@ class Agent:
             self.max_history_tokens = max_history_tokens
         self.debug = debug
         self.permission = permission_checker or PermissionChecker()
+        self.memory = memory  # 跨会话记忆系统
         if debug:
             set_debug(True)
         # System Prompt
@@ -226,7 +272,8 @@ class Agent:
     def clear_history(self):
         """清空对话历史，但保留系统提示词"""
         self.store.clear()
-        # self.messages 通过引用同步，不用重新赋值
+        # 标记记忆系统：下次保存时强制新建条目，防止覆盖清空前的内容
+        self._memory_clear_count = getattr(self, '_memory_clear_count', 0) + 1
 
     def switch_llm(self, **kwargs):
         """
@@ -347,6 +394,33 @@ class Agent:
         return "\n".join(parts)
 
     # ============================================================
+    # 跨会话记忆自动保存
+    # ============================================================
+
+    def _save_memory(self, user_input: str):
+        """
+        将本轮对话归档到跨会话记忆（memory/daily/）
+
+        在每轮对话结束时自动调用，与 self.store.save_session() 并行。
+        """
+        if not self.memory:
+            return
+        try:
+            # 只保存不含 system prompt 的消息
+            non_system = [m for m in self.messages if m.get("role") != "system"]
+            # 排除刚刚追加的 system（resume 场景下 system 在 index 0）
+            # 如果 /clear 过，追加计数到 session_id 使记忆走新条目
+            clear_count = getattr(self, '_memory_clear_count', 0)
+            mem_session_id = f"{self.store.session_id}#{clear_count}" if clear_count else self.store.session_id
+            self.memory.save_conversation(
+                user_call=user_input,
+                messages=non_system,
+                session_id=mem_session_id,
+            )
+        except Exception as e:
+            logger.error(f"记忆保存失败: {e}")
+
+    # ============================================================
     # 执行工具
     # ============================================================
 
@@ -458,6 +532,7 @@ class Agent:
                     print(f"\n  ✅ 结论（{step} 步）")
                     print(f"  🤖 {parsed['final_answer']}")
                 self.store.save_session()
+                self._save_memory(user_input)
                 return parsed["final_answer"]
 
             # --- 批量 ACTION（支持多个工具并发执行） ---
@@ -584,9 +659,11 @@ class Agent:
                 if verbose:
                     print(f"  🤖 {answer}")
                 self.store.save_session()
+                self._save_memory(user_input)
                 return answer
 
         self.store.save_session()
+        self._save_memory(user_input)
         return (
             f"⚠️ 已达最大步数（{max_steps} 步），任务可能未完成。\n"
             f"建议拆分子任务，或用 create_agent(max_steps=50) 增加上限。"
@@ -674,14 +751,19 @@ def create_agent(
     max_history_tokens: int = 0,
     debug: bool = False,
     permission: bool = True,
+    memory: bool = True,
 ) -> Agent:
     """一行创建 Agent（含 read/write/edit/grep/glob/bash + search/web_fetch）"""
     setup_logging(debug=debug)
     if debug:
         set_debug(True)
     llm = HelloAgentsLLM(model=model, api_key=api_key, base_url=base_url, provider=provider)
+
+    # 记忆系统（跨会话）
+    memory_manager = MemoryManager() if memory else None
+
     registry = ToolRegistry()
-    register_all_tools(registry)
+    register_all_tools(registry, memory_manager=memory_manager)
     register_web_tools(registry)
 
     # 权限管理
@@ -693,6 +775,7 @@ def create_agent(
         max_history_tokens=max_history_tokens,
         debug=debug,
         permission_checker=checker,
+        memory=memory_manager,
     )
 
 
@@ -712,6 +795,9 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
     print("║   /model <name>      切换到云端模型             ║")
     print("║   /model local <name> 切换到本地模型            ║")
     print("║   /session           查看/管理会话              ║")
+    print("║   /session list      列出所有历史会话           ║")
+    print("║   /session save      保存当前会话               ║")
+    print("║   /session delete <id> 删除指定会话             ║")
     print("║   /stats             查看上下文占用             ║")
     print("║   /clear             清空对话历史               ║")
     print("║   /help              显示帮助                   ║")
@@ -825,15 +911,16 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                     print(f"  ✅ 已保存: {path}")
 
                 elif cmd == "delete":
-                    target = parts[2] if len(parts) > 2 else None
-                    if target:
+                    targets = parts[2:] if len(parts) > 2 else []
+                    if targets:
                         from core.message_store import MessageStore
-                        if MessageStore.delete_session_file(target):
-                            print(f"  🗑️  已删除会话: {target}")
-                        else:
-                            print(f"  ❌ 未找到会话: {target}")
+                        for target in targets:
+                            if MessageStore.delete_session_file(target):
+                                print(f"  🗑️  已删除会话: {target}")
+                            else:
+                                print(f"  ❌ 未找到会话: {target}")
                     else:
-                        print("  ❓ 用法: /session delete <session_id>")
+                        print("  ❓ 用法: /session delete <session_id1> [<session_id2> ...]")
 
                 else:
                     print("  ❓ 用法: /session [info|list|save|delete]")
@@ -861,6 +948,7 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                 print("    /session            查看/管理会话")
                 print("    /session list       列出所有会话")
                 print("    /session save       保存当前会话")
+                print("    /session delete <id> 删除指定会话")
                 print("    /stats              查看上下文占用统计")
                 print("    /clear              清空对话历史")
                 print("    /help               显示此帮助")

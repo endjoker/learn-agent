@@ -85,6 +85,7 @@ FINAL_ANSWER：[给用户的最终答案]
 3. name=tool_result，是工具返回的数据
 4. 信息足够时输出 FINAL_ANSWER
 6. 标签回复必须用英文
+
 </SYSTEM_STATIC_CONTEXT>"""
 
     # ================================================================
@@ -101,7 +102,7 @@ FINAL_ANSWER：[给用户的最终答案]
 
 【操作系统】
 {os_name}
-{agent_md_section}{session_instructions}
+{agent_md_section}{memory_md_section}{session_instructions}
 </SYSTEM_DYNAMIC_CONTEXT>"""
 
     def __init__(self, name: str = "helloworld agent"):
@@ -170,6 +171,10 @@ FINAL_ANSWER：[给用户的最终答案]
         agent_md = self._load_agent_md()
         agent_md_section = f"\n【项目记忆（AGENT.md）】\n{agent_md}\n" if agent_md else ""
 
+        # memory.md（长期记忆配置引用）
+        memory_md = self._load_memory_md()
+        memory_md_section = f"\n【跨会话记忆】\n{memory_md}\n" if memory_md else ""
+
         # 会话指令
         if self._session_instructions:
             lines = "\n".join(f"- {inst}" for inst in self._session_instructions)
@@ -182,6 +187,7 @@ FINAL_ANSWER：[给用户的最终答案]
             date=today,
             os_name=os_name,
             agent_md_section=agent_md_section,
+            memory_md_section=memory_md_section,
             session_instructions=session_section,
         )
 
@@ -212,6 +218,28 @@ FINAL_ANSWER：[给用户的最终答案]
     # ================================================================
     # 工具方法
     # ================================================================
+
+    # ================================================================
+    # memory.md 加载
+    # ================================================================
+
+    def _load_memory_md(self) -> Optional[str]:
+        """在项目根目录查找 memory/memory.md，存在则返回其内容"""
+        search_paths = []
+        if self._project_root:
+            search_paths.append(Path(self._project_root) / "memory" / "memory.md")
+        search_paths.append(Path.cwd() / "memory" / "memory.md")
+        search_paths.append(Path.cwd().parent / "memory" / "memory.md")
+
+        for md_path in search_paths:
+            if md_path.exists() and md_path.is_file():
+                try:
+                    content = md_path.read_text(encoding="utf-8").strip()
+                    if content:
+                        return content
+                except (OSError, UnicodeDecodeError):
+                    pass
+        return None
 
     @staticmethod
     def _get_os_name() -> str:

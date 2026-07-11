@@ -175,6 +175,8 @@ class PermissionChecker:
         self.set_rule("datetime", ALLOW)
         self.set_rule("calculate", ALLOW)
         self.set_rule("notes", ALLOW)
+        self.set_rule("memory_search", ALLOW)
+        self.set_rule("memory_update", ALLOW)
         self.set_rule("search", ALLOW)
         self.set_rule("web_fetch", ALLOW)
 

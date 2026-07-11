@@ -28,54 +28,62 @@ def setup_logging(debug: bool = False, log_file: str = None):
     配置日志系统
 
     参数:
-        debug: 是否启用 DEBUG 级别日志
-        log_file: 可选的日志文件路径
+        debug: 是否启用 DEBUG 级别日志（调试信息写入 log 文件，控制台保持 INFO）
+        log_file: 可选的日志文件路径（不传时 debug 模式自动生成 log/debug-YYYY-MM-DD.log）
     """
-    # 设置日志级别
-    level = logging.DEBUG if debug else logging.INFO
-    logger.setLevel(level)
+    import os
+    from datetime import date
 
     # 清除已有的 handler
     logger.handlers.clear()
 
-    # 控制台 handler
+    # 控制台 handler：始终输出 INFO 及以上级别（debug 信息不刷屏）
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(level)
-
-    # 日志格式
-    if debug:
-        fmt = '[%(asctime)s] %(levelname)-8s %(message)s'
-    else:
-        fmt = '%(levelname)-8s %(message)s'
-
-    formatter = logging.Formatter(fmt, datefmt='%Y-%m-%d %H:%M:%S')
+    console_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(levelname)-8s %(message)s')
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # 文件 handler（可选）
-    if log_file:
+    # 文件 handler（记录所有 DEBUG 级别详情）
+    file_handler = None
+    if debug or log_file:
+        if not log_file:
+            # 自动生成 log/debug-YYYY-MM-DD.log
+            today = date.today().strftime('%Y-%m-%d')
+            log_dir = os.path.join(os.getcwd(), 'log')
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, f'debug-{today}.log')
+
         file_handler = logging.FileHandler(log_file, encoding='utf-8')
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(logging.Formatter(
-            '[%(asctime)s] %(levelname)-8s %(name)s - %(message)s',
+            '[%(asctime)s] %(levelname)-8s %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         ))
         logger.addHandler(file_handler)
 
+    # 最终日志级别由最严格的 handler 决定
+    logger.setLevel(logging.DEBUG if (debug or file_handler) else logging.INFO)
+
     # 防止日志向上传播导致重复输出
     logger.propagate = False
 
+    if file_handler:
+        logger.debug(f'调试日志已写入: {log_file}')
+
 
 def set_debug(enabled: bool):
-    """开启或关闭调试日志（向后兼容）"""
+    """开启或关闭调试日志（仅影响文件 handler，控制台保持 INFO）"""
     if enabled:
         logger.setLevel(logging.DEBUG)
         for handler in logger.handlers:
-            handler.setLevel(logging.DEBUG)
+            if isinstance(handler, logging.FileHandler):
+                handler.setLevel(logging.DEBUG)
     else:
         logger.setLevel(logging.INFO)
         for handler in logger.handlers:
-            handler.setLevel(logging.INFO)
+            if isinstance(handler, logging.FileHandler):
+                handler.setLevel(logging.INFO)
 
 
 def is_debug() -> bool:

@@ -4,7 +4,7 @@
 
 ## ✨ 功能特性
 
-### 已实现的 14 个工具
+### 已实现的 16 个工具
 
 | 工具 | 功能 | 说明 |
 |:----|:-----|:-----|
@@ -22,6 +22,8 @@
 | **file_mgr** | 文件管理 | 复制/移动/删除/创建目录 |
 | **python** | 执行 Python 代码 | 运行代码片段并返回输出 |
 | **http** | HTTP 请求 | GET/POST，支持外部 API 调用 |
+| **memory_search** | 搜索记忆 | 基于 BM25 + 中文分词的跨会话记忆检索 |
+| **memory_update** | 更新记忆权重 | 标记记忆有用/无用，影响后续排序 |
 
 ### 核心能力
 
@@ -30,7 +32,9 @@
 - **三级权限管理** — allow/ask/deny，工作区路径检测，bash 命令分类，A/Y/N/S 交互
 - **模型配置** — `.env` 按模型名前缀分组，切换模型自动匹配参数和上下文长度
 - **模型切换** — 运行时通过 `/model` 命令在线切换模型
-- **调试日志** — `--debug` 参数开启，显示 Agent 与 LLM 的完整通信
+- **调试日志** — `--debug` 参数开启，调试信息写入 `log/` 目录文件，控制台保持简洁
+- **跨会话记忆** — 每轮对话自动归档到 `memory/daily/`，支持 BM25 全文检索回忆
+- **记忆搜索** — `memory_search` 工具基于 BM25 + jieba 中文分词，支持中英文混合搜索
 - **连续对话** — 跨多轮对话保留历史上下文，自动截断防超限
 - **会话持久化** — 每轮对话自动保存到 `sessions/{id}.json`，全量覆写，不丢失历史
 - **会话恢复** — `--resume <id>` 恢复指定会话，`--resume last` 按修改时间取最新会话
@@ -120,11 +124,20 @@ hello-agent/
 │   ├── __init__.py
 │   ├── base_tool.py         # 工具基类（接口规范）
 │   ├── registry.py          # 工具注册表（管理所有工具）
-│   ├── builtin_tools.py     # 内置工具（12 个：文件操作+计算+笔记+HTTP 等）
+│   ├── builtin_tools.py     # 内置工具（14 个：文件操作+计算+笔记+HTTP+记忆等）
+│   ├── memory_tools.py      # 记忆工具（memory_search + memory_update）
 │   └── web_tools.py         # 网页工具（search + web_fetch）
 │
-└── sessions/                # 会话文件（.gitignore）
-    └── *.json               # 自动保存的会话数据
+├── memory/                  # 跨会话记忆系统
+│   ├── __init__.py
+│   ├── manager.py           # MemoryManager（保存/检索/权重管理）
+│   └── memory.md            # 记忆配置引用（加载到 System Prompt）
+│
+├── sessions/                # 会话文件（.gitignore）
+│   └── *.json               # 自动保存的会话数据
+│
+└── log/                     # 调试日志文件（.gitignore）
+    └── debug-*.log          # --debug 模式自动生成
 ```
 
 ## 💻 使用指南
@@ -142,6 +155,7 @@ hello-agent/
 | `/session` | 查看/管理会话 |
 | `/session list` | 列出所有历史会话 |
 | `/session save` | 保存当前会话 |
+| `/session delete <id>` | 删除指定会话（支持批量） |
 | `/stats` | 查看上下文占用统计 |
 | `/clear` | 清空对话历史 |
 | `/help` | 显示帮助信息 |
@@ -262,6 +276,15 @@ agent = create_agent(debug=True)
 - [x] 会话管理命令（`/session info/list/save/delete`）
 - [x] 上下文占用统计（`/stats`）
 - [x] 消息变更通知回调（`on_update`，为 UI 预留）
+- [x] 跨会话长期记忆（MemoryManager）
+- [x] 记忆搜索（memory_search + BM25 + jieba 中文分词）
+- [x] 记忆权重管理（自动递增 + 软删除 < -5）
+- [x] 记忆自动归档（同会话同天合并同一条，全量覆写）
+- [x] 记忆配置引用（memory.md → SystemPrompt 动态加载）
+- [x] 调试日志写入文件（`--debug` 输出到 `log/`，控制台精简）
+- [x] XML 标签兼容（`<THOUGHT>` / `<FINAL_ANSWER>` 等）
+- [x] ReAct 解析增强（INPUT 边界修复 + 特殊 token 清理）
+- [x] /session delete 批量删除会话
 
 ## 📄 许可证
 

@@ -43,6 +43,7 @@ import requests
 from pathlib import Path
 from typing import List
 from .base_tool import BaseTool
+from .memory_tools import MemorySearchTool, MemoryUpdateTool
 
 logger = logging.getLogger('hello_agent')
 
@@ -1279,11 +1280,17 @@ BUILTIN_TOOLS = [
     FileManagerTool,
     PythonTool,
     HttpTool,
+    MemorySearchTool,
+    MemoryUpdateTool,
 ]
 
-def register_all_tools(registry):
+def register_all_tools(registry, memory_manager=None):
     """
     一键注册所有内置工具到注册表
+
+    参数:
+        registry: ToolRegistry 实例
+        memory_manager: MemoryManager 实例（可选），注入到记忆工具中
 
     使用方式：
         from tools import ToolRegistry
@@ -1291,6 +1298,7 @@ def register_all_tools(registry):
 
         registry = ToolRegistry()
         register_all_tools(registry)
+        register_all_tools(registry, memory_manager=mm)  # 启用记忆系统
     """
     from .registry import ToolRegistry
 
@@ -1298,6 +1306,10 @@ def register_all_tools(registry):
         raise TypeError("参数必须是 ToolRegistry 实例")
 
     for tool_cls in BUILTIN_TOOLS:
-        registry.register_tool(tool_cls())
+        tool = tool_cls()
+        # 为记忆工具注入 MemoryManager
+        if memory_manager and hasattr(tool, 'set_memory_manager'):
+            tool.set_memory_manager(memory_manager)
+        registry.register_tool(tool)
 
     return registry
