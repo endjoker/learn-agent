@@ -1051,31 +1051,61 @@ class FileManagerTool(BaseTool):
     """
 
     name: str = "file_mgr"
-    description: str = "文件管理操作：复制(copy)、移动(move)、删除(delete)、创建目录(mkdir)、列出目录(ls)。比用 bash 执行系统命令更安全。"
+    description: str = "文件管理操作：复制(copy)、移动(move)、删除(delete)、创建目录(mkdir)、列出目录(ls)。比用 bash 执行系统命令更安全。支持批量删除（传 paths 数组）。"
     parameters: dict = {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "description": "操作: copy（复制）、move（移动/重命名）、delete（删除文件）、mkdir（创建目录）、ls（列出目录）",
+                "description": "操作: copy（复制）、move（移动/重命名）、delete（删除文件/目录）、mkdir（创建目录）、ls（列出目录）",
             },
             "path": {
                 "type": "string",
-                "description": "操作的目标路径",
+                "description": "操作的目标路径（单路径操作时使用）",
+            },
+            "paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "路径列表（批量删除时使用，会依次删除所有路径；单路径操作请用 path）",
             },
             "dest": {
                 "type": "string",
                 "description": "目标路径（copy/move 时需要）",
             },
         },
-        "required": ["action", "path"],
+        "required": ["action"],
     }
 
-    def execute(self, action: str, path: str, dest: str = None) -> str:
+    def execute(self, action: str, path: str = None, paths: list = None, dest: str = None) -> str:
         import shutil
-        p = Path(path).resolve()
 
         action = action.lower()
+
+        # ===== 批量操作 =====
+        if paths and action == "delete":
+            results = []
+            for p_str in paths:
+                p = Path(p_str).resolve()
+                if not p.exists():
+                    results.append(f"  ❌ 路径不存在: {p}")
+                elif p.is_file():
+                    p.unlink()
+                    results.append(f"  ✅ 已删除文件: {p}")
+                else:
+                    shutil.rmtree(p)
+                    results.append(f"  ✅ 已删除目录: {p}")
+            ok = sum(1 for r in results if r.startswith("  ✅"))
+            fail = len(results) - ok
+            summary = f"🗑️ 批量删除完成：共 {len(results)} 项，✅ {ok} 成功"
+            if fail:
+                summary += f"，❌ {fail} 失败"
+            return summary + "\n" + "\n".join(results)
+
+        # ===== 单路径操作 =====
+        if not path:
+            return "❌ 请提供 path 参数（单操作）或 paths 参数（批量删除）"
+
+        p = Path(path).resolve()
 
         if action == "mkdir":
             p.mkdir(parents=True, exist_ok=True)
@@ -1101,7 +1131,6 @@ class FileManagerTool(BaseTool):
                 p.unlink()
                 return f"🗑️ 已删除文件: {p}"
             else:
-                import shutil
                 shutil.rmtree(p)
                 return f"🗑️ 已删除目录（含所有内容）: {p}"
 

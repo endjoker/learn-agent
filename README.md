@@ -29,14 +29,16 @@
 
 - **ReAct 循环** — 思考(THOUGHT) → 行动(ACTION) → 观察 → 循环直到给出最终回答
 - **多工具并发** — 一次输出多个 ACTION，并发执行，合并结果，减少上下文开销
+- **Plan-and-Execute** — 复杂任务自动出方案 → 用户确认 → 逐任务执行（`/plan` 手动触发）
+- **上下文压缩** — 轻量压缩（tool_result 替换元数据）+ 全量压缩（LLM 结构化摘要），60%/80% 阈值自动触发
+- **锚点跟踪** — 以 API 返回 `usage` 为锚点精确估算实时 token 占用
 - **三级权限管理** — allow/ask/deny，工作区路径检测，bash 命令分类，A/Y/N/S 交互
 - **模型配置** — `.env` 按模型名前缀分组，切换模型自动匹配参数和上下文长度
 - **模型切换** — 运行时通过 `/model` 命令在线切换模型
 - **调试日志** — `--debug` 参数开启，调试信息写入 `log/` 目录文件，控制台保持简洁
 - **跨会话记忆** — 每轮对话自动归档到 `memory/daily/`，支持 BM25 全文检索回忆
-- **记忆搜索** — `memory_search` 工具基于 BM25 + jieba 中文分词，支持中英文混合搜索
 - **连续对话** — 跨多轮对话保留历史上下文，自动截断防超限
-- **会话持久化** — 每轮对话自动保存到 `sessions/{id}.json`，全量覆写，不丢失历史
+- **会话持久化** — 每轮对话自动保存到 `sessions/{id}.json`，含任务清单序列化
 - **会话恢复** — `--resume <id>` 恢复指定会话，`--resume last` 按修改时间取最新会话
 - **上下文监控** — `/stats` 命令实时查看 token 占用、消息统计和按角色分布
 - **云端+本地** — 支持云端 API（OpenAI/DeepSeek）和本地模型（Ollama/LM Studio/vLLM/llama.cpp）
@@ -115,7 +117,9 @@ hello-agent/
 ├── core/                    # 核心组件
 │   ├── __init__.py
 │   ├── llm_client.py        # LLM 客户端（云端/本地模型适配，模型前缀参数读取）
-│   ├── message_store.py     # 消息存储模块（持久化、上下文统计、会话管理）
+│   ├── message_store.py     # 消息存储模块（持久化、上下文统计、锚点跟踪、会话管理）
+│   ├── compressor.py        # 上下文压缩（轻量 + 全量 LLM 摘要）
+│   ├── task_list.py         # 任务清单（Plan-and-Execute 数据模型）
 │   ├── debug.py             # 调试日志模块（带时间戳的 DEBUG 输出）
 │   ├── permission.py        # 权限管理模块（allow/ask/deny 三级）
 │   └── system_prompt.py     # System Prompt 构建器（静态区/动态区）
@@ -124,7 +128,7 @@ hello-agent/
 │   ├── __init__.py
 │   ├── base_tool.py         # 工具基类（接口规范）
 │   ├── registry.py          # 工具注册表（管理所有工具）
-│   ├── builtin_tools.py     # 内置工具（14 个：文件操作+计算+笔记+HTTP+记忆等）
+│   ├── builtin_tools.py     # 内置工具（14 个：文件操作+计算+笔记+HTTP+记忆等，含 file_mgr 批量删除）
 │   ├── memory_tools.py      # 记忆工具（memory_search + memory_update）
 │   └── web_tools.py         # 网页工具（search + web_fetch）
 │
@@ -157,6 +161,9 @@ hello-agent/
 | `/session save` | 保存当前会话 |
 | `/session delete <id>` | 删除指定会话（支持批量） |
 | `/stats` | 查看上下文占用统计 |
+| `/history` | 查看当前会话内容 |
+| `/plan [任务描述]` | 生成并执行任务方案（Plan-and-Execute） |
+| `/compact` | 手动触发全量上下文压缩 |
 | `/clear` | 清空对话历史 |
 | `/help` | 显示帮助信息 |
 | `exit` | 退出程序 |
@@ -285,6 +292,12 @@ agent = create_agent(debug=True)
 - [x] XML 标签兼容（`<THOUGHT>` / `<FINAL_ANSWER>` 等）
 - [x] ReAct 解析增强（INPUT 边界修复 + 特殊 token 清理）
 - [x] /session delete 批量删除会话
+- [x] 上下文压缩（轻量压缩 + 全量 LLM 摘要，60%/80% 阈值）
+- [x] 锚点式 token 跟踪（API usage 校准）
+- [x] Plan-and-Execute 任务清单（/plan 自动出方案 + 逐任务执行）
+- [x] 任务清单持久化（保存到 session JSON）
+- [x] file_mgr 批量删除（paths 参数）
+- [x] 非 dict INPUT 防御（友好提示 LLM 修正）
 
 ## 📄 许可证
 

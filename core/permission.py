@@ -265,7 +265,11 @@ class PermissionChecker:
           delete → 全ask（按A后区内升allow）
         """
         action = params.get("action", "").lower()
+        # 兼容单路径 path 和批量路径 paths
         path_str = params.get("path", "")
+        if not path_str:
+            paths_list = params.get("paths", [])
+            path_str = paths_list[0] if paths_list else ""
 
         # 没有路径 → 保守处理
         if not path_str:
@@ -367,26 +371,20 @@ class PermissionChecker:
 
         # 未设置规则 → 默认 ask（安全优先）
         if rule is None:
-            return ASK
+            return ALLOW if self._workspace_trusted else ASK
 
         # 固定权限
         if isinstance(rule, str):
+            if self._workspace_trusted and rule == ASK:
+                return ALLOW  # 工作区信任：将固定 ask 升为 allow
             return rule
 
         # 动态规则（回调函数）
         if callable(rule):
             level = rule(tool_name, params)
-            # 工作区信任：将 ask 提升为 allow（但 deny 保持）
+            # 工作区信任：将 ask 升为 allow（deny 保持）
             if self._workspace_trusted and level == ASK:
-                # 检查是否是路径原因导致的 ask
-                path_str = self._extract_path(params)
-                if path_str:
-                    path = resolve_path(path_str, self.workspace)
-                    if is_within_workspace(path, self.workspace):
-                        # 工作区内且已信任 → 放行
-                        return ALLOW
-                # 非路径相关的 ask（如 python/http）→ 仍 ask
-                return level
+                return ALLOW
             return level
 
         return ASK

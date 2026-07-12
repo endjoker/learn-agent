@@ -230,6 +230,8 @@ class MemoryManager:
                 continue
 
             content = msg.get("content", "")
+            # 转义反斜杠，防止 Windows 路径（如 D:\path）被后续操作当成非法转义
+            content = content.replace("\\", "\\\\")
             # 对 assistant 消息过滤掉 ACTION/INPUT
             if role == "assistant":
                 content = self._filter_assistant_content(content)
@@ -464,7 +466,8 @@ class MemoryManager:
             re.DOTALL,
         )
         if pattern.search(content):
-            content = pattern.sub(block.rstrip(), content)
+            # 使用 lambda：避免 re.sub 将 Windows 路径 \p 等当成非法转义处理
+            content = pattern.sub(lambda m: block.rstrip(), content)
         else:
             content = content.rstrip() + "\n\n" + block
 

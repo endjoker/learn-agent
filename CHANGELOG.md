@@ -1,5 +1,45 @@
 # 更新日志
 
+## 2026-07-12 上下文压缩 & 任务清单 & 多项优化
+
+**新增：**
+- 新增 `core/compressor.py`：两级上下文压缩
+  - 轻量压缩：已消费的 tool_result 替换为元数据摘要（0 LLM 成本）
+  - 全量压缩：LLM 结构化摘要，WARN_RATIO=60% 提示 / AUTO_RATIO=80% 自动触发
+  - `find_safe_tail_boundary()` 安全截断，不切断 tool_use/tool_result 配对
+- 新增 `core/task_list.py`：Plan-and-Execute 任务清单
+  - `TaskList` / `TaskItem` 模型，支持状态推进（pending → in_progress → completed）
+  - `from_plan_text()` 解析 LLM 的 PLAN 输出
+  - `to_prompt_section()` 注入 system prompt 动态区，LLM 感知进度
+  - `to_summary()` 渲染完成总结（含每个任务结果）
+  - 序列化到 session JSON，`--resume` 后自动恢复进度
+- 新增 `/plan [任务描述]` 命令：手动触发方案生成 + 确认 + 逐任务执行
+- 新增 `/history` 命令：查看当前会话内容
+- 新增 `/compact` 命令：手动触发全量压缩
+- 新增会话级 Plan-and-Execute 流程：
+  - LLM 首轮输出 PLAN: 标签自动检测
+  - 用户确认后自动创建任务清单 → 框架驱动逐步执行
+  - 每完成一步输出 COMPLETE_TASK → 自动推进到下一步
+  - 全部完成后输出带清单的完成总结
+- `file_mgr` 工具新增 `paths` 参数支持批量删除
+
+**架构优化：**
+- 锚点式 token 跟踪：以 API 返回的 `response.usage` 为锚点，`live_tokens()` 增量估算
+- `llm_client.think()` 新增 `silent` 参数（内部 LLM 调用不打印）
+- `_extract_usage()` 兼容 DeepSeek（prompt_tokens）和 OpenAI（input_tokens）
+- `message_store.set_anchor(usage)` + `live_tokens()` 方法
+- `run()` 重构：Phase 1 ReAct → break → Phase 2 `_run_task_list()` 独立执行
+- agent.py 参数解析同时支持 `--resume` 和 `-resume`
+- 切换模型时同步 `store.max_tokens` 和 `store.model_*` 字段
+- 系统 prompt 动态区注入（`<SYSTEM_TASK_LIST>`），任务进度增量更新
+
+**Bug 修复：**
+- permission `_workspace_trusted` 只在 callable 规则中检查 → 现在 None/str/callable 三条分支都检查
+- Memory save `re.error: bad escape \p` → 用 lambda 替换 + 反斜杠转义
+- 非 dict 的 INPUT（如 JSON 数组）导致 `AttributeError` → 加类型检查，走拒绝提示给 LLM
+- `/plan` 确认方案后会话退出 → `/plan` handler 调用 `_run_task_list()` 执行任务
+- 任务完成输出只显示"全部完成" → 改为带任务清单和结果的完整总结
+
 ## 2026-07-12 跨会话记忆系统 & BM25 检索
 
 **新增：**

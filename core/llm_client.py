@@ -299,6 +299,27 @@ class HelloAgentsLLM:
             timeout=timeout_value,
         )
 
+        # ---- 最后一次 API 调用的 token 用量（锚点） ----
+        self.last_usage: Optional[Dict[str, int]] = None
+
+    @staticmethod
+    def _extract_usage(usage) -> Optional[Dict[str, int]]:
+        """
+        从 API 返回的 usage 对象中提取 token 数。
+
+        兼容两种字段命名：
+          - OpenAI 格式: prompt_tokens / completion_tokens
+          - DeepSeek 格式: input_tokens / output_tokens
+        """
+        if not usage:
+            return None
+        return {
+            "input_tokens": getattr(usage, "input_tokens", None)
+                            or getattr(usage, "prompt_tokens", 0) or 0,
+            "output_tokens": getattr(usage, "output_tokens", None)
+                             or getattr(usage, "completion_tokens", 0) or 0,
+        }
+
     # ============================================================
     # 核心方法：调用 LLM
     # ============================================================
@@ -308,12 +329,22 @@ class HelloAgentsLLM:
         messages: List[Dict[str, str]],
         temperature: float = 0,
         stream: bool = True,
+        silent: bool = False,
     ) -> Optional[str]:
         """
         让 LLM 思考并返回响应
+
+        参数:
+            messages:   对话消息列表
+            temperature: 生成温度
+            stream:      是否流式输出
+            silent:      静默模式（不输出模式标签，供内部压缩等场景使用）
         """
-        mode_tag = "🏠 本地" if self.llm_type == "local" else "☁️ 云端"
-        print(f"  ▶ {mode_tag} {self.model}（{self.base_url}）")
+        if not silent:
+            mode_tag = "🏠 本地" if self.llm_type == "local" else "☁️ 云端"
+            print(f"  ▶ {mode_tag} {self.model}（{self.base_url}）")
+
+        self.last_usage = None  # 重置，防止读到上次的脏数据
 
         try:
             response = self.client.chat.completions.create(
@@ -326,6 +357,9 @@ class HelloAgentsLLM:
             if stream:
                 collected = []
                 for chunk in response:
+                    # 流式末块：choices=[] 但 usage 带数据
+                    if chunk.usage:
+                        self.last_usage = self._extract_usage(chunk.usage)
                     if not chunk.choices:
                         continue
                     content = chunk.choices[0].delta.content or ""
@@ -335,6 +369,8 @@ class HelloAgentsLLM:
                 return "".join(collected)
             else:
                 content = response.choices[0].message.content
+                if response.usage:
+                    self.last_usage = self._extract_usage(response.usage)
                 return content
 
         except Exception as e:
