@@ -4,7 +4,7 @@
 
 ## ✨ 功能特性
 
-### 已实现的 16 个工具
+### 已实现的 16 个内置工具 + MCP 扩展
 
 | 工具 | 功能 | 说明 |
 |:----|:-----|:-----|
@@ -24,6 +24,7 @@
 | **http** | HTTP 请求 | GET/POST，支持外部 API 调用 |
 | **memory_search** | 搜索记忆 | 基于 BM25 + 中文分词的跨会话记忆检索 |
 | **memory_update** | 更新记忆权重 | 标记记忆有用/无用，影响后续排序 |
+| **MCP 工具** | 动态加载 | 连接外部 MCP Server，自动发现工具并注册（数量取决于服务器） |
 
 ### 核心能力
 
@@ -35,6 +36,8 @@
 - **三级权限管理** — allow/ask/deny，工作区路径检测，bash 命令分类，A/Y/N/S 交互
 - **模型配置** — `.env` 按模型名前缀分组，切换模型自动匹配参数和上下文长度
 - **模型切换** — 运行时通过 `/model` 命令在线切换模型
+- **MCP 集成** — 支持 Model Context Protocol，可连接外部 MCP Server（GitHub/filesystem/网页搜索等），支持 Stdio、HTTP+SSE、StreamableHTTP 三种传输方式
+- **MCP 配置** — 通过 `config/mcp_config.json` 文件或代码参数配置，支持多服务器自动发现工具
 - **调试日志** — `--debug` 参数开启，调试信息写入 `log/` 目录文件，控制台保持简洁
 - **跨会话记忆** — 每轮对话自动归档到 `memory/daily/`，支持 BM25 全文检索回忆
 - **连续对话** — 跨多轮对话保留历史上下文，自动截断防超限
@@ -88,6 +91,36 @@ gemma4_PROVIDER=ollama
 gemma4_CONTEXT_LENGTH=262144
 ```
 
+### MCP 配置
+
+通过 `config/mcp_config.json` 配置外部 MCP 服务器（复制模板文件修改）：
+
+```json
+[
+  {
+    "name": "web-search",
+    "transport": "streamable",
+    "url": "http://192.168.1.110:3000/mcp"
+  },
+  {
+    "name": "filesystem",
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+  }
+]
+```
+
+支持三种传输方式：
+
+| 传输类型 | 说明 | 配置字段 |
+|:---------|:-----|:---------|
+| `stdio` | 本地子进程（npx 启动的服务） | `command` + `args` + `env` |
+| `http+sse` | 远程 HTTP+SSE（旧版 MCP 协议） | `url` + `headers` |
+| `streamable` | 远程 Streamable HTTP（新版 MCP 协议） | `url` + `headers` |
+
+MCP 工具会自动添加 `{name}/` 前缀（如 `web-search/search`），LLM 无需感知工具是本地还是远程。
+
 ### 启动
 
 ```bash
@@ -122,7 +155,8 @@ hello-agent/
 │   ├── task_list.py         # 任务清单（Plan-and-Execute 数据模型）
 │   ├── debug.py             # 调试日志模块（带时间戳的 DEBUG 输出）
 │   ├── permission.py        # 权限管理模块（allow/ask/deny 三级）
-│   └── system_prompt.py     # System Prompt 构建器（静态区/动态区）
+│   ├── system_prompt.py     # System Prompt 构建器（静态区/动态区）
+│   └── mcp_client.py        # MCP 客户端（Stdio/SSE/StreamableHTTP 传输 + JSON-RPC 协议）
 │
 ├── tools/                   # 工具系统
 │   ├── __init__.py
@@ -130,7 +164,12 @@ hello-agent/
 │   ├── registry.py          # 工具注册表（管理所有工具）
 │   ├── builtin_tools.py     # 内置工具（14 个：文件操作+计算+笔记+HTTP+记忆等，含 file_mgr 批量删除）
 │   ├── memory_tools.py      # 记忆工具（memory_search + memory_update）
-│   └── web_tools.py         # 网页工具（search + web_fetch）
+│   ├── web_tools.py         # 网页工具（search + web_fetch）
+│   └── mcp_tools.py         # MCP 工具桥接层（将 MCP 工具适配为 BaseTool）
+│
+├── config/                  # 配置文件目录
+│   ├── mcp_config.json      # MCP 服务器配置（含 Token，已 gitignore）
+│   └── mcp_config.template.json  # MCP 配置模板（含三种传输方式示例）
 │
 ├── memory/                  # 跨会话记忆系统
 │   ├── __init__.py
@@ -163,6 +202,8 @@ hello-agent/
 | `/stats` | 查看上下文占用统计 |
 | `/history` | 查看当前会话内容 |
 | `/plan [任务描述]` | 生成并执行任务方案（Plan-and-Execute） |
+| `/mcp` | 查看 MCP 服务器连接状态 |
+| `/mcp list` | 查看 MCP 服务器详情与工具列表 |
 | `/compact` | 手动触发全量上下文压缩 |
 | `/clear` | 清空对话历史 |
 | `/help` | 显示帮助信息 |

@@ -1,5 +1,30 @@
 # 更新日志
 
+## 2026-07-15 MCP 模块接入
+
+**新功能：**
+- MCP（Model Context Protocol）客户端模块
+  - `core/mcp_client.py` — 三层架构：传输层（Stdio/SSE/StreamableHTTP）+ 协议层（JSON-RPC 2.0）+ MCPClientManager
+  - `tools/mcp_tools.py` — MCPTool 桥接层，将 MCP 工具透明适配为 BaseTool，LLM 无感调用
+  - 支持三种传输方式：`stdio`（本地子进程）、`http+sse`（远程 SSE）、`streamable`（新版 Streamable HTTP）
+- 配置文件系统
+  - `config/mcp_config.json` — 用户 MCP 配置（含 Token，已 gitignore）
+  - `config/mcp_config.template.json` — 配置模板
+  - `create_agent()` 自动加载：代码参数 > config/mcp_config.json > 项目根目录（兼容旧路径）
+- 交互式 `/mcp` 命令
+  - `/mcp` — 概览 MCP 服务器连接状态
+  - `/mcp list` — 查看服务器详情与工具列表
+  - 按需初始化：未运行前配置在首次使用或输入 `/mcp` 时自动初始化
+
+**架构改进：**
+- MCP 工具自动添加 `{server_name}/` 前缀，无命名冲突
+- 优雅降级：单台 MCP 服务器初始化失败不影响其他工具
+- 退出时自动关闭所有 MCP 连接（清理 aiohttp session 和子进程）
+- 工具调用经过 PermissionChecker 权限控制
+
+**依赖变更：**
+- `requirements.txt` 新增 `aiohttp>=3.9.0`（SSE/StreamableHTTP 传输所需）
+
 ## 2026-07-14 代码审查优化 & LLM 重试逻辑
 
 **安全修复：**
