@@ -18,9 +18,11 @@ tools 包 —— Agent 工具系统
 
 from .base_tool import BaseTool
 from .registry import ToolRegistry
+from .mcp_tools import MCPTool
 
 # 方便外部直接导入
 __all__ = [
     "BaseTool",
     "ToolRegistry",
+    "MCPTool",
 ]

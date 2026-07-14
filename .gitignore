@@ -22,6 +22,9 @@ Thumbs.db
 # 学习目录
 code/
 
+# MCP 服务器配置（含 Token 等敏感信息）
+config/mcp_config.json
+
 # 会话文件（用户本地，不提交）
 sessions/
 

@@ -186,6 +186,7 @@ class Agent:
         debug: bool = False,
         permission_checker: PermissionChecker = None,
         memory: MemoryManager = None,  # 跨会话记忆系统（可选）
+        mcp_servers: list = None,      # MCP 服务器配置列表（可选）
     ):
         self.name = name
         self.llm = llm
@@ -201,6 +202,10 @@ class Agent:
         self.memory = memory  # 跨会话记忆系统
         if debug:
             set_debug(True)
+        # MCP 客户端管理器（延迟初始化）
+        self.mcp_manager = None
+        self._mcp_pending_init = mcp_servers
+        self._mcp_tool_names: list = []  # 记录 MCP 工具名称（方便清理）
         # System Prompt
         self.system_prompt_builder = system_prompt_builder
         if system_prompt:
@@ -450,6 +455,81 @@ class Agent:
         builder.set_project_root(os.getcwd())
         return builder.build(tool_descs=tool_descs)
 
+    # ============================================================
+    # MCP 初始化
+
+    # ============================================================
+
+    def _init_mcp_if_needed(self):
+        """
+        延迟初始化 MCP 连接
+
+        在首次 run() 时执行，依次完成：
+        1. 创建 MCPClientManager
+        2. 添加所有服务器配置
+        3. 初始化连接（带重试）
+        4. 发现工具并注册到 ToolRegistry
+        5. 重建 System Prompt 以包含 MCP 工具描述
+        """
+        if not self._mcp_pending_init:
+            return
+
+        import asyncio
+        from core.mcp_client import MCPClientManager
+        from tools.mcp_tools import MCPTool
+
+        configs = self._mcp_pending_init
+        self._mcp_pending_init = None  # 避免重复初始化
+
+        # 使用 asyncio.run() 执行异步初始化
+        asyncio.run(self._async_init_mcp(configs, MCPClientManager, MCPTool))
+
+    async def _async_init_mcp(self, configs, MCPClientManager_cls, MCPTool_cls):
+        """异步初始化 MCP 连接（由 _init_mcp_if_needed 调用）"""
+        self.mcp_manager = MCPClientManager_cls()
+
+        # 1. 添加所有服务器配置
+        for cfg in configs:
+            try:
+                self.mcp_manager.add_server(cfg)
+            except Exception as e:
+                logger.error(
+                    f"添加 MCP 服务器 '{cfg.get('name')}' 失败: {e}"
+                )
+
+        # 2. 初始化所有连接
+        await self.mcp_manager.initialize_all()
+
+        # 3. 发现工具并注册到注册表
+        all_tools = await self.mcp_manager.discover_all_tools()
+        for server_name, tools in all_tools.items():
+            conn = self.mcp_manager.get_connection(server_name)
+            if not conn or not tools:
+                continue
+            for tool_desc in tools:
+                # 添加服务器前缀以避免不同服务器的工具重名
+                prefixed_desc = dict(tool_desc)
+                prefixed_desc["name"] = f"{server_name}/{tool_desc['name']}"
+                mcp_tool = MCPTool_cls(connection=conn, tool_desc=prefixed_desc)
+                try:
+                    self.tool_registry.register_tool(mcp_tool)
+                    self._mcp_tool_names.append(mcp_tool.name)
+                    logger.info(f"注册 MCP 工具: {mcp_tool.name}")
+                except ValueError as e:
+                    logger.warning(
+                        f"注册 MCP 工具失败 '{mcp_tool.name}': {e}"
+                    )
+
+        # 4. 重建 System Prompt 以包含 MCP 工具描述
+        if self._mcp_tool_names:
+            self.system_prompt = self._build_system_prompt()
+            # 如果对话已开始（已有 system 消息），更新它
+            if self.messages and self.messages[0].get("role") == "system":
+                self.messages[0]["content"] = self.system_prompt
+            logger.info(
+                f"MCP 初始化完成: {len(self._mcp_tool_names)} 个工具已注册"
+            )
+
     def add_instruction(self, instruction: str) -> None:
         """
 
@@ -620,6 +700,8 @@ class Agent:
         """
 
         max_steps = self.max_steps
+        # ---- 首次运行时初始化 MCP 连接（如果有配置） ----
+        self._init_mcp_if_needed()
         # ---- 首次调用时初始化对话历史 ----
         if not self.messages:
             self.messages.append({"role": "system", "content": self.system_prompt})
@@ -1118,6 +1200,49 @@ class Agent:
         self._save_memory(user_input)
         yield f"\n⚠️ 已达最大步数 {max_steps}\n"
 
+
+# ============================================================
+# MCP 配置加载
+
+# ============================================================
+
+
+def _load_mcp_config(mcp_servers: list = None) -> list:
+    """
+    自动加载 MCP 配置，优先级：
+    1. 显式传入的 mcp_servers 参数
+    2. config/mcp_config.json 文件
+    3. 项目根目录的 mcp_config.json 文件（兼容旧路径）
+
+    参数:
+        mcp_servers: 代码传入的配置（最高优先级）
+    返回:
+        MCP 服务器配置列表，无配置时返回 None
+    """
+    # 优先级 1：显式传入
+    if mcp_servers is not None:
+        return mcp_servers
+
+    # 优先级 2：config/mcp_config.json
+    config_paths = [
+        os.path.join(os.getcwd(), "config", "mcp_config.json"),
+        os.path.join(os.getcwd(), "mcp_config.json"),  # 旧路径兼容
+    ]
+    for config_path in config_paths:
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    parsed = json.load(f)
+                if isinstance(parsed, list):
+                    rel = os.path.relpath(config_path)
+                    logger.info(f"从 {rel} 加载了 {len(parsed)} 个 MCP 服务器配置")
+                    return parsed
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"{config_path} 读取失败: {e}")
+
+    return None
+
+
 # ============================================================
 # 快速启动
 
@@ -1135,8 +1260,24 @@ def create_agent(
     debug: bool = False,
     permission: bool = True,
     memory: bool = True,
+    mcp_servers: list = None,    # MCP 服务器配置列表（可选）
 ) -> Agent:
-    """一行创建 Agent（含 read/write/edit/grep/glob/bash + search/web_fetch）"""
+    """
+    一行创建 Agent（含 read/write/edit/grep/glob/bash + search/web_fetch）
+
+    参数:
+        name: Agent 名称
+        model: 模型名称
+        api_key: API 密钥
+        base_url: API 地址
+        provider: 服务商（ollama/openai/lmstudio）
+        max_steps: 最大 ReAct 步数
+        max_history_tokens: 上下文预算阈值
+        debug: 调试模式
+        permission: 权限管理
+        memory: 跨会话记忆
+        mcp_servers: MCP 服务器配置列表，每项含 name/transport/command 等
+    """
 
     setup_logging(debug=debug)
     if debug:
@@ -1149,6 +1290,8 @@ def create_agent(
     register_web_tools(registry)
     # 权限管理
     checker = PermissionChecker() if permission else None
+    # MCP 配置：代码参数 > .env > mcp_config.json
+    mcp_servers = _load_mcp_config(mcp_servers)
     return Agent(
         name=name, llm=llm, tool_registry=registry,
         max_steps=max_steps,
@@ -1156,6 +1299,7 @@ def create_agent(
         debug=debug,
         permission_checker=checker,
         memory=memory_manager,
+        mcp_servers=mcp_servers,
     )
 
 # ============================================================
@@ -1237,6 +1381,13 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                 continue
             # ---- 退出 ----
             if u.lower() in ("exit", "quit", "q", "退出"):
+                # 清理 MCP 连接（关闭 aiohttp session 和子进程）
+                if hasattr(agent, 'mcp_manager') and agent.mcp_manager:
+                    import asyncio
+                    try:
+                        asyncio.run(agent.mcp_manager.close_all())
+                    except Exception:
+                        pass
                 print("👋 再见！")
                 break
             # ---- /model 命令 ----
@@ -1391,6 +1542,99 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                 agent.clear_history()
                 print(f"  🗑️  当前上下文已清空（历史仍保存在会话文件中）")
                 continue
+            # ---- /mcp ----
+            if u.startswith("/mcp"):
+                from tools.mcp_tools import MCPTool
+
+                # 有未初始化的配置则立即初始化
+                if not agent.mcp_manager and agent._mcp_pending_init:
+                    agent._init_mcp_if_needed()
+
+                if not agent.mcp_manager:
+                    print("\n  ℹ️  未配置 MCP 服务器")
+                    print("  配置方式：")
+                    print("    1. create_agent(mcp_servers=[...])")
+                    print("    2. 在 config/mcp_config.json 中配置")
+                else:
+                    parts = u.split()
+                    sub = parts[1] if len(parts) > 1 else "status"
+                    conn_names = agent.mcp_manager.list_connections()
+
+                    if sub == "list":
+                        print(f"\n  🔌 MCP 服务器详情")
+                        print(f"  ─────────────────────────────────")
+                        for i, name in enumerate(conn_names, 1):
+                            conn = agent.mcp_manager.get_connection(name)
+                            status = "✅ 已连接" if (conn and conn.is_initialized) else "❌ 未连接"
+                            transport = agent.mcp_manager._configs.get(name, {}).get("transport", "?")
+                            print(f"  [{i}] {name} ({transport})")
+                            print(f"     状态: {status}")
+                            # 列出该服务器的工具
+                            mcp_tools = [
+                                t for t in agent.tool_registry.list_tools()
+                                if isinstance(t, MCPTool) and t.name.startswith(f"{name}/")
+                            ]
+                            if mcp_tools:
+                                print(f"     工具:")
+                                for t in mcp_tools:
+                                    desc_short = t.description[:50]
+                                    print(f"       - {t.name}")
+                                    if desc_short:
+                                        print(f"         {desc_short}")
+                            else:
+                                print(f"     工具: （无）")
+                            print()
+                    elif sub == "tools":
+                        # /mcp tools [server]
+                        target = parts[2] if len(parts) > 2 else None
+                        all_mcp = [t for t in agent.tool_registry.list_tools() if isinstance(t, MCPTool)]
+                        if target:
+                            all_mcp = [t for t in all_mcp if t.name.startswith(f"{target}/")]
+                        if not all_mcp:
+                            print(f"\n  ℹ️  未找到 MCP 工具" + (f"（服务器: {target}）" if target else ""))
+                        else:
+                            print(f"\n  🔧 MCP 工具列表" + (f"（{target}）" if target else ""))
+                            print(f"  ─────────────────────────────────")
+                            for t in all_mcp:
+                                desc_short = t.description[:60]
+                                print(f"  ▶ {t.name}")
+                                if desc_short:
+                                    print(f"     {desc_short}")
+                                # 显示参数摘要
+                                props = t.parameters.get("properties", {})
+                                if props:
+                                    required = t.parameters.get("required", [])
+                                    param_hints = []
+                                    for pname, pinfo in props.items():
+                                        req = "必填" if pname in required else "可选"
+                                        param_hints.append(f"{pname} ({pinfo.get('type', '?')}, {req})")
+                                    print(f"     参数: {', '.join(param_hints[:5])}")
+                                    if len(param_hints) > 5:
+                                        print(f"           ... 共 {len(param_hints)} 个参数")
+                                print()
+                    else:
+                        # /mcp 或 /mcp status — 概览
+                        ok = sum(1 for n in conn_names
+                                 if (c := agent.mcp_manager.get_connection(n)) and c.is_initialized)
+                        fail = len(conn_names) - ok
+                        # 统计 MCP 工具总数
+                        all_mcp = [t for t in agent.tool_registry.list_tools() if isinstance(t, MCPTool)]
+                        print(f"\n  🔌 MCP 服务器状态")
+                        print(f"  ─────────────────────────────────")
+                        for name in conn_names:
+                            conn = agent.mcp_manager.get_connection(name)
+                            if conn and conn.is_initialized:
+                                server_tools = [t for t in all_mcp if t.name.startswith(f"{name}/")]
+                                print(f"  🔗 {name:<16} ✅ 已连接  ({len(server_tools)} 个工具)")
+                            else:
+                                print(f"  🔗 {name:<16} ❌ 未连接")
+                        print(f"  ─────────────────────────────────")
+                        print(f"  共 {len(conn_names)} 个服务器, {len(all_mcp)} 个 MCP 工具注册")
+                        if ok:
+                            print(f"  运行 /mcp list 查看详情")
+                        if fail > 0:
+                            print(f"  ⚠️  {fail} 个服务器初始化失败，检查日志了解详情")
+                continue
             # ---- /help ----
             if u.startswith("/help"):
                 print("\n  命令:")
@@ -1404,6 +1648,8 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                 print("    /session delete <id> 删除指定会话")
                 print("    /stats              查看上下文占用统计")
                 print("    /history            查看当前会话内容")
+                print("    /mcp                查看 MCP 服务器状态")
+                print("    /mcp list           查看 MCP 服务器详情与工具列表")
                 print("    /compact            手动执行全量压缩（上下文 >60% 时推荐使用）")
                 print("    /clear              清空对话历史")
                 print("    /help               显示此帮助")

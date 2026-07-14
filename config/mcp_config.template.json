@@ -1,0 +1,29 @@
+[
+  {
+    "name": "github",
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-github"
+    ],
+    "env": {
+      "GITHUB_TOKEN": "你的 GitHub Token"
+    }
+  },
+  {
+    "name": "filesystem",
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-filesystem",
+      "."
+    ]
+  },
+  {
+    "name": "web-search",
+    "transport": "streamable",
+    "url": "http://192.168.0.110:3000/mcp"
+  }
+]
