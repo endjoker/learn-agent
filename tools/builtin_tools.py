@@ -917,11 +917,13 @@ class CalculatorTool(BaseTool):
             value = self._safe_eval(node.value, funcs)
             if isinstance(node.slice, ast.Constant):
                 return value[node.slice.value]
-            elif isinstance(node.slice, ast.Index):
-                return value[self._safe_eval(node.slice.value, funcs)]
             elif isinstance(node.slice, ast.Slice):
-                return value[self._safe_eval(node.slice.lower, funcs):self._safe_eval(node.slice.upper, funcs)]
-            return value[node.slice]
+                lower = self._safe_eval(node.slice.lower, funcs) if node.slice.lower else None
+                upper = self._safe_eval(node.slice.upper, funcs) if node.slice.upper else None
+                step = self._safe_eval(node.slice.step, funcs) if node.slice.step else None
+                return value[lower:upper:step]
+            else:
+                return value[self._safe_eval(node.slice, funcs)]
         else:
             raise ValueError(f"不支持的表达式类型: {type(node).__name__}")
 

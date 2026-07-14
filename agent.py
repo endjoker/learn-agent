@@ -267,10 +267,10 @@ class Agent:
         dropped = 0
         while len(self.messages) > 3 and total > self.max_history_tokens:
             msg = self.messages.pop(1)  # 跳过 system（index 0）
-            total -= self._estimate_tokens(msg.get("content", ""))
             dropped += 1
+            total = self.store.live_tokens()  # 重新计算，避免估算口径不一致
         log_info(
-            f"⚠️ 紧急截断: 压缩后仍超预算，丢弃 {dropped} 条消息（{total} → ≤{self.max_history_tokens} tokens）"
+            f"⚠️ 紧急截断: 压缩后仍超预算，丢弃 {dropped} 条消息（剩余 {total} tokens）"
         )
 
     # ============================================================
@@ -888,6 +888,8 @@ class Agent:
 
     def _run_task_list(self, user_input, max_steps, verbose):
         """Phase 2: 任务清单模式 —— 框架主动推进，逐任务执行"""
+        # plan 模式：自动信任工作区，区内操作免确认，区外仍需审批
+        self.permission.allow_workspace()
         while not self._task_list.is_all_done():
             current = self._task_list.get_current()
             if not current:
@@ -944,20 +946,64 @@ class Agent:
                         names = [a["name"] for a in acts]
                         print(f"  🛠️  {TAG_ACTION}({len(acts)}): {', '.join(names)}")
                     self.messages.append({"role": "assistant", "content": response})
+                    # 权限检查（plan 模式：区内自动放行，区外需确认）
+                    checked_acts = []
+                    denied_acts = []
+                    for a in acts:
+                        tool_name = a["name"]
+                        input_str = a["input"]
+                        try:
+                            params = json.loads(input_str) if input_str else {}
+                        except json.JSONDecodeError:
+                            params = {}
+                        if not isinstance(params, dict):
+                            reason = f"INPUT 必须是 JSON 对象，但收到了 JSON {type(params).__name__}。"
+                            denied_acts.append((tool_name, input_str, reason))
+                            continue
+                        level = self.permission.check(tool_name, params)
+                        if level == ALLOW:
+                            checked_acts.append(a)
+                        elif level == DENY:
+                            reason = "权限不足，操作已被系统拒绝"
+                            denied_acts.append((tool_name, input_str, reason))
+                            if verbose:
+                                print(f"  ⛔ {tool_name}: {reason}")
+                        elif level == ASK:
+                            if verbose:
+                                print(f"\n  ❓ 需要确认: {tool_name}")
+                                for k, v in params.items():
+                                    print(f"     {k}: {str(v)[:120]}")
+                            choice = input(f"  请选择 [A/Y/N/S] (默认Y) ").strip().lower()
+                            if choice == "a":
+                                self.permission.allow_workspace()
+                                checked_acts.append(a)
+                            elif choice in ("", "y", "yes"):
+                                checked_acts.append(a)
+                            elif choice == "s":
+                                denied_acts.append((tool_name, input_str, "用户选择跳过"))
+                            else:
+                                return f"操作已取消：用户拒绝了 {tool_name}，对话已终止。"
                     t_results = []
-                    with ThreadPoolExecutor(max_workers=min(len(acts), 5)) as pool:
-                        tfm = {pool.submit(self._execute_tool, a["name"], a["input"]): a for a in acts}
-                        for f in as_completed(tfm):
-                            a = tfm[f]
-                            try:
-                                obs = f.result()
-                            except Exception as e:
-                                obs = f"❌ 异常: {e}"
-                            t_results.append((a["name"], a["input"], obs, obs.startswith("❌")))
+                    if checked_acts:
+                        with ThreadPoolExecutor(max_workers=min(len(checked_acts), 5)) as pool:
+                            tfm = {pool.submit(self._execute_tool, a["name"], a["input"]): a for a in checked_acts}
+                            for f in as_completed(tfm):
+                                a = tfm[f]
+                                try:
+                                    obs = f.result()
+                                except Exception as e:
+                                    obs = f"❌ 异常: {e}"
+                                t_results.append((a["name"], a["input"], obs, obs.startswith("❌")))
+                    for tool_name, input_str, reason in denied_acts:
+                        t_results.append((tool_name, input_str, f"⏭️ 跳过: {reason}", True))
                     self.messages.append({
                         "role": "user", "name": "tool_result",
                         "content": self._combine_results(t_results),
                     })
+                    # 上下文管理（与 Phase 1 保持一致）
+                    self._light_compress()
+                    self._check_context(verbose=verbose)
+                    self._truncate_history()
                     continue
                 # ELSE
                 answer = response.strip()
@@ -998,10 +1044,14 @@ class Agent:
         """逐步输出 Agent 的思考过程"""
 
         max_steps = self.max_steps
-        # 初始化对话历史
         if not self.messages:
             self.messages.append({"role": "system", "content": self.system_prompt})
+        # plan 模式：自动信任工作区，区内操作免确认，区外仍需审批
+        self.permission.allow_workspace()
+        self._light_compress()
+        self._check_context(verbose=False)
         self.messages.append({"role": "user", "content": user_input})
+        self._truncate_history()
         yield f"🤖 {self.name}（最大 {max_steps} 步）\n"
         for step in range(1, max_steps + 1):
             yield f"\n── 第 {step}/{max_steps} 步 ──\n"
@@ -1011,7 +1061,6 @@ class Agent:
                 logger.error(f"LLM 调用失败: {e}", exc_info=True)
                 yield f"❌ LLM 调用失败: {e}\n"
                 return
-            # 用 API 返回的 usage 校准上下文计数器（锚点）
             self.store.set_anchor(self.llm.last_usage)
             if not response:
                 yield "❌ LLM 调用失败\n"
@@ -1020,22 +1069,34 @@ class Agent:
             if parsed["thought"]:
                 yield f"💭 {parsed['thought']}\n"
             actions = parsed.get("actions", [])
-            # 如果有最终答案且没有待执行的工具
             if parsed["final_answer"] and not actions:
+                self.messages.append({"role": "assistant", "content": parsed["final_answer"]})
+                self.store.save_session()
+                self._save_memory(user_input)
                 yield f"\n✅ {parsed['final_answer']}\n"
                 return
-            # 如果有工具调用
             if actions:
-                # 流式模式只执行第一个工具
                 action = actions[0]
                 tool_name = action["name"]
                 input_str = action.get("input", "{}")
-                yield f"🛠️  {TAG_ACTION}: {tool_name}\n"
                 try:
-                    observation = self._execute_tool(tool_name, input_str)
-                except Exception as e:
-                    logger.error(f"工具执行失败: {e}", exc_info=True)
-                    observation = f"工具执行失败: {e}"
+                    params = json.loads(input_str) if input_str else {}
+                except json.JSONDecodeError:
+                    params = {}
+                if not isinstance(params, dict):
+                    params = {}
+                level = self.permission.check(tool_name, params)
+                if level == DENY:
+                    observation = "⏭️ 跳过: 权限不足，操作已被系统拒绝"
+                elif level == ASK:
+                    observation = "⏭️ 跳过: 工作区外操作需在交互模式下确认"
+                else:
+                    yield f"🛠️  {TAG_ACTION}: {tool_name}\n"
+                    try:
+                        observation = self._execute_tool(tool_name, input_str)
+                    except Exception as e:
+                        logger.error(f"工具执行失败: {e}", exc_info=True)
+                        observation = f"工具执行失败: {e}"
                 yield f"📊 {observation[:500]}\n"
                 self.messages.append({"role": "assistant", "content": response})
                 self.messages.append({
@@ -1043,11 +1104,18 @@ class Agent:
                     "name": "tool_result",
                     "content": self._format_tool_result(tool_name, input_str, observation),
                 })
+                self._light_compress()
+                self._check_context(verbose=False)
+                self._truncate_history()
             else:
-                # 没有工具调用，直接返回响应
-                self.messages.append({"role": "assistant", "content": response.strip()})
-                yield f"💬 {response}\n"
+                answer = response.strip()
+                self.messages.append({"role": "assistant", "content": answer})
+                self.store.save_session()
+                self._save_memory(user_input)
+                yield f"💬 {answer}\n"
                 return
+        self.store.save_session()
+        self._save_memory(user_input)
         yield f"\n⚠️ 已达最大步数 {max_steps}\n"
 
 # ============================================================

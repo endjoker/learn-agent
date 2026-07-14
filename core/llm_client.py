@@ -1,4 +1,4 @@
-"""
+﻿"""
 LLM 客户端模块 —— 与各种大语言模型 API 通信的核心组件
 
 支持两类部署方式：
@@ -15,11 +15,15 @@ LLM 客户端模块 —— 与各种大语言模型 API 通信的核心组件
 
 import os
 import re
+import time
+import logging
 from pathlib import Path
 from typing import List, Dict, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
+
+logger = logging.getLogger('hello_agent')
 
 
 # ============================================================
@@ -324,6 +328,52 @@ class HelloAgentsLLM:
     # 核心方法：调用 LLM
     # ============================================================
 
+    # 可重试的异常类型名（网络/连接类）
+    _RETRYABLE_NAMES = frozenset({
+        "RemoteProtocolError", "ReadError", "ConnectError",
+        "ReadTimeout", "ConnectTimeout", "WriteError", "PoolTimeout",
+        "APIConnectionError", "APITimeoutError", "Timeout",
+        "ConnectionError", "ConnectionResetError", "ConnectionAbortedError",
+    })
+
+    @classmethod
+    def _get_retryable_types(cls):
+        """收集可重试的异常类型（httpx + openai）"""
+        types = []
+        try:
+            import httpx
+            for name in ("RemoteProtocolError", "ReadError", "ConnectError",
+                          "ReadTimeout", "ConnectTimeout", "WriteError",
+                          "PoolTimeout", "ProtocolError"):
+                t = getattr(httpx, name, None)
+                if t is not None:
+                    types.append(t)
+        except ImportError:
+            pass
+        try:
+            import openai
+            for name in ("APIConnectionError", "APITimeoutError"):
+                t = getattr(openai, name, None)
+                if t is not None:
+                    types.append(t)
+        except (ImportError, AttributeError):
+            pass
+        return tuple(types)
+
+    @classmethod
+    def _is_retryable(cls, e):
+        """判断异常是否值得重试（网络/连接类错误）"""
+        exc_name = type(e).__name__
+        if exc_name in cls._RETRYABLE_NAMES:
+            return True
+        for t in cls._get_retryable_types():
+            if isinstance(e, t):
+                return True
+        if hasattr(e, "status_code") and isinstance(getattr(e, "status_code"), int):
+            if e.status_code >= 500 or e.status_code == 429:
+                return True
+        return False
+
     def think(
         self,
         messages: List[Dict[str, str]],
@@ -332,7 +382,13 @@ class HelloAgentsLLM:
         silent: bool = False,
     ) -> Optional[str]:
         """
-        让 LLM 思考并返回响应
+        让 LLM 思考并返回响应（带重试逻辑）
+
+        重试策略：
+        - 网络类错误（RemoteProtocolError/Timeout/ConnectionError 等）自动重试
+        - 最多重试 3 次，退避 1s -> 2s -> 4s
+        - 流式失败后降级为非流式重试（更可靠）
+        - plan 模式（silent=True）同样重试，仅写日志不打印
 
         参数:
             messages:   对话消息列表
@@ -340,42 +396,75 @@ class HelloAgentsLLM:
             stream:      是否流式输出
             silent:      静默模式（不输出模式标签，供内部压缩等场景使用）
         """
+        MAX_RETRIES = 3
+        RETRY_DELAYS = [1, 2, 4]
+
         if not silent:
             mode_tag = "🏠 本地" if self.llm_type == "local" else "☁️ 云端"
             print(f"  ▶ {mode_tag} {self.model}（{self.base_url}）")
 
-        self.last_usage = None  # 重置，防止读到上次的脏数据
+        self.last_usage = None
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                stream=stream,
-            )
+        for attempt in range(1, MAX_RETRIES + 1):
+            use_stream = stream if attempt == 1 else False
 
-            if stream:
-                collected = []
-                for chunk in response:
-                    # 流式末块：choices=[] 但 usage 带数据
-                    if chunk.usage:
-                        self.last_usage = self._extract_usage(chunk.usage)
-                    if not chunk.choices:
-                        continue
-                    content = chunk.choices[0].delta.content or ""
-                    print(content, end="", flush=True)
-                    collected.append(content)
-                print()
-                return "".join(collected)
-            else:
-                content = response.choices[0].message.content
-                if response.usage:
-                    self.last_usage = self._extract_usage(response.usage)
-                return content
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=temperature,
+                    stream=use_stream,
+                )
 
-        except Exception as e:
-            print(f"\n  ❌ LLM 调用失败: {type(e).__name__}: {e}")
-            return None
+                if use_stream:
+                    collected = []
+                    for chunk in response:
+                        if chunk.usage:
+                            self.last_usage = self._extract_usage(chunk.usage)
+                        if not chunk.choices:
+                            continue
+                        content = chunk.choices[0].delta.content or ""
+                        if not silent:
+                            print(content, end="", flush=True)
+                        collected.append(content)
+                    if not silent:
+                        print()
+                    return "".join(collected)
+                else:
+                    content = response.choices[0].message.content
+                    if response.usage:
+                        self.last_usage = self._extract_usage(response.usage)
+                    if stream and attempt > 1 and not silent:
+                        print(content)
+                    return content
+
+            except Exception as e:
+                should_retry = self._is_retryable(e)
+
+                if not should_retry or attempt >= MAX_RETRIES:
+                    if not silent:
+                        print(f"\n  ❌ LLM 调用失败: {type(e).__name__}: {e}")
+                    logger.error(
+                        f"LLM 调用失败（第 {attempt}/{MAX_RETRIES} 次）: "
+                        f"{type(e).__name__}: {e}",
+                        exc_info=True,
+                    )
+                    return None
+
+                delay = RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
+                if not silent:
+                    fallback = "，降级为非流式" if stream else ""
+                    print(f"\n  ⚠️ 第 {attempt}/{MAX_RETRIES} 次失败: "
+                          f"{type(e).__name__}，{delay}s 后重试{fallback}…")
+                else:
+                    logger.warning(
+                        f"LLM 调用第 {attempt}/{MAX_RETRIES} 次失败: "
+                        f"{type(e).__name__}，{delay}s 后重试…"
+                    )
+
+                time.sleep(delay)
+
+        return None
 
     # ============================================================
     # 辅助方法

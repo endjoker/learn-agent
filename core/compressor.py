@@ -215,10 +215,10 @@ class Compressor:
         返回:
             True 表示有消息被压缩
         """
-        old_count = len(messages)
+        old_total = sum(len(m.get("content", "")) for m in messages)
         light_compress_tool_results(messages)
-        # 检查是否有变化（简单方法：比较 tool_result 的内容长度变化）
-        return len(messages) == old_count  # 结构不变，但内容变了
+        new_total = sum(len(m.get("content", "")) for m in messages)
+        return new_total < old_total
 
     # ---- 全量压缩 ----
 

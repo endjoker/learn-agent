@@ -1,5 +1,47 @@
 # 更新日志
 
+## 2026-07-14 代码审查优化 & LLM 重试逻辑
+
+**安全修复：**
+- 修复 `_run_task_list`（Plan 模式 Phase 2）完全绕过权限检查的问题
+  - 现在加入完整权限检查流程（allow/ask/deny）
+  - 进入时自动 `allow_workspace()`，区内操作免确认，区外仍需审批
+  - 补充轻量压缩、上下文检查、紧急截断，防止长任务撑爆上下文
+- 修复 `stream_run` 缺少权限检查和上下文管理的问题
+  - 流式模式自动信任工作区，区内放行，区外返回跳过提示
+  - 补充轻量压缩、上下文检查、紧急截断、会话保存、记忆归档
+- 优化 `PermissionChecker.check()` 路径感知
+  - 新增 `_is_operation_external()` 方法，检查 file_path/path/dest/paths 是否在工作区外
+  - trusted 模式下 callable 规则返回 ASK 时，先判断路径是否在区内
+  - 区内 → ALLOW，区外 → ASK，`allow_workspace()` 不再一刀切放行
+  - 危险命令（rm -rf / 等）仍直接 DENY，不受 trusted 影响
+
+**稳定性改进：**
+- `llm_client.think()` 新增重试逻辑
+  - 最多重试 3 次，退避间隔 1s → 2s → 4s
+  - 只重试网络类错误（RemoteProtocolError / ReadTimeout / ConnectError / APIConnectionError 等）
+  - HTTP 5xx 和 429（限流）也自动重试，400/401 等直接失败
+  - 流式失败后自动降级为非流式重试（非流式连接更短、更不容易中途断开）
+  - plan 模式（silent=True）同样重试，仅写日志不打印
+  - 非流式重试成功后，如果原始请求是流式，自动打印完整内容
+  - 新增 `_get_retryable_types()` 和 `_is_retryable()` 辅助方法
+
+**Bug 修复：**
+- 修复 `CalculatorTool._safe_eval` 中 `ast.Index` 在 Python 3.12+ 已移除的问题
+  - 改为直接处理 `ast.Slice` 和裸表达式分支
+  - 完善了 slice 的 step 参数处理
+- 修复 `Compressor.light_compress()` 返回值永远为 True 的问题
+  - 原来比较消息数量（轻量压缩不改消息数量所以永远 True）
+  - 改为比较压缩前后内容总长度，正确反映是否实际压缩
+- 修复 `_truncate_history` 中 token 统计口径不一致
+  - 原来初始用 `store.live_tokens()`（锚点值），循环内用 `_estimate_tokens()` 累减
+  - 改为每次 pop 后重新调用 `store.live_tokens()`，保证口径统一
+- 修复 `SystemPrompt` 规则编号跳过 5（1,2,3,4,6 → 1,2,3,4,5）
+
+## 2026-07-12 上下文压缩 & 任务清单 & 多项优化
+
+**新增：**
+
 ## 2026-07-12 上下文压缩 & 任务清单 & 多项优化
 
 **新增：**

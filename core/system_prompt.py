@@ -84,7 +84,7 @@ FINAL_ANSWER：[给用户的最终答案]
 2. INPUT 必须是合法 JSON
 3. name=tool_result，是工具返回的数据
 4. 信息足够时输出 FINAL_ANSWER
-6. 标签回复必须用英文
+5. 标签回复必须用英文
 
 </SYSTEM_STATIC_CONTEXT>"""
 

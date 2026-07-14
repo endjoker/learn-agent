@@ -338,56 +338,78 @@ class PermissionChecker:
                 return params[key]
         return None
 
-   def allow_workspace(self):
-       """
-       本会话内工作区全部放行（A 选项）
+    def allow_workspace(self):
+        """
+        本会话内工作区全部放行（A 选项）
 
-       调用后，工作区内的路径检查将直接返回 allow，
-       工作区外的操作和危险命令仍受限制。
-       """
-       self._workspace_trusted = True
+        调用后，工作区内的路径检查将直接返回 allow，
+        工作区外的操作和危险命令仍受限制。
+        """
+        self._workspace_trusted = True
 
-   def is_workspace_trusted(self) -> bool:
-       """当前是否已信任工作区"""
-       return self._workspace_trusted
+    def is_workspace_trusted(self) -> bool:
+        """当前是否已信任工作区"""
+        return self._workspace_trusted
 
-   def check(self, tool_name: str, params: dict = None) -> str:
-       """
-       检查工具调用的权限
+    def _is_operation_external(self, params: dict) -> bool:
+        """
+        检查操作是否涉及工作区外的路径。
+        检查 params 中所有可能的路径参数（file_path/path/dest/paths），
+        只要有一个在工作区外，就返回 True。
+        """
+        for key in ("file_path", "path", "dest"):
+            val = params.get(key)
+            if val:
+                p = resolve_path(val, self.workspace)
+                if not is_within_workspace(p, self.workspace):
+                    return True
+        paths_list = params.get("paths", [])
+        if isinstance(paths_list, list):
+            for p_str in paths_list:
+                p = resolve_path(p_str, self.workspace)
+                if not is_within_workspace(p, self.workspace):
+                    return True
+        return False
 
-       参数:
-           tool_name: 工具名称
-           params:    工具参数字典
+    def check(self, tool_name: str, params: dict = None) -> str:
+        """
+        检查工具调用的权限
 
-       返回:
-           "allow" — 直接执行
-           "ask"   — 需要用户确认
-           "deny"  — 直接拒绝
-       """
-       if params is None:
-           params = {}
+        参数:
+            tool_name: 工具名称
+            params:    工具参数字典
 
-       rule = self._rules.get(tool_name)
+        返回:
+            "allow" — 直接执行
+            "ask"   — 需要用户确认
+            "deny"  — 直接拒绝
+        """
+        if params is None:
+            params = {}
 
-       # 未设置规则 → 默认 ask（安全优先）
-       if rule is None:
-           return ALLOW if self._workspace_trusted else ASK
+        rule = self._rules.get(tool_name)
 
-       # 固定权限
-       if isinstance(rule, str):
-           if self._workspace_trusted and rule == ASK:
-               return ALLOW  # 工作区信任：将固定 ask 升为 allow
-           return rule
+        # 未设置规则 → 默认 ask（安全优先）
+        if rule is None:
+            return ALLOW if self._workspace_trusted else ASK
 
-       # 动态规则（回调函数）
-       if callable(rule):
-           level = rule(tool_name, params)
-           # 工作区信任：将 ask 升为 allow（deny 保持）
-           if self._workspace_trusted and level == ASK:
-               return ALLOW
-           return level
+        # 固定权限
+        if isinstance(rule, str):
+            if self._workspace_trusted and rule == ASK:
+                return ALLOW  # 无路径的固定 ask（如 python/http）升为 allow
+            return rule
 
-       return ASK
+        # 动态规则（回调函数）
+        if callable(rule):
+            level = rule(tool_name, params)
+            # 工作区信任：ask 升级时区分路径是否在工作区内
+            if self._workspace_trusted and level == ASK:
+                if self._is_operation_external(params):
+                    return ASK  # 工作区外操作仍需确认
+                return ALLOW  # 工作区内操作放行
+            return level
+
+        return ASK
 
     def format_permission_info(self, tool_name: str, params: dict,
                                level: str, result: str = None) -> str:
