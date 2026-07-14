@@ -338,56 +338,56 @@ class PermissionChecker:
                 return params[key]
         return None
 
-    def allow_workspace(self):
-        """
-        本会话内工作区全部放行（A 选项）
+   def allow_workspace(self):
+       """
+       本会话内工作区全部放行（A 选项）
 
-        调用后，工作区内的路径检查将直接返回 allow，
-        工作区外的操作和危险命令仍受限制。
-        """
-        self._workspace_trusted = True
+       调用后，工作区内的路径检查将直接返回 allow，
+       工作区外的操作和危险命令仍受限制。
+       """
+       self._workspace_trusted = True
 
-    def is_workspace_trusted(self) -> bool:
-        """当前是否已信任工作区"""
-        return self._workspace_trusted
+   def is_workspace_trusted(self) -> bool:
+       """当前是否已信任工作区"""
+       return self._workspace_trusted
 
-    def check(self, tool_name: str, params: dict = None) -> str:
-        """
-        检查工具调用的权限
+   def check(self, tool_name: str, params: dict = None) -> str:
+       """
+       检查工具调用的权限
 
-        参数:
-            tool_name: 工具名称
-            params:    工具参数字典
+       参数:
+           tool_name: 工具名称
+           params:    工具参数字典
 
-        返回:
-            "allow" — 直接执行
-            "ask"   — 需要用户确认
-            "deny"  — 直接拒绝
-        """
-        if params is None:
-            params = {}
+       返回:
+           "allow" — 直接执行
+           "ask"   — 需要用户确认
+           "deny"  — 直接拒绝
+       """
+       if params is None:
+           params = {}
 
-        rule = self._rules.get(tool_name)
+       rule = self._rules.get(tool_name)
 
-        # 未设置规则 → 默认 ask（安全优先）
-        if rule is None:
-            return ALLOW if self._workspace_trusted else ASK
+       # 未设置规则 → 默认 ask（安全优先）
+       if rule is None:
+           return ALLOW if self._workspace_trusted else ASK
 
-        # 固定权限
-        if isinstance(rule, str):
-            if self._workspace_trusted and rule == ASK:
-                return ALLOW  # 工作区信任：将固定 ask 升为 allow
-            return rule
+       # 固定权限
+       if isinstance(rule, str):
+           if self._workspace_trusted and rule == ASK:
+               return ALLOW  # 工作区信任：将固定 ask 升为 allow
+           return rule
 
-        # 动态规则（回调函数）
-        if callable(rule):
-            level = rule(tool_name, params)
-            # 工作区信任：将 ask 升为 allow（deny 保持）
-            if self._workspace_trusted and level == ASK:
-                return ALLOW
-            return level
+       # 动态规则（回调函数）
+       if callable(rule):
+           level = rule(tool_name, params)
+           # 工作区信任：将 ask 升为 allow（deny 保持）
+           if self._workspace_trusted and level == ASK:
+               return ALLOW
+           return level
 
-        return ASK
+       return ASK
 
     def format_permission_info(self, tool_name: str, params: dict,
                                level: str, result: str = None) -> str:
