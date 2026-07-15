@@ -1,5 +1,52 @@
 # 更新日志
 
+## 2026-07-15 沙箱系统 & 技能系统 & SystemPrompt 三区分离
+
+**新功能：沙箱执行器（三层防护）：**
+- 新增 `core/sandbox/` 模块：L2 安全沙箱
+  - `executor.py` — SandboxExecutor 主执行器（开关/配置档/绕过/核心执行流）
+  - `guard.py` — L2-A 内容拦截（敏感文件保护/数据外发检测/Python AST 审查/安全白名单/网络黑名单/输出脱敏）
+  - `profiles.py` — 配置档管理（加载 `config/sandbox.json`）
+  - `audit.py` — 审计日志记录（拦截/绕过/错误 → `log/sandbox-audit.log`）
+  - 三层架构：L2-A 内容拦截 → L2-B 资源隔离（nanosandbox 可选）→ L2-C subprocess 执行
+- 6 个内置工具注入沙箱检查：
+  - `BashTool` — 命令经 L2-A 安全审查后执行
+  - `PythonTool` — AST 级代码审查（禁止 os/subprocess/ctypes/eval/exec）
+  - `WriteTool` / `EditTool` — 敏感文件路径保护 + 系统路径拦截
+  - `HttpTool` — 外发请求目标黑名单域名/IP 检查
+  - `ReadTool` — 输出脱敏（API Key/私钥/密码 自动掩码）
+- 网络控制黑名单模式：默认全放行，仅拦截 `*.xyz`、`*.tk`、内网 IP 段等
+- 三种配置档：agent（默认 512MB/60s）、restricted（64MB/10s 严格）、permissive（2048MB/300s 宽松）
+- 绕过机制：`bypass_next()` 单条命令临时放行，执行后自动恢复
+- 交互式命令：`/sandbox on/off/bypass/strict/profile/list`
+
+**新功能：学习型技能系统：**
+- 新增 `skills/` 包：AI 学习到的可复用能力
+  - `skills/skill.py` — Skill 数据模型（名称/描述/指令/参数/标签）
+  - `skills/manager.py` — SkillManager 磁盘 I/O（加载/创建/删除/更新，目录结构 `SKILLS/{name}/skill.json + instruction.md`）
+  - `skills/skill_tool.py` — SkillTool（执行已有技能，返回指令文本供 LLM 逐步执行）+ CreateSkillTool（LLM 运行时创建技能，自动写磁盘 + 注册 + 重建 prompt）
+- 预置技能：`code-review` — 代码审查（支持指定文件列表）
+- 交互式命令：`/skill list`、`/skill <name>`、`/skill delete <name>`
+- SystemPrompt 自动加载技能列表到动态区
+- 工具注册分离：`register_skill_tool()` / `register_mcp_tool()` 独立追踪，与内置工具分三区展示
+
+**架构改进：**
+- `SystemPrompt` 三区分离：内置工具 / MCP 工具 / 技能 分别注入，LLM 清晰区分
+- `ToolRegistry` 新增 `get_skill_tool_descriptions()` / `get_mcp_tool_descriptions()` 分区块描述
+- `llm_client.think()` 新增 `timeout` 参数（默认 60s，参数 > 环境变量）
+- `Compressor` 全量摘要超时提升至 300s（大文本摘要不中断）
+- `memory.md` 补充技能系统说明，LLM 可感知技能创建能力
+- `create_agent()` 新增 `skills` 和 `sandbox` 参数，按需启用
+- 启动状态行增加沙箱状态显示，方便排查
+
+**Bug 修复：**
+- 修复 agent.py 中 MCP 工具名引用路径（`self._mcp_tool_names` → `self.tool_registry._mcp_tool_names`）
+- 修复 BashTool 沙箱模式下输出格式不统一的问题（抽取 `_format_output()` 复用）
+
+**兼容性：**
+- 沙箱模块设计为可选依赖：`pip install nanobox` 安装后启用 L2-B 资源隔离，未安装自动降级 OS 原语
+- 所有新功能在 `create_agent()` 中默认启用，可通过 `sandbox=False` / `skills=False` 关闭
+
 ## 2026-07-15 MCP 连接生命周期 & 权限匹配 & ReAct 解析修复
 
 **MCP 严重 Bug 修复（跨事件循环导致每次工具调用超时）：**

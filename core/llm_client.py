@@ -380,6 +380,7 @@ class HelloAgentsLLM:
         temperature: float = 0,
         stream: bool = True,
         silent: bool = False,
+        timeout: Optional[int] = None,
     ) -> Optional[str]:
         """
         让 LLM 思考并返回响应（带重试逻辑）
@@ -408,12 +409,16 @@ class HelloAgentsLLM:
         for attempt in range(1, MAX_RETRIES + 1):
             use_stream = stream if attempt == 1 else False
 
+            # ---- 超时（参数优先，无则环境变量，默认 60s） ----
+            req_timeout = timeout or int(os.getenv("LLM_TIMEOUT", "60"))
+
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
                     temperature=temperature,
                     stream=use_stream,
+                    timeout=req_timeout,
                 )
 
                 if use_stream:

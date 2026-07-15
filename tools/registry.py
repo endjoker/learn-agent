@@ -38,8 +38,21 @@ class ToolRegistry:
 
     def __init__(self):
         """初始化一个空的工具箱"""
-        # 内部用字典存储，key=工具名称，value=工具实例
         self._tools: Dict[str, BaseTool] = {}
+        self._skill_tool_names: set = set()  # 技能工具名称（分开展示）
+        self._mcp_tool_names: set = set()    # MCP 工具名称（分开展示）
+
+    def register_skill_tool(self, tool: BaseTool) -> "ToolRegistry":
+        """注册技能工具（单独追踪，与普通工具分开展示）"""
+        self.register_tool(tool)
+        self._skill_tool_names.add(tool.name)
+        return self
+
+    def register_mcp_tool(self, tool: BaseTool) -> "ToolRegistry":
+        """注册 MCP 工具（单独追踪，与普通工具分开展示）"""
+        self.register_tool(tool)
+        self._mcp_tool_names.add(tool.name)
+        return self
 
     # ==================== 注册与管理 ====================
 
@@ -117,21 +130,21 @@ class ToolRegistry:
 
     def get_tool_descriptions(self) -> str:
         """
-        生成所有工具的文本描述
-
-        这段文本会放到 System Prompt 中，让 LLM 知道：
-        1. 有哪些工具可用
-        2. 每个工具是做什么的
-        3. 每个工具需要什么参数
+        生成内置工具的文本描述（排除技能工具和 MCP 工具，它们有单独区域）
 
         返回:
             格式化的工具描述文本
         """
-        if not self._tools:
+        tools_to_show = [
+            t for n, t in self._tools.items()
+            if n not in self._skill_tool_names and n not in self._mcp_tool_names
+        ]
+
+        if not tools_to_show:
             return "（当前没有可用工具）"
 
         descriptions = []
-        for tool in self._tools.values():
+        for tool in tools_to_show:
             # 描述参数信息
             params_desc = []
             props = tool.parameters.get("properties", {})
@@ -169,6 +182,58 @@ class ToolRegistry:
             OpenAI tools 参数格式的列表
         """
         return [tool.to_openai_tool_format() for tool in self._tools.values()]
+
+    def get_skill_tool_descriptions(self) -> str:
+        """仅生成技能工具的文本描述"""
+        skill_tools = [self._tools[n] for n in self._skill_tool_names if n in self._tools]
+        if not skill_tools:
+            return ""
+
+        parts = []
+        for tool in skill_tools:
+            params_desc = []
+            props = tool.parameters.get("properties", {})
+            required = tool.parameters.get("required", [])
+            for pname, pinfo in props.items():
+                req_mark = "（必填）" if pname in required else "（可选）"
+                ptype = pinfo.get("type", "string")
+                pdesc = pinfo.get("description", "")
+                params_desc.append(f"      - {pname} ({ptype}){req_mark}: {pdesc}")
+
+            param_str = "\n".join(params_desc) if params_desc else "      无参数"
+            parts.append(
+                f"  ▶ {tool.name}\n"
+                f"    描述: {tool.description}\n"
+                f"    参数:\n{param_str}\n"
+            )
+
+        return "\n".join(parts)
+
+    def get_mcp_tool_descriptions(self) -> str:
+        """仅生成 MCP 工具的文本描述"""
+        mcp_tools = [self._tools[n] for n in self._mcp_tool_names if n in self._tools]
+        if not mcp_tools:
+            return ""
+
+        parts = []
+        for tool in mcp_tools:
+            params_desc = []
+            props = tool.parameters.get("properties", {})
+            required = tool.parameters.get("required", [])
+            for pname, pinfo in props.items():
+                req_mark = "（必填）" if pname in required else "（可选）"
+                ptype = pinfo.get("type", "string")
+                pdesc = pinfo.get("description", "")
+                params_desc.append(f"      - {pname} ({ptype}){req_mark}: {pdesc}")
+
+            param_str = "\n".join(params_desc) if params_desc else "      无参数"
+            parts.append(
+                f"  ▶ {tool.name}\n"
+                f"    描述: {tool.description}\n"
+                f"    参数:\n{param_str}\n"
+            )
+
+        return "\n".join(parts)
 
     # ==================== 工具方法 ====================
 

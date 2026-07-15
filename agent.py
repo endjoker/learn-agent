@@ -53,6 +53,8 @@ from tools import BaseTool, ToolRegistry
 from tools.builtin_tools import register_all_tools
 from tools.web_tools import register_web_tools
 from memory import MemoryManager
+from skills import SkillManager, SkillTool, CreateSkillTool
+from core.sandbox import SandboxExecutor
 
 # ============================================================
 # ReAct 关键字（英文，避免中文编码兼容问题）
@@ -188,6 +190,7 @@ class Agent:
         permission_checker: PermissionChecker = None,
         memory: MemoryManager = None,  # 跨会话记忆系统（可选）
         mcp_servers: list = None,      # MCP 服务器配置列表（可选）
+        sandbox: SandboxExecutor = None,  # 沙箱执行器（可选）
     ):
         self.name = name
         self.llm = llm
@@ -201,6 +204,8 @@ class Agent:
         self.debug = debug
         self.permission = permission_checker or PermissionChecker()
         self.memory = memory  # 跨会话记忆系统
+        self.sandbox = sandbox  # 沙箱执行器
+        self.skill_manager = None  # 技能系统（延迟注册）
         if debug:
             set_debug(True)
         # MCP 客户端管理器（延迟初始化）
@@ -451,10 +456,44 @@ class Agent:
         """使用 SystemPrompt 构建器生成带静态区和动态区的提示词"""
 
         tool_descs = self.tool_registry.get_tool_descriptions()
-        # 创建构建器（如果外部没有传入）
+        skill_descs = self.skill_manager.get_skill_descriptions() if self.skill_manager else ""
+        mcp_descs = self.tool_registry.get_mcp_tool_descriptions()
         builder = self.system_prompt_builder or SystemPrompt(name=self.name)
         builder.set_project_root(os.getcwd())
-        return builder.build(tool_descs=tool_descs)
+        return builder.build(tool_descs=tool_descs, skill_descs=skill_descs, mcp_descs=mcp_descs)
+
+    # ============================================================
+    # 技能系统
+    # ============================================================
+
+    def _register_skill_tools(self):
+        """将 SkillManager 中的技能注册为 SkillTool"""
+        if not self.skill_manager:
+            return
+        for skill in self.skill_manager.get_all_skills():
+            tool = SkillTool(skill)
+            try:
+                self.tool_registry.register_skill_tool(tool)
+            except (ValueError, TypeError) as e:
+                logger.warning(f"注册技能工具失败 '{tool.name}': {e}")
+
+    def _register_create_skill_tool(self):
+        """注册 create_skill 工具（LLM 运行时创建技能）"""
+        if not self.skill_manager:
+            return
+        tool = CreateSkillTool(self.skill_manager)
+        tool.set_tool_registry(self.tool_registry)
+        tool.set_agent_ref(self)
+        try:
+            self.tool_registry.register_tool(tool)
+        except (ValueError, TypeError) as e:
+            logger.warning(f"注册 create_skill 失败: {e}")
+
+    def _rebuild_system_prompt(self):
+        """重新构建 system prompt（技能/MCP 注册后调用）"""
+        self.system_prompt = self._build_system_prompt()
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0]["content"] = self.system_prompt
 
     # ============================================================
     # MCP 初始化
@@ -512,8 +551,7 @@ class Agent:
                 prefixed_desc["name"] = f"{server_name}/{tool_desc['name']}"
                 mcp_tool = MCPTool_cls(connection=conn, tool_desc=prefixed_desc)
                 try:
-                    self.tool_registry.register_tool(mcp_tool)
-                    self._mcp_tool_names.append(mcp_tool.name)
+                    self.tool_registry.register_mcp_tool(mcp_tool)
                     logger.info(f"注册 MCP 工具: {mcp_tool.name}")
                 except ValueError as e:
                     logger.warning(
@@ -521,7 +559,7 @@ class Agent:
                     )
 
         # 4. 重建 System Prompt 以包含 MCP 工具描述
-        if self._mcp_tool_names:
+        if self._mcp_tool_names or self.tool_registry._mcp_tool_names:
             self.system_prompt = self._build_system_prompt()
             # 如果对话已开始（已有 system 消息），更新它
             if self.messages and self.messages[0].get("role") == "system":
@@ -1260,6 +1298,8 @@ def create_agent(
     debug: bool = False,
     permission: bool = True,
     memory: bool = True,
+    skills: bool = True,
+    sandbox: bool = True,       # 沙箱执行器
     mcp_servers: list = None,    # MCP 服务器配置列表（可选）
 ) -> Agent:
     """
@@ -1276,6 +1316,8 @@ def create_agent(
         debug: 调试模式
         permission: 权限管理
         memory: 跨会话记忆
+        skills: 学习型技能系统
+        sandbox: 沙箱执行器（L2 内容拦截+资源隔离）
         mcp_servers: MCP 服务器配置列表，每项含 name/transport/command 等
     """
 
@@ -1285,22 +1327,35 @@ def create_agent(
     llm = HelloAgentsLLM(model=model, api_key=api_key, base_url=base_url, provider=provider)
     # 记忆系统（跨会话）
     memory_manager = MemoryManager() if memory else None
+    # 技能系统（学习型，保存在 SKILLS/ 目录）
+    skill_manager = SkillManager() if skills else None
+    if skill_manager:
+        skill_manager.load_all()
+    # 沙箱执行器（L2 内容拦截 + 资源隔离）
+    sandbox_executor = SandboxExecutor() if sandbox else None
     registry = ToolRegistry()
-    register_all_tools(registry, memory_manager=memory_manager)
+    register_all_tools(registry, memory_manager=memory_manager, sandbox=sandbox_executor)
     register_web_tools(registry)
     # 权限管理
     checker = PermissionChecker() if permission else None
     # MCP 配置：代码参数 > .env > mcp_config.json
     mcp_servers = _load_mcp_config(mcp_servers)
-    return Agent(
+    agent = Agent(
         name=name, llm=llm, tool_registry=registry,
         max_steps=max_steps,
         max_history_tokens=max_history_tokens,
         debug=debug,
         permission_checker=checker,
         memory=memory_manager,
+        sandbox=sandbox_executor,
         mcp_servers=mcp_servers,
     )
+    if skill_manager:
+        agent.skill_manager = skill_manager
+        agent._register_skill_tools()
+        agent._register_create_skill_tool()
+        agent._rebuild_system_prompt()
+    return agent
 
 # ============================================================
 # 交互式 CLI
@@ -1324,8 +1379,16 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
     print("║   /session list      列出所有历史会话           ║")
     print("║   /session save      保存当前会话               ║")
     print("║   /session delete <id> 删除指定会话             ║")
+    print("║   /skill list        列出所有技能               ║")
+    print("║   /skill <name>      直接调用指定技能           ║")
+    print("║   /skill delete <name> 删除指定技能             ║")
+    print("║   /sandbox           查看沙箱状态               ║")
+    print("║   /sandbox on/off    开启/关闭沙箱              ║")
+    print("║   /sandbox strict    切换到严格模式             ║")
+    print("║   /sandbox bypass    临时绕过沙箱               ║")
+    print("║   /sandbox profile   切换配置档                 ║")
     print("║   /stats             查看上下文占用             ║")
-    print("║   /history             查看当前会话内容             ║")
+    print("║   /history             查看当前会话内容         ║")
     print("║   /compact           全量压缩历史（释放上下文）  ║")
     print("║   /clear             清空对话历史               ║")
     print("║   /help              显示帮助                   ║")
@@ -1372,8 +1435,9 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
     # 显示当前状态
     print(f"\n🤖 {agent.name}")
     print(f"📡 当前模型: {agent.llm}  |  session: {agent.store.session_id}")
-    perm_status = f"🛡️  权限管理: {'启用' if agent.permission else '关闭'}"
-    print(f"📦 {agent.tool_registry.count()} 个工具就绪 | {perm_status}")
+    perm_status = f"[PERM] 权限管理: {'启用' if agent.permission else '关闭'}"
+    sb_status = f" | Sandbox: {'ON' if getattr(agent, 'sandbox', None) and agent.sandbox.enabled else 'OFF'}" if getattr(agent, 'sandbox', None) else ""
+    print(f"[TOOLS] {agent.tool_registry.count()} 个工具就绪 | {perm_status}{sb_status}")
     while True:
         try:
             u = input("\n👤 你: ").strip()
@@ -1456,6 +1520,85 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                         print("  ❓ 用法: /session delete <session_id1> [<session_id2> ...]")
                 else:
                     print("  ❓ 用法: /session [info|list|save|delete]")
+                continue
+            # ---- /skill ----
+            if u.startswith("/skill"):
+                parts = u.split()
+                cmd = parts[1] if len(parts) > 1 else ""
+                sm = getattr(agent, 'skill_manager', None)
+
+                if cmd == "" or cmd == "list":
+                    if not sm or sm.skill_count() == 0:
+                        print("  📭 暂无技能（使用 create_skill 工具创建）")
+                    else:
+                        print(f"\n  已保存的技能（共 {sm.skill_count()} 个）:")
+                        for s in sm.get_all_skills():
+                            print(f"    ▶ {s.name}")
+                            print(f"      描述: {s.description[:60]}")
+                            print()
+                elif cmd == "delete":
+                    target = parts[2] if len(parts) > 2 else None
+                    if not target:
+                        print("  ❓ 用法: /skill delete <skill_name>")
+                    elif not sm:
+                        print("  ❌ 技能系统未就绪")
+                    elif sm.delete_skill(target):
+                        print(f"  🗑️  已删除技能: {target}")
+                    else:
+                        print(f"  ❌ 未找到技能: {target}")
+                else:
+                    # /skill <name> [args...] → 直接调用技能（传参）
+                    if not sm:
+                        print("  ❌ 技能系统未就绪")
+                    else:
+                        skill_name = cmd
+                        skill = sm.get_skill(skill_name)
+                        if not skill:
+                            print(f"  ❌ 未找到技能: {skill_name}")
+                            print("  可用: /skill list 查看所有技能")
+                        else:
+                            # 解析额外参数传入技能
+                            extra_args = parts[2:]
+                            kwargs_desc = f"参数：{extra_args}" if extra_args else "无参数"
+                            msg = (
+                                f'用户通过 /skill 命令调用了技能 "{skill_name}"，{kwargs_desc}。\n\n'
+                                f"请按以下技能指令逐步执行，可调用其他工具：\n"
+                                f"{skill.instruction}\n\n"
+                                f"所有步骤完成后，输出 FINAL_ANSWER。"
+                            )
+                            agent.run(msg)
+                continue
+            # ---- /sandbox ----
+            if u.startswith("/sandbox"):
+                parts = u.split()
+                cmd = parts[1] if len(parts) > 1 else ""
+                sb = getattr(agent, 'sandbox', None)
+                if not sb:
+                    print("  ❌ 沙箱未启用（create_agent(sandbox=False)")
+                elif cmd == "on":
+                    sb.enabled = True
+                    print("  [OK] 沙箱已开启")
+                elif cmd == "off":
+                    sb.enabled = False
+                    print("  [WARN] 沙箱已关闭（仅保留 L1 权限检查）")
+                elif cmd == "bypass":
+                    sb.bypass_next()
+                    print("  [BYPASS] 下一条命令绕过沙箱")
+                elif cmd == "strict":
+                    msg = sb.set_profile("restricted")
+                    print(f"  [LOCK] {msg}")
+                elif cmd == "profile":
+                    name = parts[2] if len(parts) > 2 else ""
+                    if name:
+                        msg = sb.set_profile(name)
+                        print(f"  [CFG] {msg}")
+                    else:
+                        print(f"  Usage: /sandbox profile <name>")
+                elif cmd == "list":
+                    profiles = sb.list_profiles()
+                    print(f"  可用配置档: {', '.join(profiles)}")
+                else:
+                    print(f"\n  {sb.get_status_text()}")
                 continue
             # ---- /stats ----
             if u.startswith("/stats"):
@@ -1647,6 +1790,14 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                 print("    /session list       列出所有会话")
                 print("    /session save       保存当前会话")
                 print("    /session delete <id> 删除指定会话")
+                print("    /skill list         列出所有技能")
+                print("    /skill <name>       直接调用技能")
+                print("    /skill delete <name> 删除指定技能")
+                print("    /sandbox            查看沙箱状态")
+                print("    /sandbox on/off     开启/关闭沙箱")
+                print("    /sandbox strict     切换到严格模式")
+                print("    /sandbox bypass     临时绕过沙箱")
+                print("    /sandbox profile    切换配置档")
                 print("    /stats              查看上下文占用统计")
                 print("    /history            查看当前会话内容")
                 print("    /mcp                查看 MCP 服务器状态")

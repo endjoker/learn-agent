@@ -64,8 +64,20 @@ class SystemPrompt:
 - 修改后尽量验证（观察运行结果）
 - 一次改一个问题，保持改动可追溯
 
-【可用工具】
+【内置工具】
 {tool_descs}
+
+【MCP 工具】
+{mcp_descs}
+
+【可用技能】
+{skill_descs}
+
+【技能使用规则】
+- 技能是 AI 学习到的可复用能力，调用后返回操作指令，不是最终结果
+- 收到技能指令后，请一步一步执行，期间可以调用其他工具
+- 所有步骤执行完毕后，输出 FINAL_ANSWER
+- 如果发现某个流程需要重复执行，可以使用 create_skill 工具创建新技能
 
 【回复格式——必须使用英文标签】
 每次回复严格使用英文标签（避免编码问题）：
@@ -133,17 +145,19 @@ FINAL_ANSWER：[给用户的最终答案]
         """
         self._project_root = path
 
-    def build(self, tool_descs: str) -> str:
+    def build(self, tool_descs: str, skill_descs: str = "", mcp_descs: str = "") -> str:
         """
         构建完整的 System Prompt。
 
         参数:
             tool_descs: 工具描述的文本，由 ToolRegistry.get_tool_descriptions() 生成
+            skill_descs: 技能描述的文本，由 SkillManager.get_skill_descriptions() 生成
+            mcp_descs: MCP 工具描述的文本，由 ToolRegistry.get_mcp_tool_descriptions() 生成
 
         返回:
             包含静态区和动态区的完整 system prompt
         """
-        static = self._build_static(tool_descs)
+        static = self._build_static(tool_descs, skill_descs, mcp_descs)
         dynamic = self._build_dynamic()
         return static + "\n\n" + dynamic
 
@@ -151,10 +165,16 @@ FINAL_ANSWER：[给用户的最终答案]
     # 内部构建
     # ================================================================
 
-    def _build_static(self, tool_descs: str) -> str:
+    def _build_static(self, tool_descs: str, skill_descs: str = "", mcp_descs: str = "") -> str:
+        if not skill_descs:
+            skill_descs = "（当前没有可用技能）"
+        if not mcp_descs:
+            mcp_descs = "（当前没有可用 MCP 工具）"
         return self.STATIC_TEMPLATE.format(
             name=self.name,
             tool_descs=tool_descs,
+            skill_descs=skill_descs,
+            mcp_descs=mcp_descs,
         )
 
     def _build_dynamic(self) -> str:

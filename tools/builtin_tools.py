@@ -45,6 +45,13 @@ from typing import List
 from .base_tool import BaseTool
 from .memory_tools import MemorySearchTool, MemoryUpdateTool
 
+# 沙箱导入（可选，无 sandbox 时自动降级）
+try:
+    from core.sandbox import SandboxExecutor, SandboxResult
+except ImportError:
+    SandboxExecutor = None  # type: ignore
+    SandboxResult = None  # type: ignore
+
 logger = logging.getLogger('hello_agent')
 
 
@@ -141,6 +148,14 @@ class ReadTool(BaseTool):
         "required": ["file_path"],
     }
 
+    def __init__(self):
+        super().__init__()
+        self._sandbox: SandboxExecutor | None = None
+
+    def set_sandbox(self, sandbox: SandboxExecutor):
+        """注入沙箱执行器"""
+        self._sandbox = sandbox
+
     def execute(self, file_path: str, offset: int = None, limit: int = None) -> str:
         """
         读取文件内容并返回带行号的结果
@@ -199,7 +214,14 @@ class ReadTool(BaseTool):
             if end < total_lines:
                 parts.append(f"\n  …… 还有 {total_lines - end} 行未显示（使用 offset={end + 1} 继续查看）")
 
-            return "\n".join(parts)
+            result = "\n".join(parts)
+
+            # 沙箱输出脱敏（如果注入）
+            if self._sandbox:
+                from core.sandbox.guard import sanitize_output
+                result = sanitize_output(result)
+
+            return result
 
         except PermissionError:
             return f"❌ 权限不足：无法读取文件 -> {file_path}"
@@ -237,6 +259,14 @@ class WriteTool(BaseTool):
         "required": ["file_path", "content"],
     }
 
+    def __init__(self):
+        super().__init__()
+        self._sandbox: SandboxExecutor | None = None
+
+    def set_sandbox(self, sandbox: SandboxExecutor):
+        """注入沙箱执行器"""
+        self._sandbox = sandbox
+
     def execute(self, file_path: str, content: str) -> str:
         """
         写入文件
@@ -250,6 +280,12 @@ class WriteTool(BaseTool):
         """
         try:
             path = Path(file_path).resolve()
+
+            # --- 沙箱检查（如果注入） ---
+            if self._sandbox:
+                is_safe, reason = self._sandbox.check_write_file(str(path), content)
+                if not is_safe:
+                    return f"⛔ 沙箱拦截: {reason}"
 
             # 检查是否试图写入已存在的文件（安全提示）
             file_exists = path.exists()
@@ -319,6 +355,14 @@ class EditTool(BaseTool):
         "required": ["file_path", "old_string", "new_string"],
     }
 
+    def __init__(self):
+        super().__init__()
+        self._sandbox: SandboxExecutor | None = None
+
+    def set_sandbox(self, sandbox: SandboxExecutor):
+        """注入沙箱执行器"""
+        self._sandbox = sandbox
+
     def execute(self, file_path: str, old_string: str, new_string: str) -> str:
         """
         在文件中执行精确的查找替换
@@ -360,6 +404,12 @@ class EditTool(BaseTool):
 
             # --- 执行替换（只替换第一次，更安全） ---
             new_content = content.replace(old_string, new_string, 1)
+
+            # --- 沙箱检查（如果注入） ---
+            if self._sandbox:
+                is_safe, reason = self._sandbox.check_write_file(str(path), new_content)
+                if not is_safe:
+                    return f"⛔ 沙箱拦截: {reason}"
 
             # --- 写回文件 ---
             with open(path, "w", encoding="utf-8") as f:
@@ -672,6 +722,14 @@ class BashTool(BaseTool):
         "required": ["command"],
     }
 
+    def __init__(self):
+        super().__init__()
+        self._sandbox: SandboxExecutor | None = None
+
+    def set_sandbox(self, sandbox: SandboxExecutor):
+        """注入沙箱执行器"""
+        self._sandbox = sandbox
+
     # ============ 系统检测 ============
 
     # 当前操作系统
@@ -751,6 +809,23 @@ class BashTool(BaseTool):
         # --- 提取命令名（用于后续的智能提示） ---
         cmd_name = command.strip().split()[0].lower() if command.strip() else ""
 
+        # --- 沙箱检查（如果注入） ---
+        if self._sandbox:
+            result = self._sandbox.run(
+                "cmd.exe" if self.IS_WINDOWS else "bash",
+                ["/c", command] if self.IS_WINDOWS else ["-c", command],
+                tool_name="bash",
+            )
+            if result.blocked:
+                return f"⛔ 沙箱拦截: {result.block_reason}"
+            if result.timeout:
+                return f"⏰ 命令执行超时\n   命令: {command}"
+
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
+            # 构造输出（复用下方格式化逻辑）
+            return self._format_output(command, stdout, stderr, 0, cmd_name)
+
         try:
             # --- 执行命令 ---
             # 注意：shell=True 在 Windows 上用 cmd.exe，在 Linux/Mac 上用 bash
@@ -764,48 +839,7 @@ class BashTool(BaseTool):
                 errors="replace",
             )
 
-            # --- 构造输出 ---
-            parts = []
-            # 显示系统信息 + shell 提示符
-            os_display = {
-                "windows": "Windows",
-                "darwin": "macOS",
-                "linux": "Linux",
-            }.get(self.SYSTEM, self.SYSTEM)
-
-            parts.append(f"⚡ [{os_display} | {self.SHELL_NAME}] {self.PROMPT_SYMBOL} {command}")
-            parts.append(f"   ➡ 退出码: {result.returncode}")
-            parts.append("")
-
-            # 标准输出
-            if result.stdout:
-                output = result.stdout.rstrip()
-                if len(output) > 8000:
-                    output = output[:8000] + f"\n\n……（输出过长，已截断，共 {len(result.stdout)} 字符）"
-                parts.append(f"📤 输出:\n{output}")
-
-            # 标准错误 —— 如果命令失败，给出智能提示
-            if result.stderr:
-                err = result.stderr.rstrip()
-                if len(err) > 3000:
-                    err = err[:3000] + f"\n\n……（错误输出过长，已截断，共 {len(result.stderr)} 字符）"
-
-                # 错误信息
-                parts.append(f"📕 错误:\n{err}")
-
-                # 智能提示：如果是 Windows 上运行了 Linux 命令
-                if self.IS_WINDOWS and cmd_name in self.COMMAND_SUGGESTIONS:
-                    suggestion = self.COMMAND_SUGGESTIONS[cmd_name]
-                    parts.append(
-                        f"   💡 提示：在 Windows 上请尝试使用 '{suggestion['win']}' "
-                        f"替代 '{cmd_name}'（{suggestion['desc']}）"
-                    )
-
-            # 无输出
-            if not result.stdout and not result.stderr:
-                parts.append("（命令执行完毕，无输出）")
-
-            return "\n".join(parts)
+            return self._format_output(command, result.stdout, result.stderr, result.returncode, cmd_name)
 
         except subprocess.TimeoutExpired:
             return f"⏰ 命令执行超时（{timeout} 秒）\n   命令: {command}"
@@ -818,6 +852,43 @@ class BashTool(BaseTool):
         except Exception as e:
             logger.error(f"命令执行异常: {e}", exc_info=True)
             return f"❌ 命令执行异常: {type(e).__name__}: {e}"
+
+    def _format_output(self, command: str, stdout: str, stderr: str,
+                        returncode: int, cmd_name: str) -> str:
+        """统一格式化命令输出"""
+        os_display = {
+            "windows": "Windows",
+            "darwin": "macOS",
+            "linux": "Linux",
+        }.get(self.SYSTEM, self.SYSTEM)
+
+        parts = [f"⚡ [{os_display} | {self.SHELL_NAME}] {self.PROMPT_SYMBOL} {command}"]
+        parts.append(f"   ➡ 退出码: {returncode}")
+        parts.append("")
+
+        if stdout:
+            output = stdout.rstrip()
+            if len(output) > 8000:
+                output = output[:8000] + f"\n\n……（输出过长，已截断，共 {len(stdout)} 字符）"
+            parts.append(f"📤 输出:\n{output}")
+
+        if stderr:
+            err = stderr.rstrip()
+            if len(err) > 3000:
+                err = err[:3000] + f"\n\n……（错误输出过长，已截断，共 {len(stderr)} 字符）"
+            parts.append(f"📕 错误:\n{err}")
+
+            if self.IS_WINDOWS and cmd_name in self.COMMAND_SUGGESTIONS:
+                suggestion = self.COMMAND_SUGGESTIONS[cmd_name]
+                parts.append(
+                    f"   💡 提示：在 Windows 上请尝试使用 '{suggestion['win']}' "
+                    f"替代 '{cmd_name}'（{suggestion['desc']}）"
+                )
+
+        if not stdout and not stderr:
+            parts.append("（命令执行完毕，无输出）")
+
+        return "\n".join(parts)
 
 
 # ============================================================
@@ -1185,7 +1256,21 @@ class PythonTool(BaseTool):
         "required": ["code"],
     }
 
+    def __init__(self):
+        super().__init__()
+        self._sandbox: SandboxExecutor | None = None
+
+    def set_sandbox(self, sandbox: SandboxExecutor):
+        """注入沙箱执行器"""
+        self._sandbox = sandbox
+
     def execute(self, code: str) -> str:
+        # --- 沙箱检查：AST 级代码审查（如果注入） ---
+        if self._sandbox:
+            is_safe, reason = self._sandbox.check_python(code)
+            if not is_safe:
+                return f"⛔ 沙箱拦截: {reason}"
+
         import subprocess
         try:
             result = subprocess.run(
@@ -1247,9 +1332,23 @@ class HttpTool(BaseTool):
         "Accept": "application/json, text/plain, */*",
     }
 
+    def __init__(self):
+        super().__init__()
+        self._sandbox: SandboxExecutor | None = None
+
+    def set_sandbox(self, sandbox: SandboxExecutor):
+        """注入沙箱执行器"""
+        self._sandbox = sandbox
+
     def execute(self, url: str, method: str = "GET", data: str = None) -> str:
         if not url.startswith(("http://", "https://")):
             return f"❌ 无效 URL: {url}"
+
+        # --- 沙箱检查：外发目标黑名单（如果注入） ---
+        if self._sandbox:
+            is_safe, reason = self._sandbox.check_egress(url)
+            if not is_safe:
+                return f"⛔ 沙箱拦截: {reason}"
 
         try:
             method = method.upper()
@@ -1315,13 +1414,14 @@ BUILTIN_TOOLS = [
     MemoryUpdateTool,
 ]
 
-def register_all_tools(registry, memory_manager=None):
+def register_all_tools(registry, memory_manager=None, sandbox=None):
     """
     一键注册所有内置工具到注册表
 
     参数:
         registry: ToolRegistry 实例
         memory_manager: MemoryManager 实例（可选），注入到记忆工具中
+        sandbox: SandboxExecutor 实例（可选），注入到 bash/python/write/edit/read/http 工具中
 
     使用方式：
         from tools import ToolRegistry
@@ -1330,6 +1430,7 @@ def register_all_tools(registry, memory_manager=None):
         registry = ToolRegistry()
         register_all_tools(registry)
         register_all_tools(registry, memory_manager=mm)  # 启用记忆系统
+        register_all_tools(registry, sandbox=sb)         # 启用沙箱
     """
     from .registry import ToolRegistry
 
@@ -1338,9 +1439,12 @@ def register_all_tools(registry, memory_manager=None):
 
     for tool_cls in BUILTIN_TOOLS:
         tool = tool_cls()
-        # 为记忆工具注入 MemoryManager
+        # 注入 MemoryManager（记忆工具）
         if memory_manager and hasattr(tool, 'set_memory_manager'):
             tool.set_memory_manager(memory_manager)
+        # 注入 SandboxExecutor（沙箱工具）
+        if sandbox and hasattr(tool, 'set_sandbox'):
+            tool.set_sandbox(sandbox)
         registry.register_tool(tool)
 
     return registry

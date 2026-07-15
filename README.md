@@ -24,6 +24,7 @@
 | **http** | HTTP 请求 | GET/POST，支持外部 API 调用 |
 | **memory_search** | 搜索记忆 | 基于 BM25 + 中文分词的跨会话记忆检索 |
 | **memory_update** | 更新记忆权重 | 标记记忆有用/无用，影响后续排序 |
+| **create_skill** | 创建技能 | LLM 运行时将重复流程封装为可复用技能（写磁盘 + 注册 + 重建 prompt） |
 | **MCP 工具** | 动态加载 | 连接外部 MCP Server，自动发现工具并注册（数量取决于服务器） |
 
 ### 核心能力
@@ -40,6 +41,8 @@
 - **MCP 配置** — 通过 `config/mcp_config.json` 文件或代码参数配置，支持多服务器自动发现工具
 - **调试日志** — `--debug` 参数开启，调试信息写入 `log/` 目录文件，控制台保持简洁
 - **跨会话记忆** — 每轮对话自动归档到 `memory/daily/`，支持 BM25 全文检索回忆
+- **学习型技能系统** — AI 每轮学习到的可复用能力持久化到 `SKILLS/` 目录，LLM 可通过 `create_skill` 工具运行时创建技能，交互式 `/skill` 命令查看和调用
+- **沙箱执行器（L2 三层防护）** — L2-A 内容拦截（敏感文件/数据外发/Python AST/网络黑名单）+ L2-B 资源隔离（可选 nanosandbox）+ L2-C subprocess 执行；支持配置档切换（agent/restricted/permissive）和临时绕过
 - **连续对话** — 跨多轮对话保留历史上下文，自动截断防超限
 - **会话持久化** — 每轮对话自动保存到 `sessions/{id}.json`，含任务清单序列化
 - **会话恢复** — `--resume <id>` 恢复指定会话，`--resume last` 按修改时间取最新会话
@@ -156,18 +159,34 @@ hello-agent/
 │   ├── debug.py             # 调试日志模块（带时间戳的 DEBUG 输出）
 │   ├── permission.py        # 权限管理模块（allow/ask/deny 三级）
 │   ├── system_prompt.py     # System Prompt 构建器（静态区/动态区）
-│   └── mcp_client.py        # MCP 客户端（Stdio/SSE/StreamableHTTP 传输 + JSON-RPC 协议）
+│   ├── mcp_client.py        # MCP 客户端（Stdio/SSE/StreamableHTTP 传输 + JSON-RPC 协议）
+│   └── sandbox/             # 沙箱执行器（L2 三层防护）
+│       ├── __init__.py
+│       ├── executor.py      # SandboxExecutor（开关/配置档/绕过/核心执行流）
+│       ├── guard.py         # L2-A 内容拦截（敏感文件/数据外发/Python AST/网络黑名单）
+│       ├── profiles.py      # 配置档管理（加载 config/sandbox.json）
+│       └── audit.py         # 审计日志（记录拦截/绕过/错误事件）
 │
 ├── tools/                   # 工具系统
 │   ├── __init__.py
 │   ├── base_tool.py         # 工具基类（接口规范）
-│   ├── registry.py          # 工具注册表（管理所有工具）
-│   ├── builtin_tools.py     # 内置工具（14 个：文件操作+计算+笔记+HTTP+记忆等，含 file_mgr 批量删除）
+│   ├── registry.py          # 工具注册表（三区分离展示：内置工具/MCP/技能）
+│   ├── builtin_tools.py     # 内置工具（含沙箱注入的 6 个工具）
 │   ├── memory_tools.py      # 记忆工具（memory_search + memory_update）
 │   ├── web_tools.py         # 网页工具（search + web_fetch）
 │   └── mcp_tools.py         # MCP 工具桥接层（将 MCP 工具适配为 BaseTool）
 │
+├── skills/                  # 学习型技能系统
+│   ├── __init__.py
+│   ├── skill.py             # Skill 数据模型
+│   ├── manager.py           # SkillManager（磁盘 I/O + CRUD）
+│   ├── skill_tool.py        # SkillTool + CreateSkillTool（执行/创建）
+│   └── code-review/         # 预置技能示例
+│       ├── skill.json
+│       └── instruction.md
+│
 ├── config/                  # 配置文件目录
+│   ├── sandbox.json         # 沙箱配置（配置档/网络黑名单）
 │   ├── mcp_config.json      # MCP 服务器配置（含 Token，已 gitignore）
 │   └── mcp_config.template.json  # MCP 配置模板（含三种传输方式示例）
 │
@@ -202,6 +221,14 @@ hello-agent/
 | `/stats` | 查看上下文占用统计 |
 | `/history` | 查看当前会话内容 |
 | `/plan [任务描述]` | 生成并执行任务方案（Plan-and-Execute） |
+| `/skill list` | 列出所有学习型技能 |
+| `/skill <name>` | 直接调用指定技能 |
+| `/skill delete <name>` | 删除指定技能 |
+| `/sandbox` | 查看沙箱状态 |
+| `/sandbox on/off` | 开启/关闭沙箱 |
+| `/sandbox strict` | 切换到严格模式（restricted） |
+| `/sandbox bypass` | 临时绕过沙箱（下一条命令） |
+| `/sandbox profile <name>` | 切换沙箱配置档 |
 | `/mcp` | 查看 MCP 服务器连接状态 |
 | `/mcp list` | 查看 MCP 服务器详情与工具列表 |
 | `/compact` | 手动触发全量上下文压缩 |
@@ -339,6 +366,23 @@ agent = create_agent(debug=True)
 - [x] 任务清单持久化（保存到 session JSON）
 - [x] file_mgr 批量删除（paths 参数）
 - [x] 非 dict INPUT 防御（友好提示 LLM 修正）
+- [x] LLM 重试逻辑（网络错误自动重试 3 次，退避 1s→2s→4s，流式降级非流式）
+- [x] MCP 模块接入（Stdio/SSE/StreamableHTTP 三种传输，自动发现工具）
+- [x] 常驻事件循环（`_MCPLoopRunner` 修复跨循环工具调用超时）
+- [x] 接收循环早退修复（MCP 空闲超时/SSE keepalive/Streamable 阻塞）
+- [x] 实时超时参数（`think()` 支持 `timeout` 参数，参数 > 环境变量）
+- [x] SystemPrompt 三区分离（内置工具 / MCP 工具 / 技能 分区块展示）
+- [x] MCP 工具前缀命名（`{server_name}/` 防冲突）+ 独立展示
+- [x] 沙箱执行器（L2 三层防护：内容拦截 → 资源隔离 → subprocess）
+- [x] 沙箱内容拦截（敏感文件/数据外发/Python AST/网络黑名单/输出脱敏）
+- [x] 沙箱配置档（agent/restricted/permissive，内存/CPU/超时/网络可控）
+- [x] 沙箱绕过机制（`bypass_next()` 单条放行，执行后自动恢复）
+- [x] 沙箱审计日志（拦截/绕过/错误事件记录到 `log/sandbox-audit.log`）
+- [x] 6 工具沙箱注入（bash/python/write/edit/read/http 全部经过安全审查）
+- [x] 学习型技能系统（Skills 持久化到 `SKILLS/` 目录，支持 CRUD）
+- [x] SkillTool 执行适配器（返回指令文本，LLM 按步骤执行）
+- [x] CreateSkillTool 运行时创建（LLM 自动写磁盘 + 注册 + 重建 prompt）
+- [x] 预置 code-review 技能
 
 ## 📄 许可证
 

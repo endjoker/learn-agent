@@ -309,6 +309,7 @@ class Compressor:
                 temperature=0.3,
                 stream=False,       # 非流式，直接拿完整结果
                 silent=True,        # 不输出模式标签
+                timeout=300,        # 摘要生成文本量大，给 5 分钟超时
             )
         except Exception as e:
             if verbose:
