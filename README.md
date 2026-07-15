@@ -100,7 +100,7 @@ gemma4_CONTEXT_LENGTH=262144
   {
     "name": "web-search",
     "transport": "streamable",
-    "url": "http://192.168.1.110:3000/mcp"
+    "url": "http://127.0.0.1:3000/mcp"
   },
   {
     "name": "filesystem",
