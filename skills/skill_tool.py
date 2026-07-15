@@ -11,6 +11,7 @@ import logging
 from typing import Optional
 
 from tools.base_tool import BaseTool
+from core.permission import ALLOW
 from .skill import Skill
 from .manager import SkillManager
 
@@ -146,8 +147,12 @@ class CreateSkillTool(BaseTool):
             except ValueError as e:
                 logger.warning(f"注册技能工具失败: {e}")
 
-        # 重建 system prompt
+        # 重建 system prompt + 允许该技能免确认调用（技能只返回指令文本，无副作用）
         if hasattr(self, "_agent_ref") and self._agent_ref:
+            try:
+                self._agent_ref.permission.set_rule(name, ALLOW)
+            except Exception as e:
+                logger.warning(f"设置技能 '{name}' 权限规则失败: {e}")
             try:
                 self._agent_ref._rebuild_system_prompt()
             except Exception as e:

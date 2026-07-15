@@ -479,6 +479,9 @@ class Agent:
             tool = SkillTool(skill)
             try:
                 self.tool_registry.register_skill_tool(tool)
+                # 技能只返回指令文本（无副作用），免确认；
+                # 其指挥的后续工具调用仍各自被 SecurityGate 拦截
+                self.permission.set_rule(tool.name, ALLOW)
             except (ValueError, TypeError) as e:
                 logger.warning(f"注册技能工具失败 '{tool.name}': {e}")
 
