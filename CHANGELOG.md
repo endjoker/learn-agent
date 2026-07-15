@@ -1,5 +1,43 @@
 # 更新日志
 
+## 2026-07-15 MCP 连接生命周期 & 权限匹配 & ReAct 解析修复
+
+**MCP 严重 Bug 修复（跨事件循环导致每次工具调用超时）：**
+- 引入 MCP 专用常驻事件循环 `_MCPLoopRunner`（`core/mcp_client.py`）
+  - 后台 daemon 线程跑 `run_forever()`，init / discover / call_tool / close 全部经 `run_coroutine_threadsafe` 调度到同一循环
+  - 修复原 `asyncio.run` 每次新建并关闭循环、初始化结束时 `_recv_task` 被取消、后续工具调用永远收不到响应（30s 超时）的问题
+  - `agent.py`、`tools/mcp_tools.py` 的 `asyncio.run` 调用点全部改用 `run_in_mcp_loop`，同时支持在异步宿主（notebook / async web）中调用
+  - 退出清理改在同一循环内 `close_all`，不再泄漏 npx 子进程
+
+**接收循环早退修复：**
+- `receive()` 契约统一为：`None` 仅表示真正断连（EOF / 已关闭），空闲与非数据行继续等待
+- `StdioTransport.receive` 移除 30s 空闲超时 → 修复 LLM 思考超过 30s 后 stdio 连接被误判断开
+- `SSEHttpTransport.receive` 改为循环跳过注释 / `event:` / 保活行 → 修复 SSE keepalive 杀死连接
+- `StreamableHttpTransport.receive` 去掉 30s 超时，改为阻塞 `queue.get()`，由 `close()` 取消任务解除阻塞
+
+**Streamable HTTP 流式响应修复：**
+- `StreamableHttpTransport.send` 改为后台读取模型：`send()` 拿到响应后立即返回，由 `_read_response` 任务流式解析帧入队
+- 按 `Content-Type` 分流：`text/event-stream` 逐行入队 `data:` 帧；纯 JSON 整体入队
+- 修复原 `resp.text()` 在长 SSE 流上阻塞到 30s 超时、`_send_request` 无法 await 响应 Future 的问题
+- `close()` 取消并等待所有后台读取任务
+
+**权限匹配优化：**
+- `core/permission.py` 危险命令匹配从朴素子串改为分类匹配
+  - `DANGEROUS_WORDS`（`format`/`shutdown`/`reboot`/`halt`）编译为令牌边界正则，要求前后为空白/行首行尾才命中 → 避免 `"format"` 误伤 PowerShell 的 `Format-Table` / `Format-List`
+  - `DANGEROUS_SUBSTRINGS`（`rm -rf /`、`mkfs`、`dd if=` 等特异模式）保留子串匹配，`mkfs` 仍能拦 `mkfs.ext4`
+  - 真实危险命令（`format C:`、`shutdown`、`rm -rf /`）仍 `DENY`；原被误拒的 `powershell ... Format-Table` 现降为 `ASK`，按 A 信任工作区后可执行
+
+**ReAct 解析修复：**
+- `_ACTION_RE` 工具名捕获组 `(\w+)` → `([\w\-/.]+)`，支持 `-` / `/` / `.`
+- 修复 MCP 前缀命名（如 `web-search/search`）含 `-` `/` 导致正则匹配失败 → `actions=0` → 走 ELSE 分支把工具调用当最终答案直接结束会话的问题
+- `registry.get_tool` 本为字典精确查找，带 `/` 名字可正常命中 MCPTool
+
+**验证：**
+- 端到端 stdio 全流程：init → discover → 空闲 32s → `call_tool` 正确返回（修复前必超时）
+- Streamable HTTP：mock SSE 服务器返回 keepalive + `data:` 帧，`send` 不阻塞、`receive` 正确取到 payload
+- 持久循环：调用 1 启动的后台 task 在调用 2 仍存活
+- 权限：`format-table` → `ask`、`format C:` → `deny`、`mkfs.ext4` → `deny`、`echo shutdown-server` → `allow`
+
 ## 2026-07-15 MCP 模块接入
 
 **新功能：**

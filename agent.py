@@ -70,8 +70,9 @@ _THOUGHT_RE = re.compile(
 )
 # 正则匹配 ACTION + INPUT（用 findall 捕获全部，不区分大小写）
 # INPUT 使用前瞻边界匹配，支持嵌套 JSON
+# 工具名支持 - / . 以兼容 MCP 前缀命名（如 "web-search/search"）
 _ACTION_RE = re.compile(
-    rf"(?:{TAG_ACTION}|行动)[：:]\s*\[?(\w+)\]?\s*(?:\n|$)"
+    rf"(?:{TAG_ACTION}|行动)[：:]\s*\[?([\w\-/.]+)\]?\s*(?:\n|$)"
     rf"(?:\s*(?:{TAG_INPUT}|输入)[：:]\s*"
     rf"(.+?)"
     rf"(?=\s*(?:\n(?:{TAG_ACTION}|行动)[：:]|\n(?:{TAG_FINAL}|最终回答)[：:]|\n(?:{TAG_THOUGHT}|思考)[：:]|$))"
@@ -474,15 +475,14 @@ class Agent:
         if not self._mcp_pending_init:
             return
 
-        import asyncio
-        from core.mcp_client import MCPClientManager
+        from core.mcp_client import MCPClientManager, run_in_mcp_loop
         from tools.mcp_tools import MCPTool
 
         configs = self._mcp_pending_init
         self._mcp_pending_init = None  # 避免重复初始化
 
-        # 使用 asyncio.run() 执行异步初始化
-        asyncio.run(self._async_init_mcp(configs, MCPClientManager, MCPTool))
+        # 在 MCP 专用事件循环中执行异步初始化（长生命周期，跨多次调用复用）
+        run_in_mcp_loop(self._async_init_mcp(configs, MCPClientManager, MCPTool))
 
     async def _async_init_mcp(self, configs, MCPClientManager_cls, MCPTool_cls):
         """异步初始化 MCP 连接（由 _init_mcp_if_needed 调用）"""
@@ -1383,9 +1383,10 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
             if u.lower() in ("exit", "quit", "q", "退出"):
                 # 清理 MCP 连接（关闭 aiohttp session 和子进程）
                 if hasattr(agent, 'mcp_manager') and agent.mcp_manager:
-                    import asyncio
                     try:
-                        asyncio.run(agent.mcp_manager.close_all())
+                        from core.mcp_client import run_in_mcp_loop
+                        # 在 MCP 专用事件循环中关闭，复用同一连接状态
+                        run_in_mcp_loop(agent.mcp_manager.close_all(), timeout=10)
                     except Exception:
                         pass
                 print("👋 再见！")

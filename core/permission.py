@@ -58,14 +58,39 @@ WRITE_COMMANDS = [
 ]
 
 # 危险命令（直接拒绝）
-DANGEROUS_COMMANDS = [
+# 分两类匹配，避免朴素子串误伤：
+# - DANGEROUS_WORDS：短动词，必须作为独立令牌（前后为空白/行首行尾）才拒绝。
+#   否则 "format" 会误匹配 PowerShell 的 "format-table"/"format-list" 等。
+# - DANGEROUS_SUBSTRINGS：足够特异的多 token 模式，子串匹配即可。
+DANGEROUS_WORDS = [
+    "format",     # 磁盘格式化（format C:）；令牌匹配避开 format-table
+    "shutdown",   # 关机
+    "reboot",     # 重启
+    "halt",       # 停机
+]
+DANGEROUS_SUBSTRINGS = [
     "rm -rf /", "rm -rf ~", "rm -rf .",
-    "del /f /s", "rd /s /q", "format",
-    "mkfs", "dd if=",
-    ":(){ :|:& };:",  # fork 炸弹
-    "shutdown", "reboot", "halt",
+    "del /f /s", "rd /s /q",
+    "mkfs",            # mkfs / mkfs.ext4
+    "dd if=",
+    ":(){ :|:& };:",   # fork 炸弹
     "> /dev/sda", "> /dev/mmc",
 ]
+# 令牌边界正则：要求危险词前后是空白或字符串首尾
+_DANGEROUS_WORDS_RE = re.compile(
+    r"(?:^|\s)(" + "|".join(DANGEROUS_WORDS) + r")(?=\s|$)"
+)
+
+
+def _match_dangerous(command_lower: str) -> Optional[str]:
+    """返回命中的危险模式（None 表示安全）。"""
+    for pat in DANGEROUS_SUBSTRINGS:
+        if pat in command_lower:
+            return pat
+    m = _DANGEROUS_WORDS_RE.search(command_lower)
+    if m:
+        return m.group(1)
+    return None
 
 
 def classify_bash_command(command: str) -> str:
@@ -78,10 +103,9 @@ def classify_bash_command(command: str) -> str:
     """
     cmd_lower = command.strip().lower()
 
-    # 危险命令
-    for pattern in DANGEROUS_COMMANDS:
-        if pattern in cmd_lower:
-            return DENY
+    # 危险命令（令牌边界 + 特异子串，避免 "format" 误伤 "format-table"）
+    if _match_dangerous(cmd_lower):
+        return DENY
 
     # 提取命令名（第一个词）
     first_word = cmd_lower.split()[0] if cmd_lower.split() else ""

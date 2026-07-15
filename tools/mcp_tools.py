@@ -18,7 +18,6 @@ MCPTool 包装 MCP Server 暴露的工具，使 LLM 无需感知工具是本地�
     registry.register_tool(tool)
 """
 
-import asyncio
 import json
 import logging
 from typing import Any, Dict, Optional
@@ -65,11 +64,12 @@ class MCPTool(BaseTool):
         """
         同步调用 MCP 工具
 
-        内部通过 asyncio.run() 包装底层异步调用，使 MCP 工具
-        在现有同步 ReAct 循环中无缝工作。
+        在 MCP 专用常驻事件循环中执行底层异步调用——该循环与初始化时
+        使用的同一循环，保证连接状态与后台接收循环跨调用复用。
         """
         try:
-            result = asyncio.run(self._execute_async(**kwargs))
+            from core.mcp_client import run_in_mcp_loop
+            result = run_in_mcp_loop(self._execute_async(**kwargs), timeout=60)
             return self._format_result(result)
         except ConnectionError as e:
             logger.error(f"MCP 工具 '{self.name}' 连接失败: {e}")
@@ -80,7 +80,7 @@ class MCPTool(BaseTool):
         except TimeoutError:
             logger.error(f"MCP 工具 '{self.name}' 调用超时")
             return (
-                f"❌ MCP 工具 '{self.name}' 调用超时（30秒）\n"
+                f"❌ MCP 工具 '{self.name}' 调用超时（60秒）\n"
                 f"可能是网络延迟或服务繁忙，请重试。"
             )
         except Exception as e:

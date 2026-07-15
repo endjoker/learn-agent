@@ -25,10 +25,65 @@ import json
 import logging
 import os
 import subprocess
+import threading
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger('hello_agent.mcp')
+
+
+# ============================================================
+# MCP 专用事件循环
+#
+# MCP 连接是长生命周期有状态对象（后台接收循环 _recv_task、
+# 子进程 / aiohttp session、响应队列），必须在同一个事件循环上
+# 创建并跨多次调用复用。若用 asyncio.run() 每次新建并关闭循环，
+# 接收循环会在 init 结束时被取消，后续工具调用永远收不到响应。
+#
+# 本单例在后台 daemon 线程跑一个常驻事件循环；同步代码（ReAct 循环）
+# 通过 run_coroutine_threadsafe 线程安全地把协程调度到该循环执行。
+
+class _MCPLoopRunner:
+    """后台常驻事件循环（daemon 线程），供 MCP 全部异步操作复用。"""
+
+    _instance: Optional["_MCPLoopRunner"] = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def get(cls) -> "_MCPLoopRunner":
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    def __init__(self):
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._run, name="hello-agent-mcp-loop", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self):
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_forever()
+        finally:
+            try:
+                self._loop.close()
+            except Exception:
+                pass
+
+    def run(self, coro, timeout: Optional[float] = None):
+        """把协程调度到后台循环执行，阻塞等待结果（线程安全）。"""
+        if self._loop is None or self._loop.is_closed():
+            raise RuntimeError("MCP 事件循环已关闭")
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=timeout)
+
+
+def run_in_mcp_loop(coro, timeout: Optional[float] = None):
+    """在 MCP 专用事件循环中运行协程（供同步代码调用）。"""
+    return _MCPLoopRunner.get().run(coro, timeout=timeout)
 
 
 # ============================================================
@@ -130,19 +185,25 @@ class StdioTransport(MCPTransport):
         await self._process.stdin.drain()
 
     async def receive(self) -> Optional[str]:
-        """读取一行 JSON-RPC 响应"""
-        if self._closed or (self._process and self._process.returncode is not None):
+        """读取一行 JSON-RPC 响应；返回 None 仅表示连接已关闭（EOF）。
+
+        不设空闲超时——空闲时阻塞等待即可，子进程退出或 close() 取消
+        本任务时会自然解除阻塞。原 30s 超时会让空闲连接被误判为断开。
+        """
+        if self._closed:
+            return None
+        if self._process is None or self._process.returncode is not None:
             return None
         try:
-            line = await asyncio.wait_for(
-                self._process.stdout.readline(),
-                timeout=30.0,
-            )
+            line = await self._process.stdout.readline()
             if not line:
+                # EOF：子进程已关闭 stdout
                 return None
             return line.decode("utf-8").rstrip("\n\r")
-        except asyncio.TimeoutError:
-            logger.warning("StdioTransport 接收超时")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"StdioTransport 接收异常: {e}")
             return None
 
     async def close(self):
@@ -223,22 +284,31 @@ class SSEHttpTransport(MCPTransport):
                 raise RuntimeError(f"发送失败: HTTP {resp.status}")
 
     async def receive(self) -> Optional[str]:
-        """从 SSE 流中读取下一条消息（data: 行）"""
-        if self._closed or self._sse_stream is None:
-            return None
-        try:
-            line = await asyncio.wait_for(
-                self._sse_stream.content.readline(),
-                timeout=self._timeout,
-            )
-            if not line:
+        """从 SSE 流中读取下一条 data: 消息。
+
+        跳过注释行（:）、event:/id:/retry: 与空行——这些是 SSE 保活/元数据，
+        不是 JSON-RPC 响应。返回 None 仅表示流已关闭（EOF）。原实现遇到非
+        data 行就返回 None，导致接收循环误判为断开。
+        """
+        while True:
+            if self._closed or self._sse_stream is None:
                 return None
-            text = line.decode("utf-8").strip()
+            try:
+                line = await self._sse_stream.content.readline()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"SSEHttpTransport 接收异常: {e}")
+                return None
+            if not line:
+                # EOF：流已关闭
+                return None
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
             if text.startswith("data: "):
                 return text[6:]
-            return None
-        except asyncio.TimeoutError:
-            return None
+            # 注释 / event / id / retry 等忽略，继续等待 data:
 
     async def close(self):
         """关闭连接"""
@@ -269,6 +339,7 @@ class StreamableHttpTransport(MCPTransport):
         self._session = None
         self._session_id = None
         self._response_queue = None
+        self._reader_tasks: set = set()  # 后台响应读取任务
         self._closed = False
 
     async def connect(self):
@@ -280,7 +351,12 @@ class StreamableHttpTransport(MCPTransport):
         logger.info(f"StreamableHttpTransport 就绪: {self._url}")
 
     async def send(self, message: str):
-        """通过 HTTP POST 发送 JSON-RPC 消息，响应入队供 receive() 读取"""
+        """通过 HTTP POST 发送 JSON-RPC 消息。
+
+        响应由后台任务 _read_response 流式解析入队供 receive() 消费，
+        send() 不内联读取响应体——否则遇到 text/event-stream 长流会
+        阻塞到流关闭，导致 _send_request 无法 await 响应 Future。
+        """
         if self._session is None:
             raise ConnectionError("会话未建立")
 
@@ -296,55 +372,90 @@ class StreamableHttpTransport(MCPTransport):
         logger.debug(f"[Streamable] POST {self._url} | session={self._session_id}")
         logger.debug(f"[Streamable] Request: {message[:300]}")
 
-        async with self._session.post(
-            self._url,
-            data=message,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=self._timeout),
-        ) as resp:
-            logger.debug(f"[Streamable] Response: HTTP {resp.status}")
-            logger.debug(f"[Streamable] Response headers: {dict(resp.headers)}")
+        try:
+            resp = await self._session.post(
+                self._url,
+                data=message,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=self._timeout),
+            )
+        except Exception as e:
+            raise RuntimeError(f"发送失败: 网络错误: {e}")
 
-            if resp.status not in (200, 202):
-                body = await resp.text()
-                logger.error(f"[Streamable] Error body: {body[:500]}")
-                raise RuntimeError(
-                    f"发送失败: HTTP {resp.status} — {body[:200].strip()}"
-                )
+        logger.debug(f"[Streamable] Response: HTTP {resp.status}")
+        logger.debug(f"[Streamable] Response headers: {dict(resp.headers)}")
 
-            # 记录服务端返回的 Session ID（后续请求需带上）
-            sess_id = resp.headers.get("Mcp-Session-Id")
-            if sess_id:
-                self._session_id = sess_id
+        if resp.status not in (200, 202):
+            body = await resp.text()
+            logger.error(f"[Streamable] Error body: {body[:500]}")
+            resp.release()
+            raise RuntimeError(
+                f"发送失败: HTTP {resp.status} — {body[:200].strip()}"
+            )
 
-            # 读取响应体，剥离 SSE 帧后入队
-            text = await resp.text()
-            text = text.strip()
-            if text:
-                found = False
-                for line in text.split("\n"):
+        # 记录服务端返回的 Session ID（后续请求需带上）
+        sess_id = resp.headers.get("Mcp-Session-Id")
+        if sess_id:
+            self._session_id = sess_id
+
+        # 后台流式读取响应并解析帧入队，send() 立即返回
+        task = asyncio.create_task(self._read_response(resp))
+        self._reader_tasks.add(task)
+        task.add_done_callback(self._reader_tasks.discard)
+
+    async def _read_response(self, resp):
+        """读取 HTTP 响应体，剥离 SSE 帧后入队；支持纯 JSON 与 text/event-stream"""
+        try:
+            content_type = resp.headers.get("Content-Type", "")
+            if "text/event-stream" in content_type:
+                # 流式逐行解析，避免在长 SSE 流上阻塞
+                async for raw_line in resp.content:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
                     if line.startswith("data: "):
                         await self._response_queue.put(line[6:])
-                        found = True
-                # 服务端可能直接返回纯 JSON（无 SSE 帧）
-                if not found and text.startswith("{"):
-                    await self._response_queue.put(text)
+            else:
+                text = (await resp.text()).strip()
+                if text:
+                    found = False
+                    for line in text.split("\n"):
+                        if line.startswith("data: "):
+                            await self._response_queue.put(line[6:])
+                            found = True
+                    # 服务端可能直接返回纯 JSON（无 SSE 帧）
+                    if not found and text.startswith("{"):
+                        await self._response_queue.put(text)
+        except Exception as e:
+            logger.error(f"[Streamable] 读取响应失败: {e}")
+        finally:
+            try:
+                resp.release()
+            except Exception:
+                pass
 
     async def receive(self) -> Optional[str]:
-        """从响应队列中读取下一条消息（阻塞直到有响应）"""
+        """从响应队列中读取下一条消息（阻塞直到有响应或连接关闭）。"""
         if self._closed:
             return None
         try:
-            return await asyncio.wait_for(
-                self._response_queue.get(),
-                timeout=self._timeout,
-            )
-        except asyncio.TimeoutError:
+            # 阻塞等待；close() 取消 _recv_task 时会解除阻塞
+            return await self._response_queue.get()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
             return None
 
     async def close(self):
         """关闭连接"""
         self._closed = True
+        # 取消所有后台响应读取任务
+        for task in list(self._reader_tasks):
+            task.cancel()
+        for task in list(self._reader_tasks):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._reader_tasks.clear()
         if self._session:
             await self._session.close()
         logger.info(f"StreamableHttpTransport 已关闭: {self._url}")
@@ -704,7 +815,15 @@ class MCPClientManager:
                 tasks.append(self._safe_initialize(conn, name))
 
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"MCP 初始化总超时 ({timeout}s)，部分服务器可能未完成初始化"
+                )
 
     async def _safe_initialize(self, conn: MCPConnection, name: str, max_retries: int = 2):
         """带重试的安全初始化"""
