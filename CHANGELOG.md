@@ -2,13 +2,13 @@
 
 ## 2026-07-15 沙箱系统 & 技能系统 & SystemPrompt 三区分离
 
-**新功能：沙箱执行器（三层防护）：**
+**新功能：沙箱执行器（两层防护）：**
 - 新增 `core/sandbox/` 模块：L2 安全沙箱
   - `executor.py` — SandboxExecutor 主执行器（开关/配置档/绕过/核心执行流）
   - `guard.py` — L2-A 内容拦截（敏感文件保护/数据外发检测/Python AST 审查/安全白名单/网络黑名单/输出脱敏）
   - `profiles.py` — 配置档管理（加载 `config/sandbox.json`）
   - `audit.py` — 审计日志记录（拦截/绕过/错误 → `log/sandbox-audit.log`）
-  - 三层架构：L2-A 内容拦截 → L2-B 资源隔离（nanosandbox 可选）→ L2-C subprocess 执行
+  - 两层架构：L2-A 内容拦截 → L2-C subprocess 执行（L2-B 资源隔离为设计预留，暂未实现）
 - 6 个内置工具注入沙箱检查：
   - `BashTool` — 命令经 L2-A 安全审查后执行
   - `PythonTool` — AST 级代码审查（禁止 os/subprocess/ctypes/eval/exec）
@@ -44,7 +44,7 @@
 - 修复 BashTool 沙箱模式下输出格式不统一的问题（抽取 `_format_output()` 复用）
 
 **兼容性：**
-- 沙箱模块设计为可选依赖：`pip install nanobox` 安装后启用 L2-B 资源隔离，未安装自动降级 OS 原语
+- L2-B nanosandbox 在 PyPI 上不存在对应包，该层暂未实现；L2-A 内容拦截 + L2-C subprocess 始终生效
 - 所有新功能在 `create_agent()` 中默认启用，可通过 `sandbox=False` / `skills=False` 关闭
 
 ## 2026-07-15 MCP 连接生命周期 & 权限匹配 & ReAct 解析修复

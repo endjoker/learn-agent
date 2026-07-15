@@ -42,7 +42,7 @@
 - **调试日志** — `--debug` 参数开启，调试信息写入 `log/` 目录文件，控制台保持简洁
 - **跨会话记忆** — 每轮对话自动归档到 `memory/daily/`，支持 BM25 全文检索回忆
 - **学习型技能系统** — AI 每轮学习到的可复用能力持久化到 `SKILLS/` 目录，LLM 可通过 `create_skill` 工具运行时创建技能，交互式 `/skill` 命令查看和调用
-- **沙箱执行器（L2 三层防护）** — L2-A 内容拦截（敏感文件/数据外发/Python AST/网络黑名单）+ L2-B 资源隔离（可选 nanosandbox）+ L2-C subprocess 执行；支持配置档切换（agent/restricted/permissive）和临时绕过
+- **沙箱执行器（L2 两层防护）** — L2-A 内容拦截（敏感文件/数据外发/Python AST/网络黑名单）+ L2-C subprocess 执行 + 超时控制；支持配置档切换（agent/restricted/permissive）和临时绕过（L2-B 资源隔离为设计预留）
 - **连续对话** — 跨多轮对话保留历史上下文，自动截断防超限
 - **会话持久化** — 每轮对话自动保存到 `sessions/{id}.json`，含任务清单序列化
 - **会话恢复** — `--resume <id>` 恢复指定会话，`--resume last` 按修改时间取最新会话
@@ -160,7 +160,7 @@ hello-agent/
 │   ├── permission.py        # 权限管理模块（allow/ask/deny 三级）
 │   ├── system_prompt.py     # System Prompt 构建器（静态区/动态区）
 │   ├── mcp_client.py        # MCP 客户端（Stdio/SSE/StreamableHTTP 传输 + JSON-RPC 协议）
-│   └── sandbox/             # 沙箱执行器（L2 三层防护）
+│   └── sandbox/             # 沙箱执行器（L2 两层防护）
 │       ├── __init__.py
 │       ├── executor.py      # SandboxExecutor（开关/配置档/绕过/核心执行流）
 │       ├── guard.py         # L2-A 内容拦截（敏感文件/数据外发/Python AST/网络黑名单）
@@ -373,7 +373,7 @@ agent = create_agent(debug=True)
 - [x] 实时超时参数（`think()` 支持 `timeout` 参数，参数 > 环境变量）
 - [x] SystemPrompt 三区分离（内置工具 / MCP 工具 / 技能 分区块展示）
 - [x] MCP 工具前缀命名（`{server_name}/` 防冲突）+ 独立展示
-- [x] 沙箱执行器（L2 三层防护：内容拦截 → 资源隔离 → subprocess）
+- [x] 沙箱执行器（L2 两层防护：内容拦截 → subprocess 执行）
 - [x] 沙箱内容拦截（敏感文件/数据外发/Python AST/网络黑名单/输出脱敏）
 - [x] 沙箱配置档（agent/restricted/permissive，内存/CPU/超时/网络可控）
 - [x] 沙箱绕过机制（`bypass_next()` 单条放行，执行后自动恢复）

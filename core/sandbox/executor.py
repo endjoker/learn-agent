@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-L2 沙箱执行器 —— 三层防护：内容拦截 → 资源隔离 → 子进程执行
+L2 沙箱执行器 —— 两层防护：内容拦截 → 子进程执行
 
 架构:
-    ┌─ SandboxExecutor.run() ─────────────────────────────┐
-    │  L2-A: content guard  (始终运行, 纯 Python)          │
-    │  L2-B: resource limit (nanosandbox / OS 原语, 可选)  │
-    │  L2-C: subprocess     (OS 执行层)                    │
-    └──────────────────────────────────────────────────────┘
+    ┌─ SandboxExecutor.run() ──────────────────────────┐
+    │  L2-A: content guard  (始终运行, 纯 Python)       │
+    │  L2-C: subprocess     (OS 执行层 + 超时控制)      │
+    └──────────────────────────────────────────────────┘
 
-沙箱和 subprocess 是互补关系，不是二选一。
+L2-B 资源隔离层（nanosandbox）为设计预留，暂未实现。
 沙箱关闭时（enabled=False），仅保留 L1 权限检查，L2 全部绕过。
 """
 
@@ -17,11 +16,9 @@ import os
 import subprocess
 import logging
 from pathlib import Path
-from typing import Any
 
 from .guard import (
     check_command_safety,
-    check_write_content,
     sanitize_output,
     check_python_code,
     sanitize_env,
@@ -79,17 +76,17 @@ class SandboxExecutor:
     """
     沙箱执行器
 
-    三层防护：
-      L2-A: 内容拦截（敏感文件/防泄露/系统路径）
-      L2-B: 资源隔离（nanosandbox / OS 原语）
-      L2-C: subprocess 执行（最终执行层）
+    两层防护：
+      L2-A: 内容拦截（敏感文件/防泄露/系统路径/Python AST/网络黑名单）
+      L2-C: subprocess 执行 + 超时控制 + 输出脱敏
 
-    use_sandbox():
-    - 开启（默认）: L2-A + L2-B + L2-C 完整链路
-    - 关闭: L2 全部绕过，直接 subprocess 执行
+    L2-B 资源隔离层（nanosandbox）为设计预留，暂未实现。
+
+    沙箱关闭时（enabled=False）:
+      L2 全部绕过，直接 subprocess 执行
 
     绕过机制（bypass_once）:
-    - 开启后下一条命令绕过 L2-A/L2-B，执行后自动恢复
+      开启后下一条命令绕过 L2-A，执行后自动恢复
     """
 
     def __init__(
@@ -106,48 +103,11 @@ class SandboxExecutor:
         # 临时绕过标志（下一条命令绕过，执行后自动复位）
         self._bypass_once: bool = False
 
-        # nanosandbox 实例（延迟初始化）
-        self._sandbox = None
-        if self.enabled:
-            self._init_sandbox()
-
         logger.info(
-            "沙箱执行器初始化: enabled=%s, profile=%s, nanosandbox=%s",
+            "沙箱执行器初始化: enabled=%s, profile=%s",
             self.enabled,
             self.current_profile,
-            "yes" if self._sandbox else "no",
         )
-
-    # ================================================================
-    # 初始化
-    # ================================================================
-
-    def _init_sandbox(self):
-        """尝试初始化 nanosandbox（L2-B 资源隔离层）"""
-        try:
-            from nanobox import Sandbox, MB  # type: ignore
-
-            prof = self._get_current_profile()
-            if not prof:
-                return
-
-            builder = (
-                Sandbox.builder()
-                .working_dir(str(self._workspace))
-                .memory_limit(prof.get("memory_mb", 256) * MB)
-                .timeout_secs(prof.get("timeout_seconds", 60))
-            )
-
-            # 网络控制
-            if not prof.get("network", True):
-                builder = builder.network_disabled()
-
-            self._sandbox = builder.build()
-            logger.info("nanosandbox 初始化成功")
-        except ImportError:
-            logger.info("nanosandbox 未安装，L2-B 使用 OS 原语降级")
-        except Exception as e:
-            logger.warning("nanosandbox 初始化失败: %s，L2-B 降级", e)
 
     # ================================================================
     # 配置管理
@@ -171,10 +131,6 @@ class SandboxExecutor:
             )
 
         self.current_profile = name
-        # 重新初始化 nanosandbox
-        self._sandbox = None
-        if self.enabled:
-            self._init_sandbox()
         return f"已切换到配置档: {name}"
 
     def list_profiles(self) -> list[str]:
@@ -226,7 +182,7 @@ class SandboxExecutor:
             if self._bypass_once:
                 self._bypass_once = False
                 log_bypass(tool_name, "bypass_once")
-            return self._run_bare(command, args, cwd, env)
+            return self._execute(command, args, cwd, env)
 
         # ===== L2-A: 内容拦截 =====
         is_safe, reason = check_command_safety(
@@ -236,49 +192,17 @@ class SandboxExecutor:
             log_interception(tool_name, full_cmd, reason)
             return SandboxResult(blocked=True, block_reason=reason)
 
-        # ===== L2-B + L2-C: 资源隔离 + 执行 =====
-        if self._sandbox:
-            return self._run_sandboxed(command, args, cwd, env)
-        return self._run_bare(command, args, cwd, env)
+        # ===== L2-C: subprocess 执行 =====
+        return self._execute(command, args, cwd, env)
 
-    def _run_sandboxed(
+    def _execute(
         self,
         command: str,
         args: list | None = None,
         cwd: str | None = None,
         env: dict | None = None,
     ) -> SandboxResult:
-        """L2-B 资源隔离 + L2-C subprocess 执行"""
-        prof = self._get_current_profile()
-        timeout = (prof.get("timeout_seconds", 60) if prof else 60) + 5  # 余量
-
-        try:
-            result = self._sandbox.run(
-                command,
-                args=args or [],
-                cwd=cwd or str(self._workspace),
-                env=sanitize_env(env or os.environ.copy()),
-                timeout=timeout,
-            )
-            return SandboxResult(
-                stdout=result.stdout,
-                stderr=result.stderr,
-                exit_code=result.returncode,
-            )
-        except Exception as e:
-            log_error("sandboxed_run", str(e))
-            # nanosandbox 失败时降级到裸执行
-            logger.warning("nanosandbox 执行失败，降级到 subprocess: %s", e)
-            return self._run_bare(command, args, cwd, env)
-
-    def _run_bare(
-        self,
-        command: str,
-        args: list | None = None,
-        cwd: str | None = None,
-        env: dict | None = None,
-    ) -> SandboxResult:
-        """L2-C 裸 subprocess 执行（L2-A 内容拦截仍生效）"""
+        """L2-C subprocess 执行（L2-A 内容拦截已在前置步骤完成）"""
         timeout = self._get_timeout()
 
         try:
@@ -365,20 +289,18 @@ class SandboxExecutor:
         """返回沙箱状态文本"""
         status = "开启" if self.enabled else "关闭"
         icon = "[ON]" if self.enabled else "[OFF]"
-        nanosandbox = "nanosandbox" if self._sandbox else "subprocess(OS原语)"
         lines = [
             f"  [Sandbox] {icon} 沙箱状态: {status}",
             f"  配置档: {self.current_profile}",
         ]
         if self._bypass_once:
             lines.append(f"  [BYPASS] 下条命令绕过沙箱")
-        lines.append(f"  资源隔离: {nanosandbox}")
         lines.append(f"  内容拦截: {icon if self.enabled else '[OFF] (绕过)'}")
+        lines.append(f"  执行方式: subprocess（L2-B 资源隔离暂未实现）")
         return "\n".join(lines)
 
     def __str__(self) -> str:
         return (
             f"SandboxExecutor(enabled={self.enabled}, "
-            f"profile={self.current_profile}, "
-            f"nanosandbox={'yes' if self._sandbox else 'no'})"
+            f"profile={self.current_profile})"
         )
