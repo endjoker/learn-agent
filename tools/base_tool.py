@@ -63,6 +63,29 @@ class BaseTool:
     }
     """
 
+    # ============ 安全能力标签（供 SecurityGate 决定跑哪些 L2 检查） ============
+
+    capabilities: tuple = ()
+    """
+    工具的安全能力标签。可选值：
+        fs:read / fs:write / fs:delete / fs:move  — 文件读写
+        net:egress                                 — 网络外发
+        exec:shell / exec:code                     — 命令/代码执行
+        remote:call                                — 远程工具（MCP）
+
+    无风险能力的工具（datetime/notes 等纯计算/查询）留空 () 即可，
+    SecurityGate 会跳过 L2、走 L1 权限。
+    """
+
+    def resolve_capabilities(self, params: dict) -> tuple:
+        """
+        返回本次调用的安全能力（默认返回类属性 capabilities）。
+
+        子类可重写以按参数动态决定能力，例如 file_mgr 的 action=ls 是读、
+        action=delete 是写。默认实现直接返回静态 capabilities。
+        """
+        return self.capabilities
+
     # ============ 实例方法 ============
 
     def execute(self, **kwargs) -> str:

@@ -39,8 +39,10 @@ class MCPTool(BaseTool):
     name: str = ""
     description: str = ""
     parameters: dict = {"type": "object", "properties": {}, "required": []}
+    # MCP 工具是远程调用，SecurityGate 据此走 remote:call 策略
+    capabilities = ("remote:call",)
 
-    def __init__(self, connection: 'MCPConnection', tool_desc: dict):
+    def __init__(self, connection: 'MCPConnection', tool_desc: dict, trust: bool = False):
         """
         参数:
             connection: MCPConnection 实例（来自 core/mcp_client.py）
@@ -48,6 +50,8 @@ class MCPTool(BaseTool):
                 - name: str — 工具名称（建议加 {server_name}/ 前缀）
                 - description: str — 工具描述
                 - inputSchema: dict — 参数定义的 JSON Schema
+            trust: 是否受信任（来自 mcp_config.json 的服务器 trust 标志）。
+                   True 时 SecurityGate 直接放行，False 时每次调用需确认。
         """
         self.name = tool_desc["name"]
         self.description = tool_desc.get("description", "")
@@ -59,6 +63,7 @@ class MCPTool(BaseTool):
         })
         self._connection = connection
         self._tool_desc = tool_desc  # 保留原始描述，供调试使用
+        self.trust = trust
 
     def execute(self, **kwargs) -> str:
         """

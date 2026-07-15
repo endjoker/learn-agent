@@ -203,6 +203,8 @@ class PermissionChecker:
         self.set_rule("memory_update", ALLOW)
         self.set_rule("search", ALLOW)
         self.set_rule("web_fetch", ALLOW)
+        # create_skill：写入经名字校验、限定 SKILLS/ 子目录，安全，免确认
+        self.set_rule("create_skill", ALLOW)
 
         # ===== 路径敏感的操作：规则函数动态判断 =====
         self.set_rule("read", self._check_file_path_allow)       # 区内allow，区外ask

@@ -39,6 +39,7 @@ class WebSearchTool(BaseTool):
     """
 
     name: str = "search"
+    capabilities = ("net:egress",)
     description: str = "搜索互联网。当需要查找最新信息、新闻、文档、教程等内容时使用。基于 DuckDuckGo，返回标题、链接和摘要。"
     parameters: dict = {
         "type": "object",
@@ -170,6 +171,7 @@ class WebFetchTool(BaseTool):
     """
 
     name: str = "web_fetch"
+    capabilities = ("net:egress",)
     description: str = "读取指定网页的正文内容。当需要查看某篇文章、新闻或文档的详细内容时使用。传入 URL 即可获取纯文本内容。"
     parameters: dict = {
         "type": "object",

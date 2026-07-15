@@ -49,6 +49,7 @@ from core.debug import (
 )
 from core.message_store import MessageStore
 from core.permission import PermissionChecker, ALLOW, ASK, DENY
+from core.security_gate import SecurityGate
 from tools import BaseTool, ToolRegistry
 from tools.builtin_tools import register_all_tools
 from tools.web_tools import register_web_tools
@@ -206,6 +207,10 @@ class Agent:
         self.memory = memory  # 跨会话记忆系统
         self.sandbox = sandbox  # 沙箱执行器
         self.skill_manager = None  # 技能系统（延迟注册）
+        # 中央安全闸门：统一 L1 权限 + L2 沙箱，覆盖所有工具（含 skill/MCP）
+        self._gate = SecurityGate(
+            self.permission, self.sandbox, str(self.permission.workspace)
+        )
         if debug:
             set_debug(True)
         # MCP 客户端管理器（延迟初始化）
@@ -527,6 +532,13 @@ class Agent:
         """异步初始化 MCP 连接（由 _init_mcp_if_needed 调用）"""
         self.mcp_manager = MCPClientManager_cls()
 
+        # 服务器 trust 标志映射：{name: trust}（来自 mcp_config.json）
+        cfg_trust = {
+            cfg.get("name"): bool(cfg.get("trust", False))
+            for cfg in configs
+            if cfg.get("name")
+        }
+
         # 1. 添加所有服务器配置
         for cfg in configs:
             try:
@@ -549,7 +561,9 @@ class Agent:
                 # 添加服务器前缀以避免不同服务器的工具重名
                 prefixed_desc = dict(tool_desc)
                 prefixed_desc["name"] = f"{server_name}/{tool_desc['name']}"
-                mcp_tool = MCPTool_cls(connection=conn, tool_desc=prefixed_desc)
+                # trust 标志：受信任服务器的工具直接放行，否则每次确认
+                trust = bool(cfg_trust.get(server_name, False))
+                mcp_tool = MCPTool_cls(connection=conn, tool_desc=prefixed_desc, trust=trust)
                 try:
                     self.tool_registry.register_mcp_tool(mcp_tool)
                     logger.info(f"注册 MCP 工具: {mcp_tool.name}")
@@ -690,6 +704,18 @@ class Agent:
     # 执行工具
 
     # ============================================================
+
+    def _gate_check(self, tool_name: str, params: dict) -> tuple:
+        """中央安全闸门检查（L1 权限 + L2 沙箱）。
+
+        替代原先分散的 self.permission.check()——对每次工具调用（内置/
+        skill/MCP）统一跑 L1+L2，覆盖不再依赖工具自觉接入沙箱。
+        返回 (level, reason)，level ∈ {ALLOW, ASK, DENY}。
+        """
+        tool = self.tool_registry.get_tool(tool_name)
+        if tool is None:
+            return DENY, f"未知工具 '{tool_name}'"
+        return self._gate.check(tool, params, tool_name)
 
     def _execute_tool(self, tool_name: str, input_str: str = None) -> str:
         """查找 → 解析参数 → 执行 → 返回"""
@@ -886,11 +912,11 @@ class Agent:
                         )
                         denied_actions.append((tool_name, input_str, reason))
                         continue
-                    level = self.permission.check(tool_name, params)
+                    level, gate_reason = self._gate_check(tool_name, params)
                     if level == ALLOW:
                         checked_actions.append(a)
                     elif level == DENY:
-                        reason = f"权限不足，操作已被系统拒绝"
+                        reason = gate_reason or "权限不足，操作已被系统拒绝"
                         denied_actions.append((tool_name, input_str, reason))
                         print(f"  ⛔ {tool_name}: {reason}")
                     elif level == ASK:
@@ -1080,11 +1106,11 @@ class Agent:
                             reason = f"INPUT 必须是 JSON 对象，但收到了 JSON {type(params).__name__}。"
                             denied_acts.append((tool_name, input_str, reason))
                             continue
-                        level = self.permission.check(tool_name, params)
+                        level, gate_reason = self._gate_check(tool_name, params)
                         if level == ALLOW:
                             checked_acts.append(a)
                         elif level == DENY:
-                            reason = "权限不足，操作已被系统拒绝"
+                            reason = gate_reason or "权限不足，操作已被系统拒绝"
                             denied_acts.append((tool_name, input_str, reason))
                             if verbose:
                                 print(f"  ⛔ {tool_name}: {reason}")
@@ -1205,9 +1231,9 @@ class Agent:
                     params = {}
                 if not isinstance(params, dict):
                     params = {}
-                level = self.permission.check(tool_name, params)
+                level, gate_reason = self._gate_check(tool_name, params)
                 if level == DENY:
-                    observation = "⏭️ 跳过: 权限不足，操作已被系统拒绝"
+                    observation = f"⏭️ 跳过: {gate_reason or '权限不足，操作已被系统拒绝'}"
                 elif level == ASK:
                     observation = "⏭️ 跳过: 工作区外操作需在交互模式下确认"
                 else:

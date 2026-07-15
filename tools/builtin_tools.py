@@ -128,6 +128,7 @@ class ReadTool(BaseTool):
     """
 
     name: str = "read"
+    capabilities = ("fs:read",)
     description: str = "【首选文件读取工具】读取指定文件的内容，支持行号显示和行数范围控制。查看代码、配置文件、日志等内容时请优先使用此工具，而不是用 bash 执行 cat/type 命令。跨平台兼容，自动处理编码。"
     parameters: dict = {
         "type": "object",
@@ -243,6 +244,7 @@ class WriteTool(BaseTool):
     """
 
     name: str = "write"
+    capabilities = ("fs:write",)
     description: str = "【首选文件写入工具】创建新文件或覆盖已有文件的内容。会自动创建父目录。需要新建或完全替换文件时请使用此工具，而不是用 bash 的 echo/重定向。跨平台兼容。"
     parameters: dict = {
         "type": "object",
@@ -335,6 +337,7 @@ class EditTool(BaseTool):
     """
 
     name: str = "edit"
+    capabilities = ("fs:write",)
     description: str = "【首选文件编辑工具】对文件做精确的查找替换修改。当需要修改文件中某段代码或文本（如修bug、改配置）时使用，而不是重写整个文件或使用 bash 的 sed。精确匹配，默认只替换第一次。跨平台兼容。"
     parameters: dict = {
         "type": "object",
@@ -447,6 +450,7 @@ class GrepTool(BaseTool):
     """
 
     name: str = "grep"
+    capabilities = ("fs:read",)
     description: str = "【首选文本搜索工具】在文件或目录中搜索文本内容。当需要查找某个函数、变量、关键词在哪里出现时使用。支持正则表达式和文件类型过滤。跨平台兼容，比用 bash 执行 grep/findstr 命令更可靠。"
     parameters: dict = {
         "type": "object",
@@ -594,6 +598,7 @@ class GlobTool(BaseTool):
     """
 
     name: str = "glob"
+    capabilities = ("fs:read",)
     description: str = "【首选文件查找工具】使用通配符模式查找文件，如 **/*.py 查找所有 Python 文件。当需要查看目录结构、查找符合模式的文件、统计文件数量时使用。跨平台兼容，比用 bash 执行 ls/find/dir 命令更可靠。"
     parameters: dict = {
         "type": "object",
@@ -706,6 +711,7 @@ class BashTool(BaseTool):
     """
 
     name: str = "bash"
+    capabilities = ("exec:shell",)
     description: str = "在本地执行 Shell 命令。适用于运行脚本、安装包、使用 git、启动服务等系统级操作。注意：下发命令时请自动适配当前操作系统的系统级操作（Windows/macOS/Linux）。"
     parameters: dict = {
         "type": "object",
@@ -1124,7 +1130,18 @@ class FileManagerTool(BaseTool):
     """
 
     name: str = "file_mgr"
+    capabilities = ("fs:write", "fs:delete", "fs:move")
     description: str = "文件管理操作：复制(copy)、移动(move)、删除(delete)、创建目录(mkdir)、列出目录(ls)。比用 bash 执行系统命令更安全。支持批量删除（传 paths 数组）。"
+
+    def resolve_capabilities(self, params: dict) -> tuple:
+        """按 action 决定能力：ls 是读，delete/copy/move/mkdir 是写"""
+        action = (params.get("action") or "").lower()
+        if action == "ls":
+            return ("fs:read",)
+        if action in ("delete", "copy", "cp", "move", "mv", "rename", "mkdir"):
+            return ("fs:write",)
+        return ("fs:write",)  # 未知 action 保守按写处理
+
     parameters: dict = {
         "type": "object",
         "properties": {
@@ -1244,6 +1261,7 @@ class PythonTool(BaseTool):
     """
 
     name: str = "python"
+    capabilities = ("exec:code",)
     description: str = "执行 Python 代码并返回输出结果。当需要运行代码片段来验证逻辑或计算结果时使用。代码会实际执行，请注意安全。"
     parameters: dict = {
         "type": "object",
@@ -1307,6 +1325,7 @@ class HttpTool(BaseTool):
     """
 
     name: str = "http"
+    capabilities = ("net:egress",)
     description: str = "发送 HTTP 请求。需要调用外部 REST API、获取 JSON 数据、或与 Web 服务交互时使用。支持 GET 和 POST 方法。"
     parameters: dict = {
         "type": "object",
