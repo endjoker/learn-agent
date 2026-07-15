@@ -51,20 +51,16 @@ SYSTEM_PATHS_MAC = [
 
 
 def _is_system_path(path: str | Path) -> bool:
-    """检查路径是否在系统关键路径下"""
-    p = str(Path(path).resolve())
-    p_lower = p.lower()
-
-    # Windows
-    for sys_path in SYSTEM_PATHS_WIN:
-        if p_lower.startswith(sys_path.lower()):
+    """检查路径是否在系统关键路径下（路径段边界匹配，避免 C:\\Windows 误匹 C:\\WindowsOld）"""
+    try:
+        p_norm = os.path.normpath(str(Path(path).resolve())).lower()
+    except Exception:
+        return False
+    for sys_path in SYSTEM_PATHS_WIN + SYSTEM_PATHS_LINUX + SYSTEM_PATHS_MAC:
+        sp = os.path.normpath(sys_path).lower()
+        # 必须整段相等，或 sp 是 p 的祖先目录（sp + 分隔符 前缀）
+        if p_norm == sp or p_norm.startswith(sp + os.sep):
             return True
-
-    # Linux / macOS
-    for sys_path in SYSTEM_PATHS_LINUX + SYSTEM_PATHS_MAC:
-        if p_lower.startswith(sys_path):
-            return True
-
     return False
 
 
@@ -162,6 +158,13 @@ FORBIDDEN_IMPORTS = {"os", "subprocess", "ctypes", "socket", "sys"}
 FORBIDDEN_CALLS = {"eval", "exec", "compile", "__import__", "open"}
 
 
+def _top_module(dotted: str | None) -> str:
+    """取点分模块名的顶层模块（os.path → os），用于拦截子模块导入。"""
+    if not dotted:
+        return ""
+    return dotted.split(".")[0]
+
+
 def check_python_code(code: str) -> tuple[bool, str]:
     """
     AST 级 Python 代码安全检查
@@ -175,14 +178,14 @@ def check_python_code(code: str) -> tuple[bool, str]:
         return False, f"Python 语法错误: {e}"
 
     for node in ast.walk(tree):
-        # import os → 禁止
+        # import os / import os.path → 禁止（按顶层模块判断）
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name in FORBIDDEN_IMPORTS:
+                if _top_module(alias.name) in FORBIDDEN_IMPORTS:
                     return False, f"Python 安全: 禁止导入模块 '{alias.name}'"
-        # from os import * → 禁止
+        # from os import * / from os.path import join → 禁止（按顶层模块判断）
         if isinstance(node, ast.ImportFrom):
-            if node.module in FORBIDDEN_IMPORTS:
+            if _top_module(node.module) in FORBIDDEN_IMPORTS:
                 return False, f"Python 安全: 禁止导入模块 '{node.module}'"
         # eval() / exec() → 禁止
         if isinstance(node, ast.Call):
@@ -232,16 +235,25 @@ def sanitize_output(text: str) -> str:
 # 环境变量清理
 # ================================================================
 
-SANITIZE_ENV_PREFIXES = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+# 敏感标记：名字中作为独立段（分隔符边界）出现即视为密钥变量
+# 覆盖 OPENAI_API_KEY / GITHUB_TOKEN / DB_PASSWORD / ANTHROPIC_API_KEY 等
+# 厂商前缀命名，避免仅匹配 "以 TOKEN 开头" 抓不到的情况
+SECRET_ENV_MARKERS = (
+    "API_KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL",
+)
+_SECRET_ENV_RE = re.compile(
+    r"(?:^|[_\-])(" + "|".join(SECRET_ENV_MARKERS) + r")(?:$|[_\-])"
+)
+
+
+def _is_secret_env_key(name: str) -> bool:
+    """判断环境变量名是否为敏感凭据（按段匹配，避免误伤 TOKENIZER 等）"""
+    return _SECRET_ENV_RE.search(name.upper()) is not None
 
 
 def sanitize_env(env: dict) -> dict:
-    """剥离敏感环境变量"""
-    return {
-        k: v
-        for k, v in env.items()
-        if not any(k.upper().startswith(p) for p in SANITIZE_ENV_PREFIXES)
-    }
+    """剥离敏感环境变量（API Key / Token / 密码等）"""
+    return {k: v for k, v in env.items() if not _is_secret_env_key(k)}
 
 
 # ================================================================
@@ -260,10 +272,12 @@ def check_write_content(file_path: str, content: str) -> tuple[bool, str]:
     返回:
         (is_safe, reason_or_None)
     """
-    # 1. 敏感路径检查
+    # 1. 敏感路径检查（按路径段边界匹配，避免 endswith 误伤 subagent.py）
+    p_norm = os.path.normpath(file_path).lower()
     for sensitive in SENSITIVE_FILES:
-        if sensitive in file_path or file_path.endswith(sensitive):
-            return False, f"禁止修改关键文件: {file_path}"
+        s_norm = os.path.normpath(sensitive).lower()
+        if p_norm == s_norm or p_norm.endswith(os.sep + s_norm):
+            return False, f"禁止修改关键文件: {sensitive}"
 
     # 2. 系统路径检查
     if _is_system_path(file_path):
@@ -366,5 +380,26 @@ def check_network_target(
         else:
             if hostname == pattern or hostname.endswith("." + pattern):
                 return False, f"请求目标在黑名单中: {hostname}（匹配 {pattern}）"
+
+    # IP/CIDR 黑名单检查（如 10.0.0.0/8 内网段）
+    # 仅对 IP 字面量的 hostname 生效；域名需 DNS 解析，不在静态黑名单范围
+    if blocked_ips:
+        import ipaddress
+
+        try:
+            ip = ipaddress.ip_address(hostname)
+        except ValueError:
+            ip = None  # 域名而非 IP 字面量，跳过 IP 检查
+        if ip is not None:
+            for entry in blocked_ips:
+                try:
+                    if "/" in entry:
+                        net = ipaddress.ip_network(entry, strict=False)
+                    else:
+                        net = ipaddress.ip_network(entry + "/32", strict=False)
+                except ValueError:
+                    continue  # 非法条目，跳过
+                if ip in net:
+                    return False, f"请求目标在黑名单中: {hostname}（匹配 {entry}）"
 
     return True, ""

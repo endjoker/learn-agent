@@ -14,17 +14,17 @@ L2-B 资源隔离层（nanosandbox）为设计预留，暂未实现。
 
 import os
 import subprocess
+import threading
 import logging
 from pathlib import Path
 
 from .guard import (
     check_command_safety,
+    check_write_content,
     sanitize_output,
     check_python_code,
     sanitize_env,
     check_network_target,
-    SENSITIVE_FILES as SENSITIVE_FILE_PATTERNS,
-    _is_system_path,
     _is_within_workspace,
 )
 from .audit import log_interception, log_bypass, log_error
@@ -122,6 +122,26 @@ class SandboxExecutor:
         prof = self._get_current_profile()
         return prof.get("timeout_seconds", 60) if prof else 60
 
+    def _get_max_output_bytes(self) -> int:
+        """获取当前配置档的最大输出字节数（max_output_mb → bytes）。
+
+        防止子进程把 stdout/stderr 全量读进内存导致 OOM；
+        与资源隔离层（L2-B）无关，纯标准库即可生效。
+        """
+        prof = self._get_current_profile()
+        if not prof:
+            return 10 * 1024 * 1024  # 默认 10 MB
+        mb = prof.get("max_output_mb", 10)
+        return max(int(mb) * 1024 * 1024, 64 * 1024)  # 至少 64KB，避免误杀
+
+    def is_profile_network_enabled(self) -> bool:
+        """当前配置档是否允许网络外发（profile.network）。
+
+        与资源隔离层无关，纯配置开关。
+        """
+        prof = self._get_current_profile()
+        return bool(prof.get("network", True)) if prof else True
+
     def set_profile(self, name: str) -> str:
         """切换配置档，返回状态消息"""
         available = profile_loader.list_profiles(self._config)
@@ -202,32 +222,99 @@ class SandboxExecutor:
         cwd: str | None = None,
         env: dict | None = None,
     ) -> SandboxResult:
-        """L2-C subprocess 执行（L2-A 内容拦截已在前置步骤完成）"""
+        """L2-C subprocess 执行（L2-A 内容拦截已在前置步骤完成）
+
+        使用 Popen + 双线程流式读取 stdout/stderr，按 max_output_mb 截断输出，
+        避免 `yes`/`cat /dev/zero` 类命令把输出全量读进内存导致 OOM。
+        """
         timeout = self._get_timeout()
+        max_bytes = self._get_max_output_bytes()
 
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 [command] + (args or []),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 cwd=cwd or str(self._workspace),
                 env=sanitize_env(env or os.environ.copy()),
-                encoding="utf-8",
-                errors="replace",
             )
+        except FileNotFoundError:
             return SandboxResult(
-                stdout=sanitize_output(result.stdout),
-                stderr=result.stderr,
-                exit_code=result.returncode,
+                stderr=f"命令未找到: {command}", exit_code=-1
             )
-        except subprocess.TimeoutExpired:
-            return SandboxResult(timeout=True)
         except Exception as e:
             log_error(f"{command} run", str(e))
-            return SandboxResult(
-                stderr=str(e), exit_code=-1
+            return SandboxResult(stderr=str(e), exit_code=-1)
+
+        out_chunks: list[bytes] = []
+        err_chunks: list[bytes] = []
+        truncated = {"value": False}
+
+        def drain(pipe, sink: list):
+            """流式读取管道，累计超过 max_bytes 则停止读取并 kill 进程"""
+            try:
+                while True:
+                    chunk = pipe.read(65536)
+                    if not chunk:
+                        break
+                    if sum(len(c) for c in sink) + len(chunk) > max_bytes:
+                        truncated["value"] = True
+                        # 输出超限，立即终止进程，避免其继续刷屏占满管道缓冲
+                        try:
+                            proc.kill()
+                        except (ProcessLookupError, OSError):
+                            pass
+                        break
+                    sink.append(chunk)
+            except (OSError, ValueError):
+                pass
+
+        t_out = threading.Thread(
+            target=drain, args=(proc.stdout, out_chunks), daemon=True
+        )
+        t_err = threading.Thread(
+            target=drain, args=(proc.stderr, err_chunks), daemon=True
+        )
+        t_out.start()
+        t_err.start()
+
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                proc.kill()
+            except (ProcessLookupError, OSError):
+                pass
+            proc.wait()
+
+        t_out.join(timeout=5)
+        t_err.join(timeout=5)
+
+        # 关闭管道，释放文件描述符
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                pipe.close()
+            except Exception:
+                pass
+
+        if timed_out:
+            return SandboxResult(timeout=True)
+
+        stdout = b"".join(out_chunks).decode("utf-8", errors="replace")
+        stderr = b"".join(err_chunks).decode("utf-8", errors="replace")
+        if truncated["value"]:
+            stderr = (
+                (stderr + "\n" if stderr else "")
+                + f"[沙箱] 输出超过 max_output_mb 上限（{max_bytes // (1024 * 1024)}MB），已截断"
             )
+
+        return SandboxResult(
+            stdout=sanitize_output(stdout),
+            stderr=stderr,
+            exit_code=proc.returncode,
+        )
 
     # ================================================================
     # 文件写入检查接口（供 WriteTool / EditTool 调用）
@@ -236,21 +323,18 @@ class SandboxExecutor:
     def check_write_file(
         self, file_path: str, content: str
     ) -> tuple[bool, str]:
-        """检查文件写入操作（L2-A 文件保护）"""
+        """检查文件写入操作（L2-A 文件保护）
+
+        委托 guard.check_write_content 做敏感文件 / 系统路径 / 内容注入扫描，
+        再补充工作区边界检查（guard 不感知 workspace）。
+        """
+        is_safe, reason = check_write_content(file_path, content)
+        if not is_safe:
+            log_interception("write", file_path, reason)
+            return False, reason
+
+        # 工作区外写入需要额外确认（走 L1 权限）
         path = Path(file_path).resolve()
-
-        # 1. 保护敏感文件
-        for sensitive in SENSITIVE_FILE_PATTERNS:
-            if str(path).endswith(sensitive):
-                log_interception("write", file_path, f"SENSITIVE_FILE:{sensitive}")
-                return False, f"禁止修改关键文件: {sensitive}"
-
-        # 2. 保护系统路径
-        if _is_system_path(path):
-            log_interception("write", file_path, "SYSTEM_PATH")
-            return False, f"禁止写入系统路径: {path}"
-
-        # 3. 工作区外写入需要额外确认（走 L1 权限）
         if not _is_within_workspace(path, self._workspace):
             log_interception("write", file_path, "OUTSIDE_WORKSPACE")
             return False, f"写入路径不在工作区内: {path}"
@@ -270,7 +354,18 @@ class SandboxExecutor:
     # ================================================================
 
     def check_egress(self, url: str) -> tuple[bool, str]:
-        """检查外发请求目标"""
+        """检查外发请求目标
+
+        1. 当前配置档 network 开关为 False → 直接拒绝所有外发
+        2. 域名/IP 黑名单（注：blocked_ips 由 check_network_target 处理）
+        """
+        # 1. per-profile 网络开关：restricted 档 network=False 时禁网
+        if not self.is_profile_network_enabled():
+            reason = f"当前配置档 '{self.current_profile}' 禁止网络访问"
+            log_interception("http", url, f"EGRESS:profile_network_off")
+            return False, reason
+
+        # 2. 域名/IP 黑名单
         net = self.get_network_config()
         is_safe, reason = check_network_target(
             url,

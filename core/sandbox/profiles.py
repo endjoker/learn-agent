@@ -5,6 +5,7 @@
 
 import json
 import os
+import copy
 import logging
 from pathlib import Path
 from typing import Any
@@ -30,8 +31,7 @@ _DEFAULT_CONFIG = {
         ],
         "blocked_ips": [
             "10.0.0.0/8",
-            "172.16.0.0/12",
-            "192.168.0.0/16",
+            "172.16.0.0/12"
         ],
     },
     "profiles": {
@@ -97,8 +97,8 @@ def load_config() -> dict[str, Any]:
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             user_cfg = json.load(f)
-        # 合并：用户配置覆盖默认
-        merged = _deep_merge(_DEFAULT_CONFIG.copy(), user_cfg)
+        # 合并：用户配置覆盖默认（深拷贝默认配置，避免就地修改污染模块级 _DEFAULT_CONFIG）
+        merged = _deep_merge(copy.deepcopy(_DEFAULT_CONFIG), user_cfg)
         logger.info("从 %s 加载了沙箱配置", cfg_path.name)
         return merged
     except (json.JSONDecodeError, OSError) as e:
