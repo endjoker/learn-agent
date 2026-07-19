@@ -16,6 +16,7 @@ logger = logging.getLogger("hello_agent")
 _DEFAULT_CONFIG = {
     "enabled": True,
     "default_profile": "agent",
+    "idle_timeout_seconds": 300,   # 长驻进程空闲上限（5 分钟无 read/send → kill），供 ProcessManager 用
     "network": {
         "blocked_domains": [
             "*.xyz",

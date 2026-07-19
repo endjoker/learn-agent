@@ -4,7 +4,7 @@
 
 ## ✨ 功能特性
 
-### 已实现的 16 个内置工具 + MCP 扩展
+### 已实现的 22 个内置工具 + MCP 扩展 + 技能
 
 | 工具 | 功能 | 说明 |
 |:----|:-----|:-----|
@@ -13,7 +13,12 @@
 | **edit** | 精确查找替换 | 修改文件某段内容，默认替换第一处 |
 | **grep** | 文本搜索 | 正则匹配，支持文件类型过滤 |
 | **glob** | 通配符查找文件 | 查找某类文件、浏览项目结构 |
-| **bash** | 执行 Shell 命令 | 运行脚本、git 操作，自动适配系统 |
+| **bash** | 执行 Shell 命令 | 一次性命令、git 操作，自动适配系统 |
+| **proc_start** | 启动长驻进程 | dev server / watcher / REPL，跨步存活 |
+| **proc_send** | 向进程投喂 stdin | REPL 交互、y/n 确认 |
+| **proc_read** | 增量读进程输出 | 不阻塞，后台缓冲区取数据 |
+| **proc_list** | 列出进程会话 | ID/名称/状态/退出码/空闲时长 |
+| **proc_stop** | 终止进程 | 杀整树（Windows taskkill /F /T） |
 | **search** | 网页搜索 | 基于 DuckDuckGo/Bing，无需 API Key |
 | **web_fetch** | 读取网页正文 | 提取文章/新闻的纯文本内容 |
 | **calculate** | 数学计算 | 安全执行表达式，支持 sqrt/sin 等 |
@@ -43,6 +48,10 @@
 - **跨会话记忆** — 每轮对话自动归档到 `memory/daily/`，支持 BM25 全文检索回忆
 - **学习型技能系统** — AI 每轮学习到的可复用能力持久化到 `SKILLS/` 目录，LLM 可通过 `create_skill` 工具运行时创建技能，交互式 `/skill` 命令查看和调用
 - **沙箱执行器（L2 两层防护）** — L2-A 内容拦截（敏感文件/数据外发/Python AST/网络黑名单）+ L2-C subprocess 执行 + 超时控制；支持配置档切换（agent/restricted/permissive）和临时绕过（L2-B 资源隔离为设计预留）
+- **长驻子进程模块** — `ProcessManager` 管理跨步存活的长驻进程（dev server / watcher / REPL），5 个 proc_* 工具，增量读取、stdin 投喂、杀整树；idle 超时自动清理；区外 cwd 拒绝启动
+- **L2 危险命令下沉** — `rm -rf /` / `format` / `mkfs` 等 OS 危害强制 L2 硬拦（白名单不可绕过），bash 和 proc_start 统一兜底
+- **安全闸门 SecurityGate** — capability 驱动的统一权限+沙箱检查点，覆盖内置/MCP/skill/未来工具；未知工具默认 ASK；技能注册自动 ALLOW
+- **交互命令** — `/model`、`/plan`、`/session`、`/mcp`、`/skill`、`/sandbox`、`/proc`、`/stats`、`/history`、`/compact`、`/clear`、`/help`
 - **连续对话** — 跨多轮对话保留历史上下文，自动截断防超限
 - **会话持久化** — 每轮对话自动保存到 `sessions/{id}.json`，含任务清单序列化
 - **会话恢复** — `--resume <id>` 恢复指定会话，`--resume last` 按修改时间取最新会话

@@ -1,5 +1,56 @@
 # 更新日志
 
+## 2026-07-16 长驻子进程模块 & L2 危险命令下沉 & OutputDrainer 重构
+
+**新功能：长驻子进程管理器 `ProcessManager`**：
+- 新增 `core/process_manager.py`——长驻交互式子进程会话管理器
+  - `ProcessSession` 数据类：id / name / proc / ring buffer / 读指针 / idle watchdog
+  - `ProcessManager`：start（shell 字符串+Popen 包装）/ send（stdin 投喂）/ read（增量，per-session 消费）/ stop（杀整树）/ list_sessions / cleanup_all
+  - Popen 包装 shell：POSIX `bash -c` / Windows `cmd.exe /c`；`CREATE_NEW_PROCESS_GROUP` + `taskkill /F /T` 杀整树（防 Windows 下杀父进程残留孤儿持有管道）
+  - drain 用 `read1()` 而非 `read(n)`——避免低频输出进程（dev server）被 64KB 阻塞
+  - ring buffer（`deque(maxlen)`）内存有界，长驻不因输出量 kill；病态 spam 由 idle watchdog 兜底
+  - idle watchdog：无 read/send 超 `idle_timeout_seconds` → 自动 kill；同时检测自然退出 + 保留 exited 会话 600s
+  - cwd 校验：区外 cwd → 拒绝启动；env 不脱敏（继承 `os.environ`，与 MCP stdio 一致）
+- 新增 `tools/process_tools.py`——5 个长驻进程工具
+  - `proc_start`（`proc:manage`+`exec:shell`）启动长驻进程
+  - `proc_send`（`proc:manage`）向 stdin 投喂
+  - `proc_read`（`proc:read`）增量读取（只读）
+  - `proc_list`（`proc:read`）列出会话状态
+  - `proc_stop`（`proc:manage`）终止进程
+  - 各工具静态声明 `capabilities`，SecurityGate 按标签自动跑 L2
+
+**新增 `check_proc_send_input`**（`core/sandbox/guard.py`）：
+- proc_send 的 L2 内容检查——投喂到 REPL 的 input 可能含 shell 命令或 python 代码
+- 同时检查 shell 危险模式（复用 check_command_safety，含 DANGEROUS）+ python 危险模式（`os.system`/`subprocess`/`eval`/`exec`/`__import__`/`shutil.rmtree`/`ctypes`）
+
+**L2 危险命令下沉**（`core/sandbox/guard.py`）：
+- `DANGEROUS_WORDS`（format/shutdown/reboot/halt，令牌边界）+ `DANGEROUS_SUBSTRINGS`（rm -rf //mkfs/dd if=/fork 炸弹…）合并进 `check_command_safety`
+- **DANGEROUS 检查在白名单之前**——关键修正：`ls; rm -rf /` 不再被 `^ls` 白名单绕过
+- 原 `permission.DANGEROUS` 保留作 L1 二级防线
+
+**OutputDrainer 重构**（`core/sandbox/executor.py`）：
+- 把 `SandboxExecutor._execute` 的内嵌三层闭包 drain 提取为 `OutputDrainer` 类
+- 双模式：list sink + kill_on_exceed（一次性，BashTool）+ deque(maxlen) sink + dropped 计数（长驻，ProcessManager）
+- `SandboxExecutor._execute` 改用 `OutputDrainer`，行为不变（BashTool 回归通过）
+
+**SecurityGate 新增 `proc:manage` L2 分支**（`core/security_gate.py`）：
+- `proc:manage` + 有 `input` 参数 → `check_proc_send_input`
+- gate 不依赖 ProcessManager（内容检查只是字符串扫描）
+
+**agent 长驻进程接线**（`agent.py`）：
+- `create_agent` 创建 `ProcessManager` 并注入 `register_all_tools`
+- `Agent.__init__` 注入 `process_manager` 并批量 `set_rule`（proc_* → ALLOW，危险判定全交 L2）
+- 退出时 `process_manager.cleanup_all()`（与 `mcp_manager.close_all` 并列）
+- 新增交互命令 `/proc`（list / stop <id> / tail <id>），启动 banner + /help 同步更新
+
+**配置落地**：
+- `config/sandbox.json` 顶层加 `idle_timeout_seconds: 300`（长驻进程空闲上限）
+- `core/sandbox/profiles.py` `_DEFAULT_CONFIG` 顶层同步
+- `SandboxExecutor._get_idle_timeout()` 读取
+- profile `max_processes` 字段此前一直未用，现由 ProcessManager 生效
+
+**依赖**：全标准库（`subprocess`/`threading`/`collections.deque`/`dataclasses`/`pathlib`/`time`），无新增外部依赖。
+
 ## 2026-07-15 沙箱系统 & 技能系统 & SystemPrompt 三区分离
 
 **新功能：沙箱执行器（两层防护）：**

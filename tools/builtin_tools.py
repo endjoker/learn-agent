@@ -1433,7 +1433,7 @@ BUILTIN_TOOLS = [
     MemoryUpdateTool,
 ]
 
-def register_all_tools(registry, memory_manager=None, sandbox=None):
+def register_all_tools(registry, memory_manager=None, sandbox=None, process_manager=None):
     """
     一键注册所有内置工具到注册表
 
@@ -1441,6 +1441,7 @@ def register_all_tools(registry, memory_manager=None, sandbox=None):
         registry: ToolRegistry 实例
         memory_manager: MemoryManager 实例（可选），注入到记忆工具中
         sandbox: SandboxExecutor 实例（可选），注入到 bash/python/write/edit/read/http 工具中
+        process_manager: ProcessManager 实例（可选），注入到 proc_* 工具中
 
     使用方式：
         from tools import ToolRegistry
@@ -1450,6 +1451,7 @@ def register_all_tools(registry, memory_manager=None, sandbox=None):
         register_all_tools(registry)
         register_all_tools(registry, memory_manager=mm)  # 启用记忆系统
         register_all_tools(registry, sandbox=sb)         # 启用沙箱
+        register_all_tools(registry, process_manager=pm) # 启用长驻进程工具
     """
     from .registry import ToolRegistry
 
@@ -1465,5 +1467,10 @@ def register_all_tools(registry, memory_manager=None, sandbox=None):
         if sandbox and hasattr(tool, 'set_sandbox'):
             tool.set_sandbox(sandbox)
         registry.register_tool(tool)
+
+    # 长驻子进程工具（proc_*）
+    if process_manager is not None:
+        from .process_tools import register_process_tools
+        register_process_tools(registry, process_manager=process_manager)
 
     return registry

@@ -1,6 +1,7 @@
 {
     "enabled": true,
     "default_profile": "agent",
+    "idle_timeout_seconds": 300,
     "network": {
         "blocked_domains": [
             "*.xyz",

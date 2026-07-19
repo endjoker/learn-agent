@@ -97,6 +97,80 @@ DATA_LEAK_PATTERNS = [
 ]
 
 # ================================================================
+# 危险命令模式（OS 级危害，L2 最后硬拦）
+# 与 permission.DANGEROUS 一致；bash 与 proc_* 在 L2 统一拦死，
+# 不依赖 L1 规则是否设了 ALLOW。permission 的 DANGEROUS 保留作 L1 二级防线。
+# ================================================================
+
+# 单词型危险命令：必须作为独立令牌（前后空白/行首行尾）才命中
+# 避免 "format" 误伤 PowerShell 的 "format-table"
+DANGEROUS_WORDS = ["format", "shutdown", "reboot", "halt"]
+_DANGEROUS_WORDS_RE = re.compile(
+    r"(?:^|\s)(" + "|".join(DANGEROUS_WORDS) + r")(?=\s|$)",
+    re.IGNORECASE,
+)
+
+# 子串型危险命令：足够特异，子串匹配（mkfs 含 mkfs.ext4）
+DANGEROUS_SUBSTRINGS = [
+    "rm -rf /", "rm -rf ~", "rm -rf .",
+    "del /f /s", "rd /s /q",
+    "mkfs",
+    "dd if=",
+    ":(){ :|:& };:",   # fork 炸弹
+    "> /dev/sda", "> /dev/mmc",
+]
+
+
+def _match_dangerous(command_lower: str) -> str | None:
+    """返回命中的危险模式（None 表示安全）。供 L2 硬拦使用。"""
+    for pat in DANGEROUS_SUBSTRINGS:
+        if pat in command_lower:
+            return pat
+    m = _DANGEROUS_WORDS_RE.search(command_lower)
+    if m:
+        return m.group(1)
+    return None
+
+
+# ================================================================
+# proc_send 内容检查（投喂到 REPL 的 input 可能是 shell/python 危险调用）
+# ================================================================
+
+# Python 危险调用模式（投喂到 python REPL 时）
+_PROC_PYTHON_DANGER = [
+    re.compile(r"\bos\.system\s*\("),
+    re.compile(r"\bos\.(remove|unlink|rmdir|kill)\s*\("),
+    re.compile(r"\bshutil\.rmtree\s*\("),
+    re.compile(r"\bsubprocess\b"),
+    re.compile(r"\b__import__\s*\("),
+    re.compile(r"\beval\s*\("),
+    re.compile(r"\bexec\s*\("),
+    re.compile(r"\bctypes\b"),
+]
+
+
+def check_proc_send_input(text: str) -> tuple[bool, str]:
+    """proc_send 的 L2 内容检查。
+
+    投喂到 REPL 的 input 可能是 shell 命令或 python 代码，统一查两类危险模式：
+    - shell 危险：data-leak / exec-injection / DANGEROUS（复用 check_command_safety 的模式）
+    - python 危险：os.system / subprocess / eval / exec / __import__ / shutil.rmtree / ctypes
+
+    返回 (is_safe, reason)。诚实声明：字符串模式启发，覆盖常见 OS-harm 向量；
+    混淆/编码输入无法完全覆盖，靠 L1 区外 ASK + idle-timeout 兜底。
+    """
+    # shell 危险（直接复用 check_command_safety，它已含 DANGEROUS）
+    safe, reason = check_command_safety(text, "bash")
+    if not safe:
+        return False, f"send 内容命中 shell 危险模式: {reason}"
+    # python 危险
+    for p in _PROC_PYTHON_DANGER:
+        if p.search(text):
+            return False, f"send 内容命中 Python 危险调用: {p.pattern}"
+    return True, ""
+
+
+# ================================================================
 # 可执行注入模式
 # ================================================================
 
@@ -312,12 +386,17 @@ def check_command_safety(
     返回:
         (is_safe, reason) — True 表示安全，False 表示被拦截
     """
-    # ===== 0. 白名单检查 =====
+    # ===== 0. 危险命令（OS 级，最后硬拦——最先检查，不可被白名单绕过）=====
+    dangerous = _match_dangerous(command.lower())
+    if dangerous:
+        return False, f"检测到危险命令，已拦截: {dangerous}"
+
+    # ===== 1. 白名单检查 =====
     for pattern in SAFE_PATTERNS:
         if pattern.search(command):
             return True, ""
 
-    # ===== 1. 防外发数据检测 =====
+    # ===== 2. 防外发数据检测 =====
     for pattern in DATA_LEAK_PATTERNS:
         if pattern.search(command):
             return (
@@ -325,7 +404,7 @@ def check_command_safety(
                 f"检测到疑似数据外发行为，已拦截: {command[:100]}",
             )
 
-    # ===== 2. 防危险操作检测 =====
+    # ===== 3. 防危险操作检测 =====
     for pattern in EXEC_INJECTION_PATTERNS:
         if pattern.search(command):
             return (

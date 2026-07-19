@@ -20,7 +20,7 @@ import logging
 from typing import Optional, Tuple
 
 from core.permission import PermissionChecker, ALLOW, ASK, DENY
-from core.sandbox.guard import check_command_safety, check_python_code
+from core.sandbox.guard import check_command_safety, check_python_code, check_proc_send_input
 
 logger = logging.getLogger("hello_agent")
 
@@ -145,6 +145,14 @@ class SecurityGate:
             if not code:
                 return None
             ok, reason = check_python_code(code)
+            return (ok, reason) if not ok else None
+
+        # proc_send 内容检查（投喂到 REPL 的 input，shell+python 危险模式）
+        if "proc:manage" in cap_set:
+            inp = params.get("input")
+            if not inp:
+                return None   # 无 input（如 proc_stop）→ 交 L1
+            ok, reason = check_proc_send_input(inp)
             return (ok, reason) if not ok else None
 
         return None

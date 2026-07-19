@@ -50,6 +50,7 @@ from core.debug import (
 from core.message_store import MessageStore
 from core.permission import PermissionChecker, ALLOW, ASK, DENY
 from core.security_gate import SecurityGate
+from core.process_manager import ProcessManager
 from tools import BaseTool, ToolRegistry
 from tools.builtin_tools import register_all_tools
 from tools.web_tools import register_web_tools
@@ -192,6 +193,7 @@ class Agent:
         memory: MemoryManager = None,  # 跨会话记忆系统（可选）
         mcp_servers: list = None,      # MCP 服务器配置列表（可选）
         sandbox: SandboxExecutor = None,  # 沙箱执行器（可选）
+        process_manager = None,           # 长驻子进程管理器（可选）
     ):
         self.name = name
         self.llm = llm
@@ -206,11 +208,16 @@ class Agent:
         self.permission = permission_checker or PermissionChecker()
         self.memory = memory  # 跨会话记忆系统
         self.sandbox = sandbox  # 沙箱执行器
+        self.process_manager = process_manager  # 长驻子进程管理器
         self.skill_manager = None  # 技能系统（延迟注册）
         # 中央安全闸门：统一 L1 权限 + L2 沙箱，覆盖所有工具（含 skill/MCP）
         self._gate = SecurityGate(
             self.permission, self.sandbox, str(self.permission.workspace)
         )
+        # 长驻进程工具权限：L1 注册为 ALLOW（危险判定全交 L2：exec:shell 查 command、proc:manage 查 input）
+        if self.process_manager is not None:
+            for _t in ("proc_start", "proc_send", "proc_read", "proc_list", "proc_stop"):
+                self.permission.set_rule(_t, ALLOW)
         if debug:
             set_debug(True)
         # MCP 客户端管理器（延迟初始化）
@@ -1362,11 +1369,18 @@ def create_agent(
         skill_manager.load_all()
     # 沙箱执行器（L2 内容拦截 + 资源隔离）
     sandbox_executor = SandboxExecutor() if sandbox else None
-    registry = ToolRegistry()
-    register_all_tools(registry, memory_manager=memory_manager, sandbox=sandbox_executor)
-    register_web_tools(registry)
     # 权限管理
     checker = PermissionChecker() if permission else None
+    # 长驻子进程管理器（依赖沙箱的 max_output/idle 配置）
+    process_manager = None
+    if sandbox_executor and checker:
+        process_manager = ProcessManager(sandbox_executor, str(checker.workspace))
+    registry = ToolRegistry()
+    register_all_tools(
+        registry, memory_manager=memory_manager,
+        sandbox=sandbox_executor, process_manager=process_manager,
+    )
+    register_web_tools(registry)
     # MCP 配置：代码参数 > .env > mcp_config.json
     mcp_servers = _load_mcp_config(mcp_servers)
     agent = Agent(
@@ -1377,6 +1391,7 @@ def create_agent(
         permission_checker=checker,
         memory=memory_manager,
         sandbox=sandbox_executor,
+        process_manager=process_manager,
         mcp_servers=mcp_servers,
     )
     if skill_manager:
@@ -1416,6 +1431,9 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
     print("║   /sandbox strict    切换到严格模式             ║")
     print("║   /sandbox bypass    临时绕过沙箱               ║")
     print("║   /sandbox profile   切换配置档                 ║")
+    print("║   /proc              查看长驻进程会话           ║")
+    print("║   /proc stop <id>    停止指定进程               ║")
+    print("║   /proc tail <id>    持续打印进程输出          ║")
     print("║   /stats             查看上下文占用             ║")
     print("║   /history             查看当前会话内容         ║")
     print("║   /compact           全量压缩历史（释放上下文）  ║")
@@ -1480,6 +1498,12 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                         from core.mcp_client import run_in_mcp_loop
                         # 在 MCP 专用事件循环中关闭，复用同一连接状态
                         run_in_mcp_loop(agent.mcp_manager.close_all(), timeout=10)
+                    except Exception:
+                        pass
+                # 清理长驻子进程（杀整树）
+                if getattr(agent, 'process_manager', None):
+                    try:
+                        agent.process_manager.cleanup_all()
                     except Exception:
                         pass
                 print("👋 再见！")
@@ -1628,6 +1652,51 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                     print(f"  可用配置档: {', '.join(profiles)}")
                 else:
                     print(f"\n  {sb.get_status_text()}")
+                continue
+            # ---- /proc ----
+            if u.startswith("/proc"):
+                pm = getattr(agent, 'process_manager', None)
+                if not pm:
+                    print("  ❌ 长驻进程模块未启用（create_agent 需 sandbox=True）")
+                    continue
+                parts = u.split()
+                sub = parts[1] if len(parts) > 1 else "list"
+                if sub == "list":
+                    sessions = pm.list_sessions()
+                    if not sessions:
+                        print("  📭 暂无进程会话")
+                    else:
+                        print(f"\n  🖥️  进程会话（共 {len(sessions)} 个）:")
+                        for s in sessions:
+                            print(f"    [{s['id']}] {s['name']} | {s['status']}"
+                                  f" | exit={s['exit_code']} | idle={s['idle_for']}s")
+                elif sub == "stop" and len(parts) > 2:
+                    try:
+                        print(f"  {pm.stop(int(parts[2]))}")
+                    except ValueError:
+                        print("  ❌ 用法: /proc stop <id>")
+                elif sub == "tail" and len(parts) > 2:
+                    try:
+                        sid = int(parts[2])
+                        print(f"  📺 tail session={sid}（Ctrl-C 中断）")
+                        import time as _t
+                        try:
+                            while True:
+                                out, err, trunc, status = pm.read(sid)
+                                if out:
+                                    print(out, end="", flush=True)
+                                if err:
+                                    print(f"\n📕 {err}", end="", flush=True)
+                                if status and ("exited" in status or "killed" in status):
+                                    print(f"\n  {status.strip()}")
+                                    break
+                                _t.sleep(0.5)
+                        except KeyboardInterrupt:
+                            print("\n  ⏹  tail 已中断")
+                    except ValueError:
+                        print("  ❌ 用法: /proc tail <id>")
+                else:
+                    print("  用法: /proc [list | stop <id> | tail <id>]")
                 continue
             # ---- /stats ----
             if u.startswith("/stats"):
@@ -1827,6 +1896,9 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                 print("    /sandbox strict     切换到严格模式")
                 print("    /sandbox bypass     临时绕过沙箱")
                 print("    /sandbox profile    切换配置档")
+                print("    /proc               查看长驻进程会话")
+                print("    /proc stop <id>     停止指定进程")
+                print("    /proc tail <id>     持续打印进程输出")
                 print("    /stats              查看上下文占用统计")
                 print("    /history            查看当前会话内容")
                 print("    /mcp                查看 MCP 服务器状态")

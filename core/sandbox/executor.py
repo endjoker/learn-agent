@@ -72,6 +72,70 @@ class SandboxResult:
         return "\n".join(parts)
 
 
+class OutputDrainer:
+    """流式读取子进程管道写入 sink，供 SandboxExecutor._execute 和 ProcessManager 共用。
+
+    - sink 为 list + kill_on_exceed=True：一次性命令，累计超 max_bytes 则 kill 进程（BashTool）
+    - sink 为 deque(maxlen) + kill_on_exceed=False：长驻会话，ring 天然驱丢，记 dropped（ProcessManager）
+    """
+
+    def __init__(
+        self,
+        proc: subprocess.Popen,
+        pipe,
+        sink,
+        max_bytes: int,
+        kill_on_exceed: bool = True,
+    ):
+        self._proc = proc
+        self._pipe = pipe
+        self._sink = sink
+        self._max_bytes = max_bytes
+        self._kill_on_exceed = kill_on_exceed
+        self.truncated = False   # 一次性：是否触发 kill 截断
+        self.dropped = 0          # 长驻：ring 驱丢的 chunk 累计计数
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._thread.start()
+
+    def join(self, timeout: float = 5) -> None:
+        if self._thread:
+            self._thread.join(timeout=timeout)
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                # read1：一次底层读取，返回当前可得字节（不阻塞等待填满缓冲），
+                # 否则低频输出（如 dev server 日志）会被 read(65536) 阻塞到 EOF
+                chunk = self._pipe.read1(65536)
+                if not chunk:
+                    break
+                if self._kill_on_exceed:
+                    # 一次性模式：累计超限则 kill
+                    if sum(len(c) for c in self._sink) + len(chunk) > self._max_bytes:
+                        self.truncated = True
+                        try:
+                            self._proc.kill()
+                        except (ProcessLookupError, OSError):
+                            pass
+                        break
+                    self._sink.append(chunk)
+                else:
+                    # ring 模式：deque(maxlen) 自动驱丢最旧；append 前若满则记一次 drop
+                    mx = getattr(self._sink, "maxlen", None)
+                    if mx is not None and len(self._sink) >= mx:
+                        self.dropped += 1
+                    self._sink.append(chunk)
+        except (OSError, ValueError):
+            pass
+
+    def result_bytes(self) -> bytes:
+        """一次性模式用：拼接 sink 为 bytes。ring 模式由 ProcessManager 自管读指针。"""
+        return b"".join(self._sink)
+
+
 class SandboxExecutor:
     """
     沙箱执行器
@@ -141,6 +205,13 @@ class SandboxExecutor:
         """
         prof = self._get_current_profile()
         return bool(prof.get("network", True)) if prof else True
+
+    def _get_idle_timeout(self) -> float:
+        """长驻进程空闲上限（秒）。读 config 顶层 idle_timeout_seconds，默认 300。
+
+        供 ProcessManager idle watchdog 使用；BashTool 等一次性工具不涉及。
+        """
+        return float(self._config.get("idle_timeout_seconds", 300))
 
     def set_profile(self, name: str) -> str:
         """切换配置档，返回状态消息"""
@@ -224,8 +295,8 @@ class SandboxExecutor:
     ) -> SandboxResult:
         """L2-C subprocess 执行（L2-A 内容拦截已在前置步骤完成）
 
-        使用 Popen + 双线程流式读取 stdout/stderr，按 max_output_mb 截断输出，
-        避免 `yes`/`cat /dev/zero` 类命令把输出全量读进内存导致 OOM。
+        使用 Popen + OutputDrainer 双线程流式读取 stdout/stderr，按 max_output_mb
+        截断输出，避免 `yes`/`cat /dev/zero` 类命令把输出全量读进内存导致 OOM。
         """
         timeout = self._get_timeout()
         max_bytes = self._get_max_output_bytes()
@@ -246,37 +317,16 @@ class SandboxExecutor:
             log_error(f"{command} run", str(e))
             return SandboxResult(stderr=str(e), exit_code=-1)
 
-        out_chunks: list[bytes] = []
-        err_chunks: list[bytes] = []
-        truncated = {"value": False}
-
-        def drain(pipe, sink: list):
-            """流式读取管道，累计超过 max_bytes 则停止读取并 kill 进程"""
-            try:
-                while True:
-                    chunk = pipe.read(65536)
-                    if not chunk:
-                        break
-                    if sum(len(c) for c in sink) + len(chunk) > max_bytes:
-                        truncated["value"] = True
-                        # 输出超限，立即终止进程，避免其继续刷屏占满管道缓冲
-                        try:
-                            proc.kill()
-                        except (ProcessLookupError, OSError):
-                            pass
-                        break
-                    sink.append(chunk)
-            except (OSError, ValueError):
-                pass
-
-        t_out = threading.Thread(
-            target=drain, args=(proc.stdout, out_chunks), daemon=True
+        out_sink: list[bytes] = []
+        err_sink: list[bytes] = []
+        out_drainer = OutputDrainer(
+            proc, proc.stdout, out_sink, max_bytes, kill_on_exceed=True
         )
-        t_err = threading.Thread(
-            target=drain, args=(proc.stderr, err_chunks), daemon=True
+        err_drainer = OutputDrainer(
+            proc, proc.stderr, err_sink, max_bytes, kill_on_exceed=True
         )
-        t_out.start()
-        t_err.start()
+        out_drainer.start()
+        err_drainer.start()
 
         timed_out = False
         try:
@@ -289,8 +339,8 @@ class SandboxExecutor:
                 pass
             proc.wait()
 
-        t_out.join(timeout=5)
-        t_err.join(timeout=5)
+        out_drainer.join()
+        err_drainer.join()
 
         # 关闭管道，释放文件描述符
         for pipe in (proc.stdout, proc.stderr):
@@ -302,9 +352,9 @@ class SandboxExecutor:
         if timed_out:
             return SandboxResult(timeout=True)
 
-        stdout = b"".join(out_chunks).decode("utf-8", errors="replace")
-        stderr = b"".join(err_chunks).decode("utf-8", errors="replace")
-        if truncated["value"]:
+        stdout = out_drainer.result_bytes().decode("utf-8", errors="replace")
+        stderr = err_drainer.result_bytes().decode("utf-8", errors="replace")
+        if out_drainer.truncated or err_drainer.truncated:
             stderr = (
                 (stderr + "\n" if stderr else "")
                 + f"[沙箱] 输出超过 max_output_mb 上限（{max_bytes // (1024 * 1024)}MB），已截断"
