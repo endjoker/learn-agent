@@ -148,6 +148,9 @@ class SecurityGate:
             return (ok, reason) if not ok else None
 
         # proc_send 内容检查（投喂到 REPL 的 input，shell+python 危险模式）
+        # 注意：此处硬编码 params["input"] 与 proc_send 的参数名耦合；
+        # 若未来新增 proc:manage 工具用了不同参数名（如 data/content），
+        # 需同步更新此处或改为按 capability 注册检查函数。
         if "proc:manage" in cap_set:
             inp = params.get("input")
             if not inp:

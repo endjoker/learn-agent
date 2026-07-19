@@ -1687,6 +1687,8 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                                     print(out, end="", flush=True)
                                 if err:
                                     print(f"\n📕 {err}", end="", flush=True)
+                                if trunc:
+                                    print("\n⚠️ 部分输出因缓冲区满被丢弃", end="", flush=True)
                                 if status and ("exited" in status or "killed" in status):
                                     print(f"\n  {status.strip()}")
                                     break

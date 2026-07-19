@@ -177,22 +177,22 @@ class SandboxExecutor:
     # 配置管理
     # ================================================================
 
-    def _get_current_profile(self) -> dict | None:
+    def get_current_profile(self) -> dict | None:
         """获取当前配置档"""
         return profile_loader.get_profile(self._config, self.current_profile)
 
     def _get_timeout(self) -> int:
         """获取当前超时设置"""
-        prof = self._get_current_profile()
+        prof = self.get_current_profile()
         return prof.get("timeout_seconds", 60) if prof else 60
 
-    def _get_max_output_bytes(self) -> int:
+    def get_max_output_bytes(self) -> int:
         """获取当前配置档的最大输出字节数（max_output_mb → bytes）。
 
         防止子进程把 stdout/stderr 全量读进内存导致 OOM；
         与资源隔离层（L2-B）无关，纯标准库即可生效。
         """
-        prof = self._get_current_profile()
+        prof = self.get_current_profile()
         if not prof:
             return 10 * 1024 * 1024  # 默认 10 MB
         mb = prof.get("max_output_mb", 10)
@@ -203,10 +203,10 @@ class SandboxExecutor:
 
         与资源隔离层无关，纯配置开关。
         """
-        prof = self._get_current_profile()
+        prof = self.get_current_profile()
         return bool(prof.get("network", True)) if prof else True
 
-    def _get_idle_timeout(self) -> float:
+    def get_idle_timeout(self) -> float:
         """长驻进程空闲上限（秒）。读 config 顶层 idle_timeout_seconds，默认 300。
 
         供 ProcessManager idle watchdog 使用；BashTool 等一次性工具不涉及。
@@ -299,7 +299,7 @@ class SandboxExecutor:
         截断输出，避免 `yes`/`cat /dev/zero` 类命令把输出全量读进内存导致 OOM。
         """
         timeout = self._get_timeout()
-        max_bytes = self._get_max_output_bytes()
+        max_bytes = self.get_max_output_bytes()
 
         try:
             proc = subprocess.Popen(

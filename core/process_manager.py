@@ -20,7 +20,7 @@ import signal
 import threading
 import subprocess
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -64,7 +64,6 @@ class ProcessSession:
     last_active: float
     status: str                # running / exited / killed / idle_killed
     exit_code: Optional[int] = None
-    is_external: bool = False
     out_drainer: Optional[OutputDrainer] = None
     err_drainer: Optional[OutputDrainer] = None
     last_out_dropped: int = 0
@@ -80,9 +79,9 @@ class ProcessManager:
         self._workspace = Path(workspace).resolve()
         self._sessions: dict[int, ProcessSession] = {}
         self._next_id = 1
-        prof = sandbox._get_current_profile() or {}
+        prof = sandbox.get_current_profile() or {}
         self._max_sessions = int(prof.get("max_processes", 8))
-        self._idle_timeout = float(sandbox._get_idle_timeout())
+        self._idle_timeout = float(sandbox.get_idle_timeout())
         self._retain_exited = 600.0
         self._lock = threading.Lock()
         self._stop = False
@@ -102,7 +101,7 @@ class ProcessManager:
 
     def _max_chunks(self) -> int:
         """ring buffer chunk 数（≈ max_output_bytes / chunk_size）"""
-        return max(1, self._sandbox._get_max_output_bytes() // _CHUNK)
+        return max(1, self._sandbox.get_max_output_bytes() // _CHUNK)
 
     def _evict_oldest_exited(self) -> bool:
         """驱逐最老的 exited 会话以腾容量。返回是否驱逐成功。"""
@@ -127,7 +126,8 @@ class ProcessManager:
                     pipe.close()
             except Exception:
                 pass
-        self._sessions.pop(s.id, None)
+        with self._lock:
+            self._sessions.pop(s.id, None)
 
     # ================================================================
     # 主接口
@@ -138,8 +138,7 @@ class ProcessManager:
         失败返回 (-1, 错误信息)。
         """
         cwd_path = Path(cwd).resolve() if cwd else self._workspace
-        is_external = not self._is_within_workspace(cwd_path)
-        if is_external:
+        if not self._is_within_workspace(cwd_path):
             return -1, f"❌ 区外 cwd 不允许: {cwd_path}（请用工作区内路径）"
 
         with self._lock:
@@ -170,38 +169,51 @@ class ProcessManager:
         except Exception as e:
             return -1, f"❌ 启动失败: {e}"
 
-        maxlen = self._max_chunks()
-        out_buf: deque = deque(maxlen=maxlen)
-        err_buf: deque = deque(maxlen=maxlen)
-        max_bytes = self._sandbox._get_max_output_bytes()
-        now = time.time()
-        session = ProcessSession(
-            id=sid,
-            name=name or f"proc-{sid}",
-            proc=proc,
-            stdout_buf=out_buf,
-            stderr_buf=err_buf,
-            lock=threading.Lock(),
-            started_at=now,
-            last_active=now,
-            status="running",
-            is_external=False,            # 区外已在前面拒绝
-        )
-        session.out_drainer = OutputDrainer(
-            proc, proc.stdout, out_buf, max_bytes, kill_on_exceed=False
-        )
-        session.err_drainer = OutputDrainer(
-            proc, proc.stderr, err_buf, max_bytes, kill_on_exceed=False
-        )
-        session.out_drainer.start()
-        session.err_drainer.start()
+        # 确保 Popen 成功后无论 drainer 创建/启动是否异常，都能清理子进程
+        session = None
+        try:
+            maxlen = self._max_chunks()
+            out_buf: deque = deque(maxlen=maxlen)
+            err_buf: deque = deque(maxlen=maxlen)
+            max_bytes = self._sandbox.get_max_output_bytes()
+            now = time.time()
+            session = ProcessSession(
+                id=sid,
+                name=name or f"proc-{sid}",
+                proc=proc,
+                stdout_buf=out_buf,
+                stderr_buf=err_buf,
+                lock=threading.Lock(),
+                started_at=now,
+                last_active=now,
+                status="running",
+            )
+            session.out_drainer = OutputDrainer(
+                proc, proc.stdout, out_buf, max_bytes, kill_on_exceed=False
+            )
+            session.err_drainer = OutputDrainer(
+                proc, proc.stderr, err_buf, max_bytes, kill_on_exceed=False
+            )
+            session.out_drainer.start()
+            session.err_drainer.start()
+        except Exception:
+            # drainer 创建/启动失败 → 杀子进程，避免僵尸
+            _kill_tree(proc)
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+            return -1, f"❌ 输出读取器启动失败，进程已清理"
 
         with self._lock:
             self._sessions[sid] = session
 
-        # grace 0.8s 取初始输出
-        time.sleep(0.8)
-        out, err, _trunc = self._read_internal(session)
+        # grace 取初始输出（最多等 200ms × 4 轮，快速进程不浪费时间）
+        for _ in range(4):
+            time.sleep(0.2)
+            out, err, _trunc = self._read_internal(session)
+            if out or err:
+                break
         init_parts = []
         if out:
             init_parts.append(out.rstrip())
@@ -216,14 +228,12 @@ class ProcessManager:
         s = self._sessions.get(int(session_id))
         if not s:
             return f"❌ 会话不存在: {session_id}"
-        if s.is_external:
-            return f"❌ 区外会话不允许操作: {s.name}"
         if s.status != "running":
             return f"❌ 进程已结束（{s.status}, exit={s.exit_code}）"
         try:
-            s.proc.stdin.write((data + "\n").encode("utf-8"))
+            s.proc.stdin.write((data + "\n").encode("utf-8", errors="replace"))
             s.proc.stdin.flush()
-        except (BrokenPipeError, OSError, ValueError) as e:
+        except (BrokenPipeError, OSError, ValueError, UnicodeEncodeError) as e:
             return f"❌ 写入 stdin 失败（进程可能已关闭 stdin）: {e}"
         s.last_active = time.time()
         return f"✅ 已发送 {len(data)} 字节到 {s.name}"
@@ -241,11 +251,15 @@ class ProcessManager:
         return out, err, trunc, status
 
     def _read_internal(self, s: ProcessSession) -> tuple[str, str, bool]:
+        # 使用 popleft() 逐条消费，而非 list()+clear()，避免与 _drain 线程的 append
+        # 竞态丢失 chunk（_drain 不持 s.lock，list()+clear() 之间 GIL 切换会丢数据）
         with s.lock:
-            out_chunks = list(s.stdout_buf)
-            s.stdout_buf.clear()
-            err_chunks = list(s.stderr_buf)
-            s.stderr_buf.clear()
+            out_chunks = []
+            while s.stdout_buf:
+                out_chunks.append(s.stdout_buf.popleft())
+            err_chunks = []
+            while s.stderr_buf:
+                err_chunks.append(s.stderr_buf.popleft())
             new_out_drop = s.out_drainer.dropped if s.out_drainer else 0
             new_err_drop = s.err_drainer.dropped if s.err_drainer else 0
         delta_out = new_out_drop - s.last_out_dropped
@@ -268,20 +282,13 @@ class ProcessManager:
                 "exit_code": s.exit_code,
                 "started_at": s.started_at,
                 "idle_for": int(now - s.last_active),
-                "is_external": s.is_external,
             })
         return out
-
-    def is_external(self, session_id: int) -> bool:
-        s = self._sessions.get(int(session_id))
-        return bool(s and s.is_external)
 
     def stop(self, session_id: int) -> str:
         s = self._sessions.get(int(session_id))
         if not s:
             return f"❌ 会话不存在: {session_id}"
-        if s.is_external:
-            return f"❌ 区外会话不允许操作: {s.name}"
         if s.status != "running":
             return f"⚠️ 进程已结束（{s.status}, exit={s.exit_code}）"
         # 先关 stdin（让读 stdin 的子进程收 EOF 自然退出），再杀整树
@@ -318,6 +325,7 @@ class ProcessManager:
                     pass
             self._close_session(s)
         self._sessions.clear()
+        self._watchdog.join(timeout=5)
 
     # ================================================================
     # watchdog：idle 超时 + 自然退出检测 + exited 保留清理

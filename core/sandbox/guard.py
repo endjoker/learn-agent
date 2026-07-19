@@ -104,9 +104,10 @@ DATA_LEAK_PATTERNS = [
 
 # 单词型危险命令：必须作为独立令牌（前后空白/行首行尾）才命中
 # 避免 "format" 误伤 PowerShell 的 "format-table"
+# 限制在行首或命令分隔符后（; / && / || / |），防止参数中的误匹配（如 ls format）
 DANGEROUS_WORDS = ["format", "shutdown", "reboot", "halt"]
 _DANGEROUS_WORDS_RE = re.compile(
-    r"(?:^|\s)(" + "|".join(DANGEROUS_WORDS) + r")(?=\s|$)",
+    r"(?:^|;\s*|\|\|\s*|&&\s*|\|\s*)(" + "|".join(DANGEROUS_WORDS) + r")(?=\s|$)",
     re.IGNORECASE,
 )
 
@@ -114,9 +115,13 @@ _DANGEROUS_WORDS_RE = re.compile(
 DANGEROUS_SUBSTRINGS = [
     "rm -rf /", "rm -rf ~", "rm -rf .",
     "del /f /s", "rd /s /q",
+    "diskpart",              # Windows 磁盘分区工具
+    "taskkill /f",           # 强制杀进程
+    "chmod 0",               # Unix 权限清零（与 chmod 777 / 互补覆盖）
+    "chown -r",              # 递归改所有者
     "mkfs",
     "dd if=",
-    ":(){ :|:& };:",   # fork 炸弹
+    ":(){ :|:& };:",         # fork 炸弹
     "> /dev/sda", "> /dev/mmc",
 ]
 

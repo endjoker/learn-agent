@@ -1,5 +1,31 @@
 # 更新日志
 
+## 2026-07-19 Bug 修复：进程管理/安全拦截/代码审查反馈
+
+**修正（基于 code-review 反馈）**：
+
+**进程管理器 `ProcessManager`**：
+- **deque 竞态修复**：`_read_internal` 从 `list()+clear()` 改为 `popleft()` 逐条消费，避免与 drain 线程的 append 并发丢失 ~64KB chunk（#1）
+- **孤儿子进程泄露修复**：drainer 创建/启动包在 try/except 中，失败时 `_kill_tree` 清理已启动的 Popen（#5）
+- **UnicodeEncodeError 修复**：`send()` 的 encode 加 `errors="replace"`，except 加 `UnicodeEncodeError`（#6）
+- **容量竞态修复**：容量检查→ID 分配→session 存储全程持 `self._lock`，消除中间释放窗口（#8）
+- **移除 `is_external` 死字段**：字段恒为 False，移除 dataclass 字段 + 3 处守卫 + `is_external()` 方法（#14）
+- **线程安全增强**：`_close_session` 加 `self._lock`；`cleanup_all` 末尾 join watchdog 线程（#15）
+- **sleep(0.8) 优化**：改为 4×200ms 轮询，有输出立即返回（#10）
+
+**安全检查 `guard.py`**：
+- **DANGEROUS_SUBSTRINGS 补充**：新增 `diskpart`/`taskkill /f`/`chmod 0`/`chown -r`，消除 proc_start 相对 BashTool 的安全缺口（#2）
+- **DANGEROUS_WORDS 误杀修复**：正则从 `(?:^|\s)` 改为 `(?:^|;\s*|\|\|\s*|&&\s*|\|\s*)`，只匹配命令分隔符后的危险词，不再误杀 `ls format`/`echo shutdown` 等合法命令（#4）
+
+**沙箱执行器 `SandboxExecutor`**：
+- **私有方法公开化**：`_get_current_profile()`/`_get_max_output_bytes()`/`_get_idle_timeout()` → 去下划线前缀，消除 ProcessManager 对私有 API 的依赖（#12）
+
+**agent.py**：
+- **`/proc tail` trunc 提示**：检测 `trunc` 标志时打印缓冲区溢出警告（#9）
+
+**security_gate.py**：
+- **proc:manage 文档化**：添加注释说明 `input` 参数名与 proc_send 的隐式耦合（#7）
+
 ## 2026-07-16 长驻子进程模块 & L2 危险命令下沉 & OutputDrainer 重构
 
 **新功能：长驻子进程管理器 `ProcessManager`**：
