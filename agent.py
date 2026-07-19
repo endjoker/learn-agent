@@ -1073,9 +1073,11 @@ class Agent:
                 print(f"\n  📋 任务 {current.id}/{self._task_list.total}: {current.description}")
 
             task_done = False
-            for t_step in range(1, max_steps + 1):
+            # plan 模式子任务步数不应受默认 max_steps 限制，至少 200 步
+            task_max_steps = max(max_steps, 200)
+            for t_step in range(1, task_max_steps + 1):
                 if verbose:
-                    print(f"\n  ─── 任务 {current.id} 第 {t_step} 步 ───")
+                    print(f"\n  ─── 任务 {current.id} 第 {t_step}/{task_max_steps} 步 ───")
                 try:
                     response = self.llm.think(self.messages, temperature=0)
                 except Exception as e:
@@ -1184,7 +1186,11 @@ class Agent:
                 task_done = True
                 break
             if not task_done:
-                break
+                # 子任务超步数：标记失败，继续执行下一个任务
+                fail_reason = f"已达最大步数（{task_max_steps} 步），任务未完成"
+                self._task_list.mark_done(current.id, fail_reason)
+                if verbose:
+                    print(f"  ⚠️  任务 {current.id}/{self._task_list.total} {fail_reason}")
             self._update_task_list_in_prompt()
             self.store.save_session()
         # 全部完成

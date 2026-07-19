@@ -51,14 +51,27 @@ SYSTEM_PATHS_MAC = [
 
 
 def _is_system_path(path: str | Path) -> bool:
-    """检查路径是否在系统关键路径下（路径段边界匹配，避免 C:\\Windows 误匹 C:\\WindowsOld）"""
+    """检查路径是否在系统关键路径下（路径段边界匹配）。
+
+    对 POSIX 绝对路径（以 / 开头）直接用字符串前缀匹配，避免 Windows 上
+    Path.resolve() 把 /etc 解析成 D:\\etc 导致的漏检。Windows 绝对路径
+    （以盘符开头）走 resolve + normpath 比较。
+    """
+    s = str(path).replace("\\", "/")
+    # POSIX 绝对路径：直接前缀匹配
+    if s.startswith("/"):
+        for sys_path in SYSTEM_PATHS_LINUX + SYSTEM_PATHS_MAC:
+            sp = sys_path.replace("\\", "/").rstrip("/")
+            if s == sp or s.startswith(sp + "/"):
+                return True
+        return False
+    # Windows 绝对路径（盘符开头）
     try:
         p_norm = os.path.normpath(str(Path(path).resolve())).lower()
     except Exception:
         return False
-    for sys_path in SYSTEM_PATHS_WIN + SYSTEM_PATHS_LINUX + SYSTEM_PATHS_MAC:
+    for sys_path in SYSTEM_PATHS_WIN:
         sp = os.path.normpath(sys_path).lower()
-        # 必须整段相等，或 sp 是 p 的祖先目录（sp + 分隔符 前缀）
         if p_norm == sp or p_norm.startswith(sp + os.sep):
             return True
     return False
@@ -233,7 +246,7 @@ SAFE_PATTERNS = [
 # Python 代码 AST 检查
 # ================================================================
 
-FORBIDDEN_IMPORTS = {"os", "subprocess", "ctypes", "socket", "sys"}
+FORBIDDEN_IMPORTS = {"os", "subprocess", "ctypes", "socket", "sys", "pathlib", "shutil"}
 FORBIDDEN_CALLS = {"eval", "exec", "compile", "__import__", "open"}
 
 
@@ -375,6 +388,38 @@ def check_write_content(file_path: str, content: str) -> tuple[bool, str]:
 # ================================================================
 
 
+# 从命令中提取候选绝对路径（Unix: /…  Windows: X:\…）
+_CMD_ABS_PATH_RE = re.compile(r'(/[^\s;|&<>`\'"(){}\[\]]{2,})')
+
+
+def _check_command_for_paths(command: str) -> tuple[bool, str]:
+    """检查命令字符串中引用的路径是否命中系统路径或敏感文件。
+
+    从命令中提取绝对路径并调用 _is_system_path()；同时检测命令引用的
+    token 是否命中 SENSITIVE_FILES 基名。
+    返回 (is_blocked, reason)。
+    """
+    # 1. 绝对路径 → 系统路径检查
+    for m in _CMD_ABS_PATH_RE.finditer(command):
+        p = m.group(1)
+        if _is_system_path(p):
+            return True, f"检测到系统路径操作，已拦截: {p}"
+
+    # 2. 敏感文件引用（按文件名 token 检测，如 rm agent.py / cat .env / > core/…）
+    cmd_lower = command.lower()
+    for sf in SENSITIVE_FILES:
+        sf_base = os.path.basename(sf).lower()
+        if not sf_base:
+            continue
+        # 用正则做 token 级匹配，避免 .env 误伤 .env.example
+        if re.search(r'(?:^|[\s;|&<>`\'"(){}\[\]])(?:[./]*)?'
+                     + re.escape(sf_base)
+                     + r'(?:[\s;|&<>`\'"(){}\[\]$]|$)', cmd_lower):
+            return True, f"检测到敏感文件操作，已拦截: {sf}"
+
+    return False, ""
+
+
 def check_command_safety(
     command: str,
     tool_name: str = "bash",
@@ -395,6 +440,11 @@ def check_command_safety(
     dangerous = _match_dangerous(command.lower())
     if dangerous:
         return False, f"检测到危险命令，已拦截: {dangerous}"
+
+    # ===== 0.5. 系统路径 & 敏感文件检测（在白名单之前，ls /etc 也需拦截）=====
+    blocked, reason = _check_command_for_paths(command)
+    if blocked:
+        return False, reason
 
     # ===== 1. 白名单检查 =====
     for pattern in SAFE_PATTERNS:

@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import List
 from .base_tool import BaseTool
 from .memory_tools import MemorySearchTool, MemoryUpdateTool
+from core.sandbox.guard import sanitize_output
 
 # 沙箱导入（可选，无 sandbox 时自动降级）
 try:
@@ -217,10 +218,8 @@ class ReadTool(BaseTool):
 
             result = "\n".join(parts)
 
-            # 沙箱输出脱敏（如果注入）
-            if self._sandbox:
-                from core.sandbox.guard import sanitize_output
-                result = sanitize_output(result)
+            # 输出脱敏（API Key / Token / 私钥 → ****）
+            result = sanitize_output(result)
 
             return result
 
@@ -573,7 +572,7 @@ class GrepTool(BaseTool):
             if max_results > 0 and total_matches > max_results:
                 parts.append(f"  …… 还有 {total_matches - max_results} 处未显示")
 
-            return "\n".join(parts)
+            return sanitize_output("\n".join(parts))
 
         except Exception as e:
             logger.error(f"搜索失败: {e}", exc_info=True)
@@ -682,7 +681,7 @@ class GlobTool(BaseTool):
             if max_results > 0 and total_found > max_results:
                 parts.append(f"\n  …… 还有 {total_found - max_results} 个文件未显示")
 
-            return "\n".join(parts)
+            return sanitize_output("\n".join(parts))
 
         except Exception as e:
             logger.error(f"文件查找失败: {e}", exc_info=True)
@@ -1311,6 +1310,19 @@ class PythonTool(BaseTool):
             return f"❌ Python 执行失败: {e}"
 
 
+# HttpTool POST data 凭据检测（复用 guard.py SECRET_PATTERNS 的核心模式）
+_CREDENTIAL_LEAK_RE = re.compile(
+    r'(sk-[a-zA-Z0-9]{20,})'           # API Key（OpenAI / Anthropic）
+    r'|(-----BEGIN\s+(RSA |EC |DSA )?PRIVATE KEY-----)',  # 私钥块
+    re.DOTALL,
+)
+
+
+def _contains_secrets(data: str) -> bool:
+    """检查字符串中是否包含疑似凭据（API Key / 私钥）。"""
+    return bool(_CREDENTIAL_LEAK_RE.search(data or ""))
+
+
 # ============================================================
 # 12. HttpTool —— HTTP 请求
 # ============================================================
@@ -1362,6 +1374,11 @@ class HttpTool(BaseTool):
     def execute(self, url: str, method: str = "GET", data: str = None) -> str:
         if not url.startswith(("http://", "https://")):
             return f"❌ 无效 URL: {url}"
+
+        # --- DLP: POST 数据不得包含疑似凭据（API Key / 私钥） ---
+        if method.upper() == "POST" and data:
+            if _contains_secrets(data):
+                return "⛔ 安全拦截: POST 数据中包含疑似 API Key 或私钥，已阻止外发"
 
         # --- 沙箱检查：外发目标黑名单（如果注入） ---
         if self._sandbox:

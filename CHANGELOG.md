@@ -1,5 +1,37 @@
 # 更新日志
 
+## 2026-07-19 沙箱安全加固：L2 覆盖盲区修复 + Plan 模式步数限制修复
+
+**plan 模式步数限制修复（agent.py）**：
+- 子任务步数从默认 30 → `max(max_steps, 200)`，避免复杂子任务因步数限制中断
+- 单任务超步不再终止整个流程，改为标记失败并继续下一个任务
+
+**安全性修复（core/sandbox/guard.py + tools/builtin_tools.py）**：
+
+以下 5 个 L2 盲区均基于 capability 视角全量审查发现并修复：
+
+**1. `exec:shell` 不检查操作路径（高）**：
+- `SYSTEM_PATHS_*` 定义完备但 `check_command_safety` 未调用 `_is_system_path()`
+- 修复：新增 `_check_command_for_paths()`，从命令字符串提取绝对路径并校验
+- `_is_system_path()` 重写：POSIX 绝对路径（`/etc/…`）用字符串前缀匹配，避免 Windows 上 `Path.resolve()` 把 `/etc` 解析成 `D:\etc` 漏检
+- 敏感文件（`.env`/`agent.py` 等）token 匹配同步接入命令检查
+
+**2. `exec:code` pathlib 绕过（中）**：
+- `check_python_code` 禁 `open()` 但 `Path.write_text()` 不受限
+- 修复：`FORBIDDEN_IMPORTS` 扩展 `"pathlib"`、`"shutil"`
+
+**3. `fs:read` 输出不脱敏（中）**：
+- `sanitize_output` 只用于 bash 输出端；ReadTool/GrepTool/GlobTool 读 `.env` 返回原始凭据
+- 修复：ReadTool 改为无条件脱敏；GrepTool/GlobTool 返回前新增脱敏调用
+
+**4. `net:egress` 不检查 POST 数据泄露（中）**：
+- `.env` 内容可通过 `HttpTool POST` 外发，只检查了域名黑名单不管 payload
+- 修复：HttpTool POST 前新增 `_contains_secrets()` 检查 API Key/私钥
+
+**5. 配套工程**：
+- `builtin_tools.py` 顶层导入 `sanitize_output`（替代 ReadTool 内的条件 import）
+- 新增 `_CREDENTIAL_LEAK_RE` 正则在 POST 数据中检测凭据泄漏
+
 ## 2026-07-19 Bug 修复：进程管理/安全拦截/代码审查反馈
 
 **修正（基于 code-review 反馈）**：
