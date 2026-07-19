@@ -1424,6 +1424,12 @@ def create_agent(
 def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
     """启动交互式命令行，支持 /model 切换模型"""
 
+    # Linux: 激活 input() 的行编辑（方向键/Home/End/历史）和 tab 补全
+    try:
+        import readline
+    except ImportError:
+        pass
+
     print("\n╔═══════════════════════════════════════════════╗")
     print("║   🚀 HelloAgent 交互式命令行                  ║")
     if debug:
