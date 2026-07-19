@@ -724,7 +724,21 @@ class Agent:
         """
         tool = self.tool_registry.get_tool(tool_name)
         if tool is None:
-            return DENY, f"未知工具 '{tool_name}'"
+            # 模糊匹配：LLM 偶尔漏写 MCP 前缀的 /工具名，如只写 web-search 而非 web-search/search
+            prefix = tool_name + "/"
+            candidates = [
+                n for n in self.tool_registry.list_tool_names()
+                if n.startswith(prefix)
+            ]
+            if candidates:
+                hint = "，".join(sorted(candidates)[:5])
+                msg = (
+                    f"未找到工具 '{tool_name}'。"
+                    f"你是否想用: {hint}？"
+                )
+            else:
+                msg = f"未知工具 '{tool_name}'"
+            return DENY, msg
         return self._gate.check(tool, params, tool_name)
 
     def _execute_tool(self, tool_name: str, input_str: str = None) -> str:

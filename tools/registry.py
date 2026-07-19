@@ -112,6 +112,10 @@ class ToolRegistry:
         """
         return list(self._tools.values())
 
+    def list_tool_names(self) -> List[str]:
+        """列出所有已注册的工具名（供模糊匹配等场景使用）"""
+        return list(self._tools.keys())
+
     def remove_tool(self, name: str) -> bool:
         """
         从注册表中移除一个工具
