@@ -47,13 +47,15 @@ class MCPTool(BaseTool):
         参数:
             connection: MCPConnection 实例（来自 core/mcp_client.py）
             tool_desc: 工具描述字典，包含:
-                - name: str — 工具名称（建议加 {server_name}/ 前缀）
+                - name: str — 工具名称（已加 {server_name}/ 前缀，用于注册表和 LLM）
                 - description: str — 工具描述
                 - inputSchema: dict — 参数定义的 JSON Schema
             trust: 是否受信任（来自 mcp_config.json 的服务器 trust 标志）。
                    True 时 SecurityGate 直接放行，False 时每次调用需确认。
         """
         self.name = tool_desc["name"]
+        # 协议调用用原始名（去掉注册用的 {server}/ 前缀），如 'web-search/search' → 'search'
+        self._mcp_tool_name = self.name.split("/", 1)[1] if "/" in self.name else self.name
         self.description = tool_desc.get("description", "")
         # MCP 使用 inputSchema，BaseTool 使用 parameters —— 兼容转换
         self.parameters = tool_desc.get("inputSchema", {
@@ -95,8 +97,8 @@ class MCPTool(BaseTool):
             return f"❌ MCP 工具执行出错: {type(e).__name__}: {e}"
 
     async def _execute_async(self, **kwargs) -> dict:
-        """异步底层调用"""
-        return await self._connection.call_tool(self.name, kwargs)
+        """异步底层调用（协议层面用原始名，不含注册前缀）"""
+        return await self._connection.call_tool(self._mcp_tool_name, kwargs)
 
     def _format_result(self, result: dict) -> str:
         """
