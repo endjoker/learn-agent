@@ -51,7 +51,8 @@
 - **长驻子进程模块** — `ProcessManager` 管理跨步存活的长驻进程（dev server / watcher / REPL），5 个 proc_* 工具，增量读取、stdin 投喂、杀整树；idle 超时自动清理；区外 cwd 拒绝启动
 - **L2 危险命令下沉** — `rm -rf /` / `format` / `mkfs` 等 OS 危害强制 L2 硬拦（白名单不可绕过），bash 和 proc_start 统一兜底
 - **安全闸门 SecurityGate** — capability 驱动的统一权限+沙箱检查点，覆盖内置/MCP/skill/未来工具；未知工具默认 ASK；技能注册自动 ALLOW
-- **交互命令** — `/model`、`/plan`、`/session`、`/mcp`、`/skill`、`/sandbox`、`/proc`、`/stats`、`/history`、`/compact`、`/clear`、`/help`
+- **Hook 模块（事件驱动）** — 12 个生命周期事件（`pre_tool`/`post_tool`/`user_prompt`/`stop`/`notification`/`denied`…），支持 Python 回调 + 命令式 hook（JSON stdin/stdout 协议，与 Claude Code 兼容）；内置过滤器（敏感词/危险模式拦截）配好即生效；仅可加严不可放松（在 SecurityGate 之后运行）
+- **交互命令** — `/model`、`/plan`、`/session`、`/mcp`、`/skill`、`/sandbox`、`/proc`、`/hook`、`/stats`、`/history`、`/compact`、`/clear`、`/help`
 - **连续对话** — 跨多轮对话保留历史上下文，自动截断防超限
 - **会话持久化** — 每轮对话自动保存到 `sessions/{id}.json`，含任务清单序列化
 - **会话恢复** — `--resume <id>` 恢复指定会话，`--resume last` 按修改时间取最新会话
@@ -175,6 +176,12 @@ hello-agent/
 │       ├── guard.py         # L2-A 内容拦截（敏感文件/数据外发/Python AST/网络黑名单）
 │       ├── profiles.py      # 配置档管理（加载 config/sandbox.json）
 │       └── audit.py         # 审计日志（记录拦截/绕过/错误事件）
+│   └── hook/                # Hook 模块（事件驱动生命周期钩子）
+│       ├── __init__.py
+│       ├── events.py        # HookEvent 枚举 + HookContext + Decision/HookResult
+│       ├── hooks.py         # BaseHook / PythonHook / CommandHook（JSON stdin/stdout 协议）
+│       ├── manager.py       # HookManager（注册/分发/合并/配置加载）
+│       └── builtin.py       # 内置 hook（审计日志/通知/敏感词过滤/模式拦截）
 │
 ├── tools/                   # 工具系统
 │   ├── __init__.py
@@ -238,6 +245,8 @@ hello-agent/
 | `/sandbox strict` | 切换到严格模式（restricted） |
 | `/sandbox bypass` | 临时绕过沙箱（下一条命令） |
 | `/sandbox profile <name>` | 切换沙箱配置档 |
+| `/hook` | 查看已注册 hook |
+| `/hook reload` | 重新加载 `config/hooks.json` |
 | `/mcp` | 查看 MCP 服务器连接状态 |
 | `/mcp list` | 查看 MCP 服务器详情与工具列表 |
 | `/compact` | 手动触发全量上下文压缩 |

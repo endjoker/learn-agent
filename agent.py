@@ -57,6 +57,7 @@ from tools.web_tools import register_web_tools
 from memory import MemoryManager
 from skills import SkillManager, SkillTool, CreateSkillTool
 from core.sandbox import SandboxExecutor
+from core.hook import HookManager, HookEvent, Decision
 
 # ============================================================
 # ReAct 关键字（英文，避免中文编码兼容问题）
@@ -194,6 +195,7 @@ class Agent:
         mcp_servers: list = None,      # MCP 服务器配置列表（可选）
         sandbox: SandboxExecutor = None,  # 沙箱执行器（可选）
         process_manager = None,           # 长驻子进程管理器（可选）
+        hooks_enabled: bool = True,       # Hook 模块（事件驱动自定义扩展）
     ):
         self.name = name
         self.llm = llm
@@ -214,10 +216,13 @@ class Agent:
         self._gate = SecurityGate(
             self.permission, self.sandbox, str(self.permission.workspace)
         )
+        self._stop_block_count = 0  # 单次 run() 内 stop hook 连续 BLOCK 计数（上限 3）
         # 长驻进程工具权限：L1 注册为 ALLOW（危险判定全交 L2：exec:shell 查 command、proc:manage 查 input）
         if self.process_manager is not None:
             for _t in ("proc_start", "proc_send", "proc_read", "proc_list", "proc_stop"):
                 self.permission.set_rule(_t, ALLOW)
+        # Hook 模块：事件驱动自定义扩展（用户审计/通知/改写/拦截）
+        self.hooks = HookManager(enabled=hooks_enabled)
         if debug:
             set_debug(True)
         # MCP 客户端管理器（延迟初始化）
@@ -797,6 +802,12 @@ class Agent:
         self._light_compress()
         # ---- 上下文检查：超阈值时自动压缩或提示 ----
         self._check_context(verbose=verbose)
+        # ---- Hook: user_prompt（用户输入过滤/改写）----
+        hr = self.hooks.run_user_prompt(user_input)
+        if hr.decision == Decision.BLOCK:
+            return f"⛔ 输入被 hook 拦截: {hr.reason}"
+        if hr.decision == Decision.MODIFY and hr.data:
+            user_input = hr.data.get("prompt", user_input)
         # ---- 追加本次用户输入 ----
         self.messages.append({"role": "user", "content": user_input})
         # ---- 紧急截断（压缩仍超阈值时，丢弃最早的消息兜底） ----
@@ -906,6 +917,25 @@ class Agent:
                         continue
                     else:
                         break
+                # ---- Stop hook: agent 即将停止 ----
+                shr = self.hooks.run_stop(parsed["final_answer"], step_count=step)
+                if shr.decision == Decision.BLOCK:
+                    self._stop_block_count += 1
+                    if self._stop_block_count >= 3:
+                        if verbose:
+                            print(f"  ⚠️  stop hook 连续 BLOCK {self._stop_block_count} 次，强制停止")
+                        return parsed["final_answer"]
+                    self.messages.append({"role": "assistant", "content": response})
+                    follow_up = (shr.data or {}).get("prompt") or shr.reason or "请继续"
+                    self.messages.append(
+                        {"role": "user",
+                         "content": f"（hook 提示：{follow_up}）"}
+                    )
+                    if verbose:
+                        print(f"  🔄 hook 阻止停止（{self._stop_block_count}/3）")
+                    continue
+                if shr.decision == Decision.MODIFY and shr.data:
+                    parsed["final_answer"] = shr.data.get("answer", parsed["final_answer"])
                 return parsed["final_answer"]
             # --- 批量 ACTION（支持多个工具并发执行） ---
             if actions:
@@ -943,7 +973,19 @@ class Agent:
                         reason = gate_reason or "权限不足，操作已被系统拒绝"
                         denied_actions.append((tool_name, input_str, reason))
                         print(f"  ⛔ {tool_name}: {reason}")
+                        # Hook: denied 事件（审计用）
+                        self.hooks.run_denied(tool_name, reason, level="gate")
                     elif level == ASK:
+                        # Hook: notification（ASK 前拦截——可提前 BLOCK，但不能替用户放行）
+                        nhr = self.hooks.run_notification(tool_name, params,
+                                                          f"tool={tool_name}")
+                        if nhr.decision == Decision.BLOCK:
+                            denied_actions.append(
+                                (tool_name, input_str, f"hook 拒绝: {nhr.reason}")
+                            )
+                            if verbose:
+                                print(f"  ⛔ hook 拦截 {tool_name}: {nhr.reason}")
+                            continue
                         # 显示要执行的操作，等待用户确认
                         print(f"\n  ❓ 需要确认: {tool_name}")
                         for k, v in params.items():
@@ -972,24 +1014,51 @@ class Agent:
                             print(f"  ⛔ 用户已拒绝操作，结束本次会话")
                             return f"操作已取消：用户拒绝了 {tool_name}，对话已终止。"
 
-                # ===== 并发执行通过权限检查的工具 =====
+                # ===== 并发执行通过权限检查的工具（含 pre_tool hook 拦截）=====
                 results = []
+                hook_blocked = []  # 被 pre_tool hook 拦截的
                 if checked_actions:
-                    m = len(checked_actions)
-                    with ThreadPoolExecutor(max_workers=min(m, 5)) as pool:
-                        future_map = {
-                            pool.submit(self._execute_tool, a["name"], a["input"]): a
-                            for a in checked_actions
-                        }
-                        for future in as_completed(future_map):
-                            action = future_map[future]
-                            try:
-                                obs = future.result()
-                                is_error = obs.startswith("❌")
-                            except Exception as e:
-                                obs = f"❌ 工具执行异常: {type(e).__name__}: {e}"
-                                is_error = True
-                            results.append((action["name"], action["input"], obs, is_error))
+                    # ---- pre_tool hook：逐工具检查 ----
+                    ok_actions = []
+                    for a in checked_actions:
+                        tool_name = a["name"]
+                        try:
+                            params = json.loads(a["input"]) if a["input"] else {}
+                        except json.JSONDecodeError:
+                            params = {}
+                        phr = self.hooks.run_pre_tool(tool_name, params,
+                                                      gate_level="allow")
+                        if phr.decision == Decision.BLOCK:
+                            hook_blocked.append(
+                                (tool_name, a["input"],
+                                 f"hook 拦截: {phr.reason}")
+                            )
+                            if verbose:
+                                print(f"  ⛔ hook 拦截 {tool_name}: {phr.reason}")
+                            continue
+                        if phr.decision == Decision.MODIFY and phr.data:
+                            a["input"] = json.dumps(phr.data, ensure_ascii=False)
+                        ok_actions.append(a)
+                    # ---- 并发执行通过 hook 的工具 ----
+                    if ok_actions:
+                        m = len(ok_actions)
+                        with ThreadPoolExecutor(max_workers=min(m, 5)) as pool:
+                            future_map = {
+                                pool.submit(self._execute_tool, a["name"], a["input"]): a
+                                for a in ok_actions
+                            }
+                            for future in as_completed(future_map):
+                                action = future_map[future]
+                                try:
+                                    obs = future.result()
+                                    is_error = obs.startswith("❌")
+                                except Exception as e:
+                                    obs = f"❌ 工具执行异常: {type(e).__name__}: {e}"
+                                    is_error = True
+                                results.append((action["name"], action["input"], obs, is_error))
+                    # ---- pre_tool hook 拦截的加入 denied ----
+                    for tool_name, input_str, reason in hook_blocked:
+                        denied_actions.append((tool_name, input_str, reason))
 
                 # ===== 被拒绝的也加入结果 =====
                 for tool_name, input_str, reason in denied_actions:
@@ -1009,6 +1078,22 @@ class Agent:
                         short = obs[:200].replace("\n", " ")
                         prefix = "❌" if is_err else "✅"
                         print(f"    {prefix} {name} → {short}{'...' if len(obs) > 200 else ''}")
+
+                # ---- post_tool hook：结果聚合后（主线程，可改写结果）----
+                for _i, (_tname, _input_str, _obs, _is_err) in enumerate(results):
+                    _tparams = {}
+                    if _input_str:
+                        try:
+                            _tparams = json.loads(_input_str)
+                        except json.JSONDecodeError:
+                            pass
+                    phr = self.hooks.run_post_tool(_tname, _tparams, _obs, _is_err)
+                    if phr.decision == Decision.MODIFY and phr.data:
+                        _obs = phr.data.get("result", _obs)
+                        results[_i] = (_tname, _input_str, _obs, _is_err)
+                    if phr.decision == Decision.BLOCK:
+                        _obs = f"⛔ hook 告警: {phr.reason}"
+                        results[_i] = (_tname, _input_str, _obs, True)
 
                 # ====== 只添加一条 assistant + 一条合并的 tool_result ======
                 self.messages.append({"role": "assistant", "content": response})
@@ -1037,6 +1122,25 @@ class Agent:
                         self.store.save_session()
                         if verbose:
                             print(f"  ✅ 任务 {current.id}/{self._task_list.total} 完成")
+                # ---- Stop hook: agent 即将停止（ELSE 分支）----
+                shr = self.hooks.run_stop(answer, step_count=step)
+                if shr.decision == Decision.BLOCK:
+                    self._stop_block_count += 1
+                    if self._stop_block_count >= 3:
+                        if verbose:
+                            print(f"  ⚠️  stop hook 连续 BLOCK {self._stop_block_count} 次，强制停止")
+                        return answer
+                    self.messages.append({"role": "assistant", "content": response})
+                    follow_up = (shr.data or {}).get("prompt") or shr.reason or "请继续"
+                    self.messages.append(
+                        {"role": "user",
+                         "content": f"（hook 提示：{follow_up}）"}
+                    )
+                    if verbose:
+                        print(f"  🔄 hook 阻止停止（{self._stop_block_count}/3）")
+                    continue
+                if shr.decision == Decision.MODIFY and shr.data:
+                    answer = shr.data.get("answer", answer)
                 return answer
 
         # ---- Phase 2: 任务清单执行 ----
@@ -1356,6 +1460,7 @@ def create_agent(
     memory: bool = True,
     skills: bool = True,
     sandbox: bool = True,       # 沙箱执行器
+    hooks: bool = True,         # Hook 模块（事件驱动自定义扩展）
     mcp_servers: list = None,    # MCP 服务器配置列表（可选）
 ) -> Agent:
     """
@@ -1374,6 +1479,7 @@ def create_agent(
         memory: 跨会话记忆
         skills: 学习型技能系统
         sandbox: 沙箱执行器（L2 内容拦截+资源隔离）
+        hooks: Hook 模块（事件驱动自定义扩展，配置文件 config/hooks.json）
         mcp_servers: MCP 服务器配置列表，每项含 name/transport/command 等
     """
 
@@ -1413,7 +1519,11 @@ def create_agent(
         sandbox=sandbox_executor,
         process_manager=process_manager,
         mcp_servers=mcp_servers,
+        hooks_enabled=hooks,
     )
+    # Hook: 绑定 agent 身份，触发 session_start
+    agent.hooks.bind_agent(agent.name, agent.store.session_id)
+    agent.hooks.dispatch(HookEvent.SESSION_START, {})
     if skill_manager:
         agent.skill_manager = skill_manager
         agent._register_skill_tools()
@@ -1460,6 +1570,8 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
     print("║   /proc              查看长驻进程会话           ║")
     print("║   /proc stop <id>    停止指定进程               ║")
     print("║   /proc tail <id>    持续打印进程输出          ║")
+    print("║   /hook              查看已注册 hook            ║")
+    print("║   /hook reload       重新加载 config/hooks.json ║")
     print("║   /stats             查看上下文占用             ║")
     print("║   /history             查看当前会话内容         ║")
     print("║   /compact           全量压缩历史（释放上下文）  ║")
@@ -1726,6 +1838,23 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                 else:
                     print("  用法: /proc [list | stop <id> | tail <id>]")
                 continue
+            # ---- /hook ----
+            if u.startswith("/hook"):
+                parts = u.split()
+                cmd = parts[1] if len(parts) > 1 else ""
+                if cmd == "reload":
+                    count = agent.hooks.load_config("config/hooks.json")
+                    print(f"  🔄 已重新加载 hooks.json（{count} 个 hook）")
+                else:
+                    hlist = agent.hooks.list_hooks()
+                    if not hlist:
+                        print("  📭 暂无已注册 hook")
+                    else:
+                        print(f"\n  已注册 hook（共 {len(hlist)} 个）:")
+                        print("  ─" * 25)
+                        for h in hlist:
+                            print(f"  [{h['event']:18s}] {h['hook']}  matcher={h['matcher']}")
+                continue
             # ---- /stats ----
             if u.startswith("/stats"):
                 print(f"\n{agent.store.format_stats()}")
@@ -1927,6 +2056,8 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                 print("    /proc               查看长驻进程会话")
                 print("    /proc stop <id>     停止指定进程")
                 print("    /proc tail <id>     持续打印进程输出")
+                print("    /hook               查看已注册 hook")
+                print("    /hook reload        重新加载 config/hooks.json")
                 print("    /stats              查看上下文占用统计")
                 print("    /history            查看当前会话内容")
                 print("    /mcp                查看 MCP 服务器状态")

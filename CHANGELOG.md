@@ -1,5 +1,38 @@
 # 更新日志
 
+## 2026-07-20 Hook 模块：事件驱动生命周期钩子系统
+
+**背景**：agent 执行流程封闭，扩展行为只能改源码。本次新增 Hook 模块，让用户在关键执行点插入自定义逻辑（审计/通知/改写/拦截），不改动 agent.py 主流程。
+
+**新建 `core/hook/` 模块（5 个文件）**：
+
+- **events.py** — 12 个生命周期事件枚举（`session_start`/`user_prompt`/`pre_llm`/`post_llm`/`pre_tool`/`post_tool`/`notification`/`denied`/`stop`/`session_end`/`plan_approved`/`task_complete`）+ `HookContext`/`Decision`/`HookResult`/`_coerce`
+- **hooks.py** — `BaseHook` 基类 + `PythonHook`（进程内回调 fn(ctx)→HookResult）+ `CommandHook`（进程外命令，JSON stdin/stdout + exit code 0/2 + `TimeoutExpired` 兜底）
+- **manager.py** — `HookManager`：register/dispatch（matcher 过滤 + DEBUG 日志 + 异常兜底）/_merge（最严裁决：BLOCK>MODIFY>ALLOW>CONTINUE）/load_config（从 `config/hooks.json` 批量加载）+ 6 个便捷方法
+- **builtin.py** — 3 个内置 hook：`audit_logger`（post_tool+denied 审计）、`webhook_notifier`（daemon 线程异步通知）、`sensitive_word_filter`/`block_pattern_filter`（用户输入/工具调用过滤）
+- **__init__.py** — 包导出
+
+**配置文件 `config/hooks.json`**：
+- `filters.sensitive_words`（8 个敏感词）→ 自动注册 `user_prompt` hook
+- `filters.block_patterns`（7 个危险模式）→ 自动注册 `pre_tool` hook
+- 支持按事件 + matcher 配置 `CommandHook`（JSON stdin/stdout 协议，与 Claude Code 兼容）
+
+**agent.py 集成（+147/-16 行）**：
+- `Agent.__init__` 新增 `hooks_enabled` 参数，SecurityGate 之后创建 `HookManager`
+- `create_agent()` 新增 `hooks` 参数，自动加载 `config/hooks.json` + `bind_agent` + `session_start`
+- `run()` 接入 6 个事件点：
+  - `user_prompt`：用户输入前（line 800），可 BLOCK/MODIFY
+  - `denied`：gate DENY 时（line 957），审计用
+  - `notification`：ASK 提示前（line 959），可提前 BLOCK
+  - `pre_tool`：gate 通过后、执行前（line 1002），可 BLOCK/MODIFY
+  - `post_tool`：结果聚合后、`_combine_results` 前（line 1069），可 MODIFY 改写结果
+  - `stop`：FINAL_ANSWER/ELSE return 前（line 921/1133），BLOCK 则 `continue`（上限 3 次）
+- CLI 新增 `/hook`（列出）+ `/hook reload`（热更新），启动横幅 + `/help` 同步
+
+**安全分层**：Hook 在 SecurityGate（L1+L2）**之后**运行，只能加严不能放松——结构上无法绕过 L2 沙箱。`CommandHook` 注册前过 `check_command_safety`。
+
+**设计文档**：`code/learn/HOOK/design.md`（697 行，含 12 事件、7 集成代码、3 期实施步骤、22 条设计取舍）
+
 ## 2026-07-19 沙箱安全加固：L2 覆盖盲区修复 + Plan 模式步数限制修复
 
 **plan 模式步数限制修复（agent.py）**：
