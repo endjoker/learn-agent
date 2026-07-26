@@ -4,20 +4,16 @@ Hook 管理器 — 注册 / 分发 / 配置加载 / 结果合并
 
 HookManager 是用户和 agent 的唯一交互入口：
   - register()  / unregister()     — 代码注册 hook
-  - load_config()                   — 从 config/hooks.json 批量加载
   - dispatch()                      — agent 在各事件点调用
   - 便捷方法（run_*）                — agent 用，少写样板
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import re
 import time
 from collections import defaultdict
-from pathlib import Path
 from typing import Callable
 
 from .events import HookEvent, HookContext, HookResult, Decision
@@ -54,26 +50,6 @@ class HookManager:
         hm.dispatch(HookEvent.PRE_TOOL, {"tool_name": "bash"})
     """
 
-    # ---- 配置路径约定 ----
-    DEFAULT_CONFIG_NAME = "hooks.json"
-
-    @staticmethod
-    def _resolve_config_path(path: str | None = None) -> Path | None:
-        """按约定找 hooks.json：传入路径 > config/hooks.json > 项目根 hooks.json"""
-        if path:
-            p = Path(path)
-            if p.exists():
-                return p
-            return None
-        candidates = [
-            Path.cwd() / "config" / HookManager.DEFAULT_CONFIG_NAME,
-            Path.cwd() / HookManager.DEFAULT_CONFIG_NAME,
-        ]
-        for p in candidates:
-            if p.exists():
-                return p
-        return None
-
     def __init__(self, config_path: str | None = None,
                  enabled: bool = True):
         self.enabled = enabled
@@ -81,10 +57,106 @@ class HookManager:
         self._agent_name = ""
         self._session_id = ""
 
-        # 加载配置（自动按约定路径查找）
-        resolved = self._resolve_config_path(config_path)
-        if resolved:
-            self.load_config(str(resolved))
+        # 从 config.json 的 hooks section 加载
+        self._try_load_unified()
+
+    def _try_load_unified(self) -> bool:
+        """尝试从 config.json 的 hooks section 加载。成功返回 True。"""
+        try:
+            from core.config_loader import load_config as _load_cfg
+            cfg = _load_cfg()
+            hooks_cfg = cfg.get("hooks", {})
+            if not hooks_cfg:
+                return False
+            # 清空已有配置 hook，避免 reload 时叠加
+            self._hooks.clear()
+            self._load_from_dict(hooks_cfg)
+            logger.info("从 config.json 加载了 hooks 配置")
+            return True
+        except Exception:
+            return False
+
+    def _load_from_dict(self, cfg: dict) -> int:
+        """从 dict 加载 hook 配置。
+        返回加载的 hook 总数。
+        """
+        if not cfg.get("enabled", True):
+            self.enabled = False
+            return 0
+
+        count = 0
+
+        # 加载事件 hook
+        hooks = cfg.get("hooks", {})
+        for event_name, hook_list in hooks.items():
+            try:
+                event = HookEvent(event_name)
+            except ValueError:
+                logger.warning(f"hooks 配置中忽略未知事件: {event_name}")
+                continue
+            if not isinstance(hook_list, list):
+                continue
+            for entry in hook_list:
+                if not isinstance(entry, dict):
+                    continue
+                matcher = entry.get("matcher", "")
+                for hdef in entry.get("hooks", []):
+                    if not isinstance(hdef, dict):
+                        continue
+                    htype = hdef.get("type", "command")
+                    if htype == "command":
+                        try:
+                            hook = CommandHook.from_config(hdef)
+                            self.register(event, hook, matcher=matcher)
+                            count += 1
+                        except PermissionError as e:
+                            logger.warning(
+                                f"hooks 配置: 命令被拒绝注册 [{str(hdef.get('command', ''))[:80]}]: {e}"
+                            )
+                        except Exception as e:
+                            logger.warning(f"hooks 配置: 命令注册失败: {e}")
+                    elif htype == "python":
+                        logger.warning("hooks 配置不支持 python 类型（安全限制）")
+                    else:
+                        logger.warning(f"hooks 配置: 未知 hook 类型 '{htype}'")
+
+        # 加载内置过滤器（sensitive_words / block_patterns）
+        filters = cfg.get("filters", {})
+        if filters.get("enabled", True):
+            sensitive_words = filters.get("sensitive_words", [])
+            if sensitive_words:
+                words = list(sensitive_words)
+
+                def _check_sensitive(ctx: HookContext) -> HookResult:
+                    prompt = ctx.data.get("prompt", "")
+                    for w in words:
+                        if w in prompt:
+                            return HookResult(Decision.BLOCK,
+                                              reason=f"敏感词拦截: {w}")
+                    return HookResult(Decision.CONTINUE)
+
+                self.register(HookEvent.USER_PROMPT,
+                              PythonHook(_check_sensitive, name="sensitive_words_filter"))
+                count += 1
+
+            block_patterns = filters.get("block_patterns", [])
+            if block_patterns:
+                patterns = list(block_patterns)
+
+                def _check_block_patterns(ctx: HookContext) -> HookResult:
+                    params_str = str(ctx.data.get("params", ""))
+                    for pat in patterns:
+                        if pat in params_str:
+                            return HookResult(Decision.BLOCK,
+                                              reason=f"危险模式拦截: {pat}")
+                    return HookResult(Decision.CONTINUE)
+
+                self.register(HookEvent.PRE_TOOL,
+                              PythonHook(_check_block_patterns, name="block_patterns_filter"))
+                count += 1
+
+        logger.info(f"从配置加载了 {count} 个 hook")
+        return count
 
     # ---- 注册 / 注销 ----
 
@@ -197,90 +269,6 @@ class HookManager:
         return final
 
     # ---- 配置加载 ----
-
-    def load_config(self, path: str) -> int:
-        """从 config/hooks.json 加载命令式 hook + 内置过滤器。
-
-        返回加载的 hook 总数。自动注册：
-          - filters.sensitive_words → user_prompt hook（敏感词 BLOCK）
-          - filters.block_patterns  → pre_tool hook（模式匹配 BLOCK）
-          - hooks.{event}[].hooks  → CommandHook
-        """
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-
-        if not cfg.get("enabled", True):
-            self.enabled = False
-            return 0
-
-        count = 0
-
-        # ---- 内置过滤器 ----
-        filters = cfg.get("filters", {})
-
-        # 敏感词过滤 → user_prompt
-        sensitive_words = filters.get("sensitive_words")
-        if sensitive_words:
-            from .builtin import sensitive_word_filter
-            swf = sensitive_word_filter([str(w) for w in sensitive_words])
-            self.register(HookEvent.USER_PROMPT, PythonHook(swf, name="sensitive_word_filter"))
-            logger.info(f"已注册 sensitive_word_filter: {len(sensitive_words)} 个词")
-            count += 1
-
-        # 模式匹配拦截 → pre_tool（匹配工具参数中的危险模式）
-        block_patterns = filters.get("block_patterns")
-        if block_patterns:
-            def _block_pattern_fn(ctx: HookContext) -> HookResult:
-                p = ctx.payload or {}
-                params_str = json.dumps(p, ensure_ascii=False)
-                for pat in block_patterns:
-                    if pat in params_str:
-                        return HookResult(Decision.BLOCK,
-                                          reason=f"命中拦截模式: {pat}")
-                return HookResult(Decision.CONTINUE)
-
-            self.register(HookEvent.PRE_TOOL,
-                          PythonHook(_block_pattern_fn, name="block_patterns"))
-            logger.info(f"已注册 block_patterns: {block_patterns}")
-            count += 1
-
-        # ---- 命令式 hook ----
-        hooks_cfg = cfg.get("hooks", {})
-        for event_name, matcher_groups in hooks_cfg.items():
-            try:
-                evt = HookEvent(event_name)
-            except ValueError:
-                logger.warning(f"hooks.json 中忽略未知事件: {event_name}")
-                continue
-            if not isinstance(matcher_groups, list):
-                continue
-            for group in matcher_groups:
-                matcher = group.get("matcher", "")
-                hook_list = group.get("hooks", [])
-                for hc in hook_list:
-                    htype = hc.get("type", "command")
-                    if htype == "command":
-                        cmd = hc.get("command", "")
-                        if not cmd:
-                            continue
-                        # 安全预检：拒绝 DANGEROUS 命令
-                        from core.sandbox.guard import check_command_safety
-                        ok, reason = check_command_safety(cmd, "CommandHook")
-                        if not ok:
-                            logger.warning(
-                                f"hooks.json: 命令被拒绝注册 [{cmd[:80]}]: {reason}"
-                            )
-                            continue
-                        timeout = hc.get("timeout", 30)
-                        cwd = hc.get("cwd")
-                        ch = CommandHook(cmd, timeout=timeout, cwd=cwd)
-                        self.register(evt, ch, matcher=matcher)
-                        count += 1
-                    else:
-                        logger.warning(f"hooks.json: 未知 hook 类型 '{htype}'")
-
-        logger.info(f"从 {path} 加载了 {count} 个 hook")
-        return count
 
     # ---- 便捷方法（agent 调用点用，少写样板）----
 

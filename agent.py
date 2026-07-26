@@ -547,7 +547,7 @@ class Agent:
         """异步初始化 MCP 连接（由 _init_mcp_if_needed 调用）"""
         self.mcp_manager = MCPClientManager_cls()
 
-        # 服务器 trust 标志映射：{name: trust}（来自 mcp_config.json）
+        # 服务器 trust 标志映射：{name: trust}（来自 config.json 的 mcp.servers）
         cfg_trust = {
             cfg.get("name"): bool(cfg.get("trust", False))
             for cfg in configs
@@ -1409,8 +1409,7 @@ def _load_mcp_config(mcp_servers: list = None) -> list:
     """
     自动加载 MCP 配置，优先级：
     1. 显式传入的 mcp_servers 参数
-    2. config/mcp_config.json 文件
-    3. 项目根目录的 mcp_config.json 文件（兼容旧路径）
+    2. config.json → mcp.servers
 
     参数:
         mcp_servers: 代码传入的配置（最高优先级）
@@ -1421,22 +1420,16 @@ def _load_mcp_config(mcp_servers: list = None) -> list:
     if mcp_servers is not None:
         return mcp_servers
 
-    # 优先级 2：config/mcp_config.json
-    config_paths = [
-        os.path.join(os.getcwd(), "config", "mcp_config.json"),
-        os.path.join(os.getcwd(), "mcp_config.json"),  # 旧路径兼容
-    ]
-    for config_path in config_paths:
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    parsed = json.load(f)
-                if isinstance(parsed, list):
-                    rel = os.path.relpath(config_path)
-                    logger.info(f"从 {rel} 加载了 {len(parsed)} 个 MCP 服务器配置")
-                    return parsed
-            except (json.JSONDecodeError, IOError) as e:
-                logger.warning(f"{config_path} 读取失败: {e}")
+    # 优先级 2：统一配置 config.json
+    try:
+        from core.config_loader import load_config as _load_cfg
+        cfg = _load_cfg()
+        servers = cfg.get("mcp", {}).get("servers", [])
+        if servers:
+            logger.info(f"从 config.json 加载了 {len(servers)} 个 MCP 服务器配置")
+            return servers
+    except Exception:
+        pass
 
     return None
 
@@ -1479,7 +1472,7 @@ def create_agent(
         memory: 跨会话记忆
         skills: 学习型技能系统
         sandbox: 沙箱执行器（L2 内容拦截+资源隔离）
-        hooks: Hook 模块（事件驱动自定义扩展，配置文件 config/hooks.json）
+        hooks: Hook 模块（事件驱动自定义扩展，配置于 config.json 的 hooks section）
         mcp_servers: MCP 服务器配置列表，每项含 name/transport/command 等
     """
 
@@ -1507,7 +1500,7 @@ def create_agent(
         sandbox=sandbox_executor, process_manager=process_manager,
     )
     register_web_tools(registry)
-    # MCP 配置：代码参数 > .env > mcp_config.json
+    # MCP 配置：代码参数 > config.json
     mcp_servers = _load_mcp_config(mcp_servers)
     agent = Agent(
         name=name, llm=llm, tool_registry=registry,
@@ -1571,7 +1564,7 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
     print("║   /proc stop <id>    停止指定进程               ║")
     print("║   /proc tail <id>    持续打印进程输出          ║")
     print("║   /hook              查看已注册 hook            ║")
-    print("║   /hook reload       重新加载 config/hooks.json ║")
+    print("║   /hook reload       重新加载 config.json 的 hooks 配置 ║")
     print("║   /stats             查看上下文占用             ║")
     print("║   /history             查看当前会话内容         ║")
     print("║   /compact           全量压缩历史（释放上下文）  ║")
@@ -1615,7 +1608,7 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
             agent = create_agent(debug=debug)
         except ValueError as e:
             print(f"\n❌ 创建失败: {e}")
-            print("   检查 .env 中 LLM_MODEL_ID / LLM_CLOUD_API_KEY / LLM_CLOUD_BASE_URL")
+            print("   配置文件: config.json（项目根目录）")
             sys.exit(1)
     # 显示当前状态
     print(f"\n🤖 {agent.name}")
@@ -1843,8 +1836,13 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                 parts = u.split()
                 cmd = parts[1] if len(parts) > 1 else ""
                 if cmd == "reload":
-                    count = agent.hooks.load_config("config/hooks.json")
-                    print(f"  🔄 已重新加载 hooks.json（{count} 个 hook）")
+                    # 强制重新加载 config.json，然后重新加载 hooks
+                    from core.config_loader import load_config as _reload_cfg
+                    _reload_cfg(force_reload=True)
+                    if agent.hooks._try_load_unified():
+                        print(f"  🔄 已重新加载 hooks 配置")
+                    else:
+                        print(f"  ⚠️  hooks 重新加载失败")
                 else:
                     hlist = agent.hooks.list_hooks()
                     if not hlist:
@@ -1953,7 +1951,7 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                     print("\n  ℹ️  未配置 MCP 服务器")
                     print("  配置方式：")
                     print("    1. create_agent(mcp_servers=[...])")
-                    print("    2. 在 config/mcp_config.json 中配置")
+                    print("    2. 在 config.json 的 mcp.servers 中配置")
                 else:
                     parts = u.split()
                     sub = parts[1] if len(parts) > 1 else "status"
@@ -2057,7 +2055,7 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                 print("    /proc stop <id>     停止指定进程")
                 print("    /proc tail <id>     持续打印进程输出")
                 print("    /hook               查看已注册 hook")
-                print("    /hook reload        重新加载 config/hooks.json")
+                print("    /hook reload        重新加载 config.json 的 hooks 配置")
                 print("    /stats              查看上下文占用统计")
                 print("    /history            查看当前会话内容")
                 print("    /mcp                查看 MCP 服务器状态")

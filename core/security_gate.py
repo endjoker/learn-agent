@@ -166,7 +166,7 @@ class SecurityGate:
         if "remote:call" in caps:
             if tool is not None and getattr(tool, "trust", False):
                 return ALLOW, ""
-            return ASK, "MCP 远程工具需确认（可在 mcp_config.json 配 trust:true 放行）"
+            return ASK, "MCP 远程工具需确认（可在 config.json 的 mcp.servers 中配 trust:true 放行）"
 
         # 未知工具名 → ASK（修复原 trusted 时自动 ALLOW 的缺口）
         if self.permission.get_rule(name) is None:

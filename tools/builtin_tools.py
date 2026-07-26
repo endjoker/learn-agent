@@ -768,26 +768,13 @@ class BashTool(BaseTool):
         "sort":   {"win": "sort",    "desc": "排序（相同）"},
     }
 
-    # ============ 危险命令黑名单 ============
-
-    DANGEROUS_COMMANDS_WIN = [
-        "del /f /s", "rd /s /q", "format ", "diskpart",
-        "shutdown /r", "shutdown /s", "taskkill /f",
-    ]
-
-    DANGEROUS_COMMANDS_UNIX = [
-        "rm -rf /", "rm -rf ~", "rm -rf .", "mkfs",
-        "dd if=", ":(){ :|:& };:",  # fork 炸弹
-        "chmod 0", "chown -r", "> /dev/sda",
-    ]
+    # ============ 危险命令黑名单（从 guard.py 获取，唯一来源） ============
 
     @property
     def _dangerous_commands(self) -> list:
-        """根据当前系统返回合适的危险命令列表"""
-        if self.IS_WINDOWS:
-            return self.DANGEROUS_COMMANDS_UNIX + self.DANGEROUS_COMMANDS_WIN
-        else:
-            return self.DANGEROUS_COMMANDS_UNIX
+        """返回危险命令列表（从 guard.py 获取，消除重复定义）"""
+        from core.sandbox.guard import DANGEROUS_SUBSTRINGS
+        return list(DANGEROUS_SUBSTRINGS)
 
     # ============ 执行命令 ============
 

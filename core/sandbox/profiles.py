@@ -1,18 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-配置档管理 —— 加载 config/sandbox.json，提供运行时可切换的配置
+配置档管理 —— 从 config.json 的 sandbox section 加载配置，提供运行时可切换的配置档
 """
 
-import json
-import os
 import copy
 import logging
-from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("hello_agent")
 
-# 默认配置（config/sandbox.json 不存在时使用）
+# 默认配置（config.json 无 sandbox section 时使用）
 _DEFAULT_CONFIG = {
     "enabled": True,
     "default_profile": "agent",
@@ -72,39 +69,25 @@ _DEFAULT_CONFIG = {
     },
 }
 
-_CONFIG_PATH = Path("config") / "sandbox.json"
-
-
-def _find_config() -> Path | None:
-    """在标准路径查找 sandbox.json"""
-    candidates = [
-        Path.cwd() / "config" / "sandbox.json",
-        Path.cwd() / "sandbox.json",
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    return None
 
 
 def load_config() -> dict[str, Any]:
     """
-    加载 config/sandbox.json，失败时返回默认配置
+    加载沙箱配置 —— 从 config.json 的 sandbox section 读取，
+    无配置时返回默认值。
     """
-    cfg_path = _find_config()
-    if not cfg_path:
-        return _DEFAULT_CONFIG
-
     try:
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            user_cfg = json.load(f)
-        # 合并：用户配置覆盖默认（深拷贝默认配置，避免就地修改污染模块级 _DEFAULT_CONFIG）
-        merged = _deep_merge(copy.deepcopy(_DEFAULT_CONFIG), user_cfg)
-        logger.info("从 %s 加载了沙箱配置", cfg_path.name)
-        return merged
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning("加载沙箱配置失败 %s: %s，使用默认配置", cfg_path, e)
-        return _DEFAULT_CONFIG
+        from core.config_loader import load_config as _load_unified
+        unified = _load_unified()
+        sandbox_cfg = unified.get("sandbox", {})
+        if sandbox_cfg:
+            merged = _deep_merge(copy.deepcopy(_DEFAULT_CONFIG), sandbox_cfg)
+            logger.info("从 config.json 加载了沙箱配置")
+            return merged
+    except Exception:
+        pass
+
+    return _DEFAULT_CONFIG
 
 
 def _deep_merge(base: dict, override: dict) -> dict:

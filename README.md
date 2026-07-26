@@ -40,10 +40,12 @@
 - **上下文压缩** — 轻量压缩（tool_result 替换元数据）+ 全量压缩（LLM 结构化摘要），60%/80% 阈值自动触发
 - **锚点跟踪** — 以 API 返回 `usage` 为锚点精确估算实时 token 占用
 - **三级权限管理** — allow/ask/deny，工作区路径检测，bash 命令分类，A/Y/N/S 交互
-- **模型配置** — `.env` 按模型名前缀分组，切换模型自动匹配参数和上下文长度
+- **多协议适配层** — 支持 OpenAI / Anthropic / Gemini 三种协议，`create_adapter()` 自动检测或显式指定，lazy import 按需加载
+- **统一配置（config.json）** — 所有配置集中在 `config.json`（llm / permission / hooks / mcp / sandbox），支持环境变量覆盖 API Key 等敏感信息
+- **模型配置** — `config.json` 按模型名分组配置，切换模型自动匹配参数和上下文长度
 - **模型切换** — 运行时通过 `/model` 命令在线切换模型
 - **MCP 集成** — 支持 Model Context Protocol，可连接外部 MCP Server（GitHub/filesystem/网页搜索等），支持 Stdio、HTTP+SSE、StreamableHTTP 三种传输方式
-- **MCP 配置** — 通过 `config/mcp_config.json` 文件或代码参数配置，支持多服务器自动发现工具
+- **MCP 配置** — 通过 `config.json` 的 `mcp.servers` 配置，支持多服务器自动发现工具
 - **调试日志** — `--debug` 参数开启，调试信息写入 `log/` 目录文件，控制台保持简洁
 - **跨会话记忆** — 每轮对话自动归档到 `memory/daily/`，支持 BM25 全文检索回忆
 - **学习型技能系统** — AI 每轮学习到的可复用能力持久化到 `SKILLS/` 目录，LLM 可通过 `create_skill` 工具运行时创建技能，交互式 `/skill` 命令查看和调用
@@ -88,40 +90,64 @@ pip install -r requirements.txt
 
 ### 配置
 
-`.env` 文件按模型名前缀分组配置：
+复制 `config.example.json` 为 `config.json`，按需修改：
 
-```env
-# 当前使用的模型
-LLM_MODEL_ID=deepseek-v4-flash
-
-# deepseek-v4-flash 配置
-deepseek-v4-flash_BASE_URL=https://api.deepseek.com
-deepseek-v4-flash_API_KEY=sk-xxx
-deepseek-v4-flash_CONTEXT_LENGTH=1048576
-
-# 本地模型配置（通过 /model local gemma4 切换）
-gemma4_PROVIDER=ollama
-gemma4_CONTEXT_LENGTH=262144
+```bash
+cp config.example.json config.json
 ```
+
+`config.json` 包含五个 section：
+
+```json
+{
+  "llm": {
+    "model_id": "deepseek-v4-flash",
+    "timeout": 60,
+    "models": {
+      "deepseek-v4-flash": {
+        "api_key": "sk-xxx",
+        "base_url": "https://api.deepseek.com",
+        "context_length": 1048576
+      },
+      "claude-sonnet-4": {
+        "api_key": "sk-ant-xxx",
+        "protocol": "anthropic"
+      }
+    }
+  },
+  "permission": { "..." : "权限配置" },
+  "hooks": { "..." : "Hook 配置（事件钩子 + 过滤器）" },
+  "mcp": { "servers": ["MCP 服务器列表"] },
+  "sandbox": { "..." : "沙箱配置（敏感文件/危险命令/网络黑名单）" }
+}
+```
+
+API Key 等敏感信息也可通过环境变量注入（优先级高于 config.json）：
+- `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `OPENAI_API_KEY`
+- `LLM_PROTOCOL` — 覆盖协议检测
 
 ### MCP 配置
 
-通过 `config/mcp_config.json` 配置外部 MCP 服务器（复制模板文件修改）：
+在 `config.json` 的 `mcp.servers` 中配置外部 MCP 服务器：
 
 ```json
-[
-  {
-    "name": "web-search",
-    "transport": "streamable",
-    "url": "http://127.0.0.1:3000/mcp"
-  },
-  {
-    "name": "filesystem",
-    "transport": "stdio",
-    "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+{
+  "mcp": {
+    "servers": [
+      {
+        "name": "web-search",
+        "transport": "streamable",
+        "url": "http://127.0.0.1:3000/mcp"
+      },
+      {
+        "name": "filesystem",
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+      }
+    ]
   }
-]
+}
 ```
 
 支持三种传输方式：
@@ -156,13 +182,15 @@ python agent.py --debug
 ```
 hello-agent/
 ├── agent.py                 # Agent 主程序入口（ReAct 循环 + 交互式 CLI）
+├── config.json              # 统一配置文件（从 config.example.json 复制）
+├── config.example.json      # 配置模板（含全部 section 示例）
 ├── requirements.txt         # Python 依赖列表
-├── .env                     # 环境变量配置（API Key、模型等）
 ├── .gitignore               # Git 忽略规则
 │
 ├── core/                    # 核心组件
 │   ├── __init__.py
-│   ├── llm_client.py        # LLM 客户端（云端/本地模型适配，模型前缀参数读取）
+│   ├── config_loader.py     # 统一配置加载器（config.json 读取 + 环境变量覆盖 + 默认值）
+│   ├── llm_client.py        # LLM 客户端（通过协议适配器调用，支持三种协议）
 │   ├── message_store.py     # 消息存储模块（持久化、上下文统计、锚点跟踪、会话管理）
 │   ├── compressor.py        # 上下文压缩（轻量 + 全量 LLM 摘要）
 │   ├── task_list.py         # 任务清单（Plan-and-Execute 数据模型）
@@ -170,17 +198,24 @@ hello-agent/
 │   ├── permission.py        # 权限管理模块（allow/ask/deny 三级）
 │   ├── system_prompt.py     # System Prompt 构建器（静态区/动态区）
 │   ├── mcp_client.py        # MCP 客户端（Stdio/SSE/StreamableHTTP 传输 + JSON-RPC 协议）
-│   └── sandbox/             # 沙箱执行器（L2 两层防护）
-│       ├── __init__.py
-│       ├── executor.py      # SandboxExecutor（开关/配置档/绕过/核心执行流）
-│       ├── guard.py         # L2-A 内容拦截（敏感文件/数据外发/Python AST/网络黑名单）
-│       ├── profiles.py      # 配置档管理（加载 config/sandbox.json）
-│       └── audit.py         # 审计日志（记录拦截/绕过/错误事件）
+│   ├── security_gate.py     # 安全闸门（capability 驱动的统一权限+沙箱检查点）
+│   ├── protocols/           # LLM 协议适配器层
+│   │   ├── __init__.py      # 工厂函数 create_adapter() + detect_protocol()
+│   │   ├── base.py          # 抽象基类 ProtocolAdapter + ChatResponse
+│   │   ├── openai_adapter.py    # OpenAI Chat Completions（兼容 DeepSeek/Ollama/vLLM）
+│   │   ├── anthropic_adapter.py # Anthropic Messages API（Claude 系列）
+│   │   └── gemini_adapter.py    # Gemini generateContent
+│   ├── sandbox/             # 沙箱执行器（L2 两层防护）
+│   │   ├── __init__.py
+│   │   ├── executor.py      # SandboxExecutor（开关/配置档/绕过/核心执行流）
+│   │   ├── guard.py         # L2-A 内容拦截（敏感文件/数据外发/Python AST/网络黑名单）
+│   │   ├── profiles.py      # 配置档管理（从 config.json sandbox section 加载）
+│   │   └── audit.py         # 审计日志（记录拦截/绕过/错误事件）
 │   └── hook/                # Hook 模块（事件驱动生命周期钩子）
 │       ├── __init__.py
 │       ├── events.py        # HookEvent 枚举 + HookContext + Decision/HookResult
-│       ├── hooks.py         # BaseHook / PythonHook / CommandHook（JSON stdin/stdout 协议）
-│       ├── manager.py       # HookManager（注册/分发/合并/配置加载）
+│       ├── hooks.py         # BaseHook / PythonHook / CommandHook（含 from_config 安全预检）
+│       ├── manager.py       # HookManager（注册/分发/合并/配置加载/过滤器）
 │       └── builtin.py       # 内置 hook（审计日志/通知/敏感词过滤/模式拦截）
 │
 ├── tools/                   # 工具系统
@@ -200,11 +235,6 @@ hello-agent/
 │   └── code-review/         # 预置技能示例
 │       ├── skill.json
 │       └── instruction.md
-│
-├── config/                  # 配置文件目录
-│   ├── sandbox.json         # 沙箱配置（配置档/网络黑名单）
-│   ├── mcp_config.json      # MCP 服务器配置（含 Token，已 gitignore）
-│   └── mcp_config.template.json  # MCP 配置模板（含三种传输方式示例）
 │
 ├── memory/                  # 跨会话记忆系统
 │   ├── __init__.py
@@ -246,7 +276,7 @@ hello-agent/
 | `/sandbox bypass` | 临时绕过沙箱（下一条命令） |
 | `/sandbox profile <name>` | 切换沙箱配置档 |
 | `/hook` | 查看已注册 hook |
-| `/hook reload` | 重新加载 `config/hooks.json` |
+| `/hook reload` | 重新加载 config.json 的 hooks 配置 |
 | `/mcp` | 查看 MCP 服务器连接状态 |
 | `/mcp list` | 查看 MCP 服务器详情与工具列表 |
 | `/compact` | 手动触发全量上下文压缩 |
@@ -259,7 +289,7 @@ hello-agent/
 ```python
 from agent import create_agent
 
-# 创建 Agent（自动从 .env 加载配置）
+# 创建 Agent（自动从 config.json 加载配置）
 agent = create_agent()
 
 # 简单对话
@@ -313,16 +343,27 @@ registry.register_tool(MyTool())
 
 ## ⚙️ 配置说明
 
-`.env` 文件支持以下配置项：
+`config.json` 的 `llm` section 支持以下配置项：
 
-| 变量 | 说明 | 默认值 |
+| 字段 | 说明 | 默认值 |
 |:----|:-----|:------|
-| `LLM_MODEL_ID` | 当前使用的模型名称 | `deepseek-v4-flash` |
-| `{model}_BASE_URL` | 模型专属 API 地址 | `https://api.deepseek.com` |
-| `{model}_API_KEY` | 模型专属 API 密钥 | — |
-| `{model}_CONTEXT_LENGTH` | 模型上下文窗口大小 | `1048576` |
-| `{model}_PROVIDER` | 本地模型服务商 | `ollama` |
-| `LLM_TIMEOUT` | 请求超时秒数 | `60` |
+| `model_id` | 当前使用的模型名称 | `""` |
+| `timeout` | 请求超时秒数 | `60` |
+| `models.{name}.api_key` | 模型 API 密钥 | — |
+| `models.{name}.base_url` | 模型 API 地址 | — |
+| `models.{name}.protocol` | 协议类型（openai / anthropic / gemini） | 自动检测 |
+| `models.{name}.context_length` | 模型上下文窗口大小 | 自动检测 |
+| `models.{name}.provider` | 本地模型服务商（ollama / lm_studio / vllm） | — |
+
+环境变量覆盖（优先级高于 config.json）：
+
+| 变量 | 说明 |
+|:----|:-----|
+| `ANTHROPIC_API_KEY` | Anthropic API 密钥 |
+| `GEMINI_API_KEY` | Gemini API 密钥 |
+| `OPENAI_API_KEY` | OpenAI API 密钥 |
+| `LLM_PROTOCOL` | 覆盖协议检测 |
+| `LLM_TIMEOUT` | 覆盖请求超时 |
 
 ## 🧪 调试模式
 
@@ -401,6 +442,11 @@ agent = create_agent(debug=True)
 - [x] SkillTool 执行适配器（返回指令文本，LLM 按步骤执行）
 - [x] CreateSkillTool 运行时创建（LLM 自动写磁盘 + 注册 + 重建 prompt）
 - [x] 预置 code-review 技能
+- [x] 统一配置加载器（config.json 唯一来源 + 环境变量覆盖 + 硬编码默认值）
+- [x] 多协议 LLM 适配层（OpenAI / Anthropic / Gemini，lazy import 按需加载）
+- [x] 协议自动检测（detect_protocol 根据 base_url 域名推断）
+- [x] Hook 配置式加载（CommandHook.from_config 含注册期安全预检）
+- [x] Hook 内置过滤器（sensitive_words / block_patterns 配好即生效）
 
 ## 📄 许可证
 

@@ -17,7 +17,6 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Callable, Union
 
-
 # ============================================================
 # 权限级别常量
 # ============================================================
@@ -28,7 +27,7 @@ DENY = "deny"     # 直接拒绝
 
 
 # ============================================================
-# bash 命令分类
+# bash 命令分类（可从 config.json 覆盖）
 # ============================================================
 
 # 只读命令（直接放行）
@@ -57,40 +56,8 @@ WRITE_COMMANDS = [
     "taskkill", "kill -9",
 ]
 
-# 危险命令（直接拒绝）
-# 分两类匹配，避免朴素子串误伤：
-# - DANGEROUS_WORDS：短动词，必须作为独立令牌（前后为空白/行首行尾）才拒绝。
-#   否则 "format" 会误匹配 PowerShell 的 "format-table"/"format-list" 等。
-# - DANGEROUS_SUBSTRINGS：足够特异的多 token 模式，子串匹配即可。
-DANGEROUS_WORDS = [
-    "format",     # 磁盘格式化（format C:）；令牌匹配避开 format-table
-    "shutdown",   # 关机
-    "reboot",     # 重启
-    "halt",       # 停机
-]
-DANGEROUS_SUBSTRINGS = [
-    "rm -rf /", "rm -rf ~", "rm -rf .",
-    "del /f /s", "rd /s /q",
-    "mkfs",            # mkfs / mkfs.ext4
-    "dd if=",
-    ":(){ :|:& };:",   # fork 炸弹
-    "> /dev/sda", "> /dev/mmc",
-]
-# 令牌边界正则：要求危险词前后是空白或字符串首尾
-_DANGEROUS_WORDS_RE = re.compile(
-    r"(?:^|\s)(" + "|".join(DANGEROUS_WORDS) + r")(?=\s|$)"
-)
-
-
-def _match_dangerous(command_lower: str) -> Optional[str]:
-    """返回命中的危险模式（None 表示安全）。"""
-    for pat in DANGEROUS_SUBSTRINGS:
-        if pat in command_lower:
-            return pat
-    m = _DANGEROUS_WORDS_RE.search(command_lower)
-    if m:
-        return m.group(1)
-    return None
+# 危险命令检测 —— 统一从 guard.py 获取，避免重复定义
+from core.sandbox.guard import _match_dangerous
 
 
 def classify_bash_command(command: str) -> str:
@@ -103,12 +70,9 @@ def classify_bash_command(command: str) -> str:
     """
     cmd_lower = command.strip().lower()
 
-    # 危险命令（令牌边界 + 特异子串，避免 "format" 误伤 "format-table"）
+    # 危险命令 —— 从 guard.py 获取（唯一来源）
     if _match_dangerous(cmd_lower):
         return DENY
-
-    # 提取命令名（第一个词）
-    first_word = cmd_lower.split()[0] if cmd_lower.split() else ""
 
     # 只读命令
     for pattern in READONLY_COMMANDS:
@@ -171,54 +135,84 @@ class PermissionChecker:
         # → "deny"（工作区外写入）
     """
 
-    def __init__(self, workspace: str = None):
+    def __init__(self, workspace: str = None, config: dict = None):
         """
         初始化权限检查器
 
         参数:
-            workspace: 项目工作区路径（默认当前目录）
+            workspace: 项目工作区路径（默认：config → permission.workspace → 当前目录）
+            config:    permission section 的配置 dict（None 时自动从 config_loader 加载）
         """
-        self.workspace = Path(workspace).resolve() if workspace else Path.cwd().resolve()
+        # 从统一配置读取
+        if config is None:
+            try:
+                from core.config_loader import load_config
+                config = load_config().get("permission", {})
+            except Exception:
+                config = {}
+
+        # workspace: 参数 > config > 当前目录
+        if workspace:
+            self.workspace = Path(workspace).resolve()
+        elif config.get("workspace"):
+            ws = config["workspace"]
+            self.workspace = Path(ws).resolve() if ws != "." else Path.cwd().resolve()
+        else:
+            self.workspace = Path.cwd().resolve()
 
         # 工具权限规则表
-        # key = 工具名, value = 权限级别 或 回调函数
         self._rules: Dict[str, Union[str, Callable]] = {}
 
-        # 工作区信任标志（A 选项：本会话内工作区全放行）
+        # 工作区信任标志
         self._workspace_trusted = False
 
-        # 初始化默认规则
-        self._init_default_rules()
+        # 加载默认规则（从 config 或硬编码）
+        self._init_default_rules(config)
 
-    def _init_default_rules(self):
-        """设置各工具的默认权限规则"""
+    def _init_default_rules(self, config: dict = None):
+        """设置各工具的默认权限规则（可从 config.json 的 permission.tool_rules 覆盖）"""
+        cfg = config or {}
+        tool_rules = cfg.get("tool_rules", {})
+
+        # 从 config 或硬编码默认值读取每个工具的权限
+        def _rule(tool_name: str, default: Union[str, Callable]) -> Union[str, Callable]:
+            if tool_name in tool_rules:
+                val = tool_rules[tool_name]
+                if val in ("allow", "ask", "deny"):
+                    return val
+            return default
 
         # ===== allow：安全、高频、只读 =====
-        # 工作区内的读操作直接放行
-        self.set_rule("grep", ALLOW)
-        self.set_rule("datetime", ALLOW)
-        self.set_rule("calculate", ALLOW)
-        self.set_rule("notes", ALLOW)
-        self.set_rule("memory_search", ALLOW)
-        self.set_rule("memory_update", ALLOW)
-        self.set_rule("search", ALLOW)
-        self.set_rule("web_fetch", ALLOW)
-        # create_skill：写入经名字校验、限定 SKILLS/ 子目录，安全，免确认
-        self.set_rule("create_skill", ALLOW)
+        self.set_rule("grep", _rule("grep", ALLOW))
+        self.set_rule("datetime", _rule("datetime", ALLOW))
+        self.set_rule("calculate", _rule("calculate", ALLOW))
+        self.set_rule("notes", _rule("notes", ALLOW))
+        self.set_rule("memory_search", _rule("memory_search", ALLOW))
+        self.set_rule("memory_update", _rule("memory_update", ALLOW))
+        self.set_rule("search", _rule("search", ALLOW))
+        self.set_rule("web_fetch", _rule("web_fetch", ALLOW))
+        self.set_rule("create_skill", _rule("create_skill", ALLOW))
 
-        # ===== 路径敏感的操作：规则函数动态判断 =====
-        self.set_rule("read", self._check_file_path_allow)       # 区内allow，区外ask
-        self.set_rule("glob", self._check_file_path_allow)       # 区内allow，区外ask
-        self.set_rule("write", self._check_file_path_ask)        # 全ask
-        self.set_rule("edit", self._check_file_path_ask)         # 全ask
-        self.set_rule("file_mgr", self._check_file_mgr)  # 根据action区分
+        # ===== 路径敏感的操作 =====
+        self.set_rule("read", _rule("read", self._check_file_path_allow))
+        self.set_rule("glob", _rule("glob", self._check_file_path_allow))
+        self.set_rule("write", _rule("write", self._check_file_path_ask))
+        self.set_rule("edit", _rule("edit", self._check_file_path_ask))
+        self.set_rule("file_mgr", _rule("file_mgr", self._check_file_mgr))
 
         # ===== bash：根据命令内容动态判断 =====
-        self.set_rule("bash", self._check_bash_command)
+        self.set_rule("bash", _rule("bash", self._check_bash_command))
 
         # ===== ask：有副作用的操作 =====
-        self.set_rule("python", ASK)
-        self.set_rule("http", ASK)
+        self.set_rule("python", _rule("python", ASK))
+        self.set_rule("http", _rule("http", ASK))
+
+        # ---- 加载 bash 命令分类（可从 config 覆盖） ----
+        bash_cfg = cfg.get("bash_commands", {})
+        if "readonly" in bash_cfg:
+            READONLY_COMMANDS[:] = bash_cfg["readonly"]
+        if "write" in bash_cfg:
+            WRITE_COMMANDS[:] = bash_cfg["write"]
 
     # ============================================================
     # 规则设置

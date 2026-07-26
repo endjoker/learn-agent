@@ -103,6 +103,28 @@ class CommandHook(BaseHook):
         self.cwd = cwd
         self.name = name or command[:60]
 
+    @classmethod
+    def from_config(cls, cfg: dict) -> "CommandHook":
+        """从配置字典创建 CommandHook，含注册期安全预检。
+
+        cfg 格式: {"command": "...", "timeout": 30, "cwd": "...", "name": "..."}
+        危险命令抛 PermissionError（由 manager._load_from_dict 捕获）。
+        """
+        command = cfg.get("command", "")
+        if not command:
+            raise ValueError("command hook 缺少 command 字段")
+        # 注册期安全预检
+        from core.sandbox.guard import check_command_safety
+        is_safe, reason = check_command_safety(command)
+        if not is_safe:
+            raise PermissionError(f"命令被安全策略拒绝: {reason}")
+        return cls(
+            command=command,
+            timeout=cfg.get("timeout", 30),
+            cwd=cfg.get("cwd"),
+            name=cfg.get("name", ""),
+        )
+
     def run(self, ctx: HookContext) -> HookResult:
         try:
             proc = subprocess.run(

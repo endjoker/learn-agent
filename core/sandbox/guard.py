@@ -117,12 +117,19 @@ DATA_LEAK_PATTERNS = [
 
 # 单词型危险命令：必须作为独立令牌（前后空白/行首行尾）才命中
 # 避免 "format" 误伤 PowerShell 的 "format-table"
-# 限制在行首或命令分隔符后（; / && / || / |），防止参数中的误匹配（如 ls format）
+# 限制在行首、空白后或命令分隔符后（; / && / || / |），防止参数中的误匹配（如 ls --format）
 DANGEROUS_WORDS = ["format", "shutdown", "reboot", "halt"]
-_DANGEROUS_WORDS_RE = re.compile(
-    r"(?:^|;\s*|\|\|\s*|&&\s*|\|\s*)(" + "|".join(DANGEROUS_WORDS) + r")(?=\s|$)",
-    re.IGNORECASE,
-)
+
+
+def _compile_words_re(words: list) -> re.Pattern:
+    """从危险词列表编译正则（模块级定义和配置热更新共用）"""
+    return re.compile(
+        r"(?:^|\s|;\s*|\|\|\s*|&&\s*|\|\s*)(" + "|".join(words) + r")(?=\s|$)",
+        re.IGNORECASE,
+    )
+
+
+_DANGEROUS_WORDS_RE = _compile_words_re(DANGEROUS_WORDS)
 
 # 子串型危险命令：足够特异，子串匹配（mkfs 含 mkfs.ext4）
 DANGEROUS_SUBSTRINGS = [
@@ -537,3 +544,67 @@ def check_network_target(
                     return False, f"请求目标在黑名单中: {hostname}（匹配 {entry}）"
 
     return True, ""
+
+
+# ================================================================
+# 从统一配置加载安全参数
+# ================================================================
+
+_guard_config_loaded = False
+
+
+def apply_guard_config(config: dict = None):
+    """
+    从统一配置（config.json 的 sandbox section）更新模块级安全参数。
+
+    调用时机：模块导入后、Agent 初始化前。
+    未提供的 key 保留硬编码默认值。
+
+    参数:
+        config: sandbox section 的 dict。None 时自动从 config_loader 加载。
+    """
+    global SENSITIVE_FILES, SYSTEM_PATHS_WIN, SYSTEM_PATHS_LINUX, SYSTEM_PATHS_MAC
+    global DANGEROUS_SUBSTRINGS, DANGEROUS_WORDS, _DANGEROUS_WORDS_RE
+    global _guard_config_loaded
+
+    if config is None:
+        try:
+            from core.config_loader import load_config
+            config = load_config().get("sandbox", {})
+        except Exception:
+            return
+
+    if not config or _guard_config_loaded:
+        return
+
+    # --- sensitive_files ---
+    if "sensitive_files" in config:
+        SENSITIVE_FILES[:] = config["sensitive_files"]
+
+    # --- system_paths ---
+    sp = config.get("system_paths", {})
+    if isinstance(sp, dict):
+        if "windows" in sp:
+            SYSTEM_PATHS_WIN[:] = sp["windows"]
+        if "linux" in sp:
+            SYSTEM_PATHS_LINUX[:] = sp["linux"]
+        if "mac" in sp:
+            SYSTEM_PATHS_MAC[:] = sp["mac"]
+
+    # --- dangerous_commands ---
+    if "dangerous_commands" in config:
+        DANGEROUS_SUBSTRINGS[:] = config["dangerous_commands"]
+
+    # --- dangerous_words（需要重建正则） ---
+    if "dangerous_words" in config:
+        DANGEROUS_WORDS[:] = config["dangerous_words"]
+        _DANGEROUS_WORDS_RE = _compile_words_re(DANGEROUS_WORDS)
+
+    _guard_config_loaded = True
+
+
+# 模块导入时自动加载
+try:
+    apply_guard_config()
+except Exception:
+    pass  # 静默失败，使用硬编码默认值

@@ -1,0 +1,234 @@
+{
+  "llm": {
+    "model_id": "ornith",
+    "timeout": 60,
+    "models": {
+      "deepseek-v4-flash": {
+        "api_key": "YOUR_API_KEY_HERE",
+        "base_url": "https://api.deepseek.com",
+        "context_length": 1048576
+      },
+      "gemma4": {
+        "provider": "ollama",
+        "context_length": 262144
+      },
+      "ornith": {
+        "api_key": "YOUR_API_KEY_HERE",
+        "base_url": "http://192.168.0.210:8080/v1",
+        "provider": "ollama",
+        "context_length": 204800
+      }
+    }
+  },
+  "permission": {
+    "workspace": ".",
+    "default_mode": "ask",
+    "tool_rules": {
+      "grep": "allow",
+      "datetime": "allow",
+      "calculate": "allow",
+      "notes": "allow",
+      "memory_search": "allow",
+      "memory_update": "allow",
+      "search": "allow",
+      "web_fetch": "allow",
+      "create_skill": "allow",
+      "python": "ask",
+      "http": "ask"
+    },
+    "bash_commands": {
+      "readonly": [
+        "ls",
+        "dir",
+        "pwd",
+        "echo",
+        "cat",
+        "type",
+        "more",
+        "less",
+        "head",
+        "tail",
+        "findstr",
+        "where",
+        "which",
+        "git status",
+        "git log",
+        "git diff",
+        "git show",
+        "git branch",
+        "git stash list",
+        "git remote -v",
+        "git config",
+        "pip list",
+        "pip show",
+        "python --version",
+        "python3 --version",
+        "node --version",
+        "npm --version"
+      ],
+      "write": [
+        "rm",
+        "del",
+        "rd",
+        "rmdir",
+        "mv",
+        "move",
+        "rename",
+        "cp",
+        "copy",
+        "xcopy",
+        "robocopy",
+        "mkdir",
+        "md",
+        "git add",
+        "git commit",
+        "git push",
+        "git pull",
+        "git merge",
+        "git rebase",
+        "git reset",
+        "git checkout -b",
+        "git branch -d",
+        "git tag",
+        "pip install",
+        "pip uninstall",
+        "pip update",
+        "npm install",
+        "npm uninstall",
+        "chmod",
+        "chown",
+        "taskkill",
+        "kill -9"
+      ]
+    }
+  },
+  "hooks": {
+    "enabled": true,
+    "hooks": {
+      "pre_tool": [
+        {
+          "matcher": "bash|write|file_mgr",
+          "_comment": "高危工具调用时触发审计脚本",
+          "hooks": []
+        }
+      ],
+      "post_tool": [],
+      "user_prompt": [],
+      "notification": [],
+      "denied": [],
+      "stop": [],
+      "pre_llm": [],
+      "post_llm": [],
+      "session_start": [],
+      "session_end": [],
+      "plan_approved": [],
+      "task_complete": []
+    },
+    "_comment": "Hook 模块配置 — 让用户在 agent 关键执行点插入自定义逻辑（审计/通知/改写/拦截）",
+    "filters": {
+      "_comment": "内置过滤器，配好即生效，不需写代码",
+      "sensitive_words": [
+        "password",
+        "api_key",
+        "apikey",
+        "secret",
+        "token",
+        "密钥",
+        "凭据",
+        "密码"
+      ],
+      "block_patterns": [
+        "rm -rf /",
+        "format C:",
+        "diskpart",
+        "dd if=",
+        "mkfs",
+        "> /dev/sd",
+        ":(){ :|:& };:"
+      ]
+    }
+  },
+  "mcp": {
+    "servers": [
+      {
+        "name": "web-search",
+        "transport": "streamable",
+        "url": "http://localhost:3000/mcp"
+      }
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "idle_timeout_seconds": 300,
+    "sensitive_files": [
+      ".env",
+      ".git/config",
+      "core/permission.py",
+      "core/llm_client.py",
+      "agent.py",
+      "requirements.txt"
+    ],
+    "dangerous_commands": [
+      "rm -rf /",
+      "rm -rf ~",
+      "rm -rf .",
+      "del /f /s",
+      "rd /s /q",
+      "diskpart",
+      "taskkill /f",
+      "chmod 0",
+      "chown -r",
+      "mkfs",
+      "dd if=",
+      ":(){ :|:& };:",
+      "> /dev/sda",
+      "> /dev/mmc"
+    ],
+    "dangerous_words": [
+      "format",
+      "shutdown",
+      "reboot",
+      "halt"
+    ],
+    "system_paths": {
+      "windows": [
+        "C:\\Windows",
+        "C:\\Program Files",
+        "C:\\Program Files (x86)",
+        "C:\\System32"
+      ],
+      "linux": [
+        "/etc",
+        "/usr",
+        "/boot",
+        "/sys",
+        "/proc",
+        "/var/log",
+        "/var/lib"
+      ],
+      "mac": [
+        "/System",
+        "/Library",
+        "/Applications"
+      ]
+    },
+    "network": {
+      "blocked_domains": [
+        "*.xyz",
+        "*.tk",
+        "*.ml",
+        "*.ga",
+        "*.cf",
+        "*.gq",
+        "*.top",
+        "*.loan",
+        "*.date",
+        "*.men"
+      ],
+      "blocked_ips": [
+        "10.0.0.0/8",
+        "172.16.0.0/12"
+      ]
+    }
+  }
+}

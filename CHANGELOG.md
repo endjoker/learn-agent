@@ -1,5 +1,58 @@
 # 更新日志
 
+## 2026-07-27 统一配置 + 多协议适配层 + 代码审查全量修复
+
+**背景**：对本轮全部改动（config 统一重构 + 三协议 LLM 适配层，12 个修改文件 + 6 个新文件，约 2400 行）进行 8 角度代码审查，确认 24 条发现（5 CRITICAL / 7 HIGH / 7 MEDIUM / 5 LOW），全部修复。
+
+### 一、统一配置（config.json 唯一来源）
+
+- **新增 `core/config_loader.py`**：统一配置加载器，从 `config.json` 读取全部配置（llm / permission / hooks / mcp / sandbox 五个 section），缺失时用硬编码默认值补齐
+- **新增 `config.example.json`**：完整配置模板，可直接复制为 `config.json` 使用
+- **删除全部旧文件读取**：
+  - `_load_legacy_config()`（config_loader.py）— 删除 .env / config/hooks.json / config/mcp_config.json / config/sandbox.json 四段 fallback（116 行）
+  - `_load_dotenv_to_llm()`（config_loader.py）— 删除手动 .env 解析（64 行）
+  - `_load_env_file()` + `load_dotenv`（llm_client.py）— 删除 python-dotenv 依赖
+  - `_find_config()` + sandbox.json fallback（profiles.py）— 删除（30 行）
+  - `_resolve_config_path()` + hooks.json fallback（manager.py）— 删除（30 行）
+  - `_load_mcp_config` 旧文件回退（agent.py）— 删除（18 行）
+- **保留 `os.getenv` 运行时环境变量覆盖**（API Key 等敏感信息仍可通过环境变量注入）
+- **requirements.txt**：删除 `python-dotenv>=1.0.0`
+
+### 二、多协议 LLM 适配层
+
+- **新增 `core/protocols/` 包**（5 个文件）：
+  - `base.py` — 抽象基类 `ProtocolAdapter`（generate / generate_stream）+ `ChatResponse` + 消息翻译辅助
+  - `openai_adapter.py` — OpenAI Chat Completions 协议（兼容 DeepSeek / Ollama / vLLM）
+  - `anthropic_adapter.py` — Anthropic Messages API 协议（Claude 系列）
+  - `gemini_adapter.py` — Gemini generateContent 协议
+  - `__init__.py` — 工厂函数 `create_adapter()` + `detect_protocol()` URL 自动检测
+- **llm_client.py 重构**：`think()` 通过适配器调用，不再直接依赖特定 SDK
+
+### 三、代码审查修复（24 条）
+
+**CRITICAL（5 条安全/可用性修复）**：
+1. `guard.py` 正则重建 alternation 被粘连 → 提取 `_compile_words_re()` 统一编译，消除模块级与热更新的分叉
+2. `CommandHook.from_config` 全仓库不存在 → 补回类方法（含 `check_command_safety` 注册期安全预检）
+3. `filters`（sensitive_words / block_patterns）安全过滤器被整体删除 → 在 `_load_from_dict` 中恢复注册为 PythonHook
+4. `protocols/__init__.py` 顶层硬 import 三个适配器 → anthropic / gemini 改为 lazy import，未装依赖不影响启动
+5. `permission.py` 匹配语义收窄（`sudo shutdown` 从 DENY 降为 ASK）→ 正则增加 `\s` 边界
+
+**HIGH（5 条功能修复）**：
+6. `LLM_PROTOCOL` 环境变量对裸 env 配置不生效 → `_get_from_cfg` 增加 `LLM_{key}` fallback + `_apply_env_overrides` 用 `setdefault` 自动创建条目
+7. 流式路径无条件取 `adapter.last_usage` 导致过期 usage → 仅在非 None 时更新
+8. `config.json` 的 `llm.timeout` 对实际请求无效 → 保存 `_config_timeout`，纳入 `req_timeout` fallback 链
+9. `/hook reload` 无去重 → `_try_load_unified` 加载前 `_hooks.clear()`
+10. Gemini `chunk.text` 空 candidates 抛 ValueError → try/except + `last_chunk` 显式跟踪
+
+**MEDIUM（7 条重复/死代码/规范）**：
+11. 协议检测双份分叉实现 → 新增 `detect_protocol()` 唯一真相源
+12. system 消息提取逐行重复 → 上提为基类 `_split_system_messages()`
+13. `_extract_usage` 四份拷贝 → 删除 llm_client 孤儿 + gemini 死分支
+14. anthropic kwargs 构建重复 → 提取 `_build_kwargs()`
+15. 未使用代码清理：permission.py / guard.py 冗余 logging、`get_config_section()` 零调用、`first_word` 死代码
+16. `_get_from_cfg` 翻倍查找 → 局部变量收敛
+17. `_merge_consecutive_same_role` O(n²) 字符串拷贝 → parts 列表 + join，O(n)
+
 ## 2026-07-20 Hook 模块：事件驱动生命周期钩子系统
 
 **背景**：agent 执行流程封闭，扩展行为只能改源码。本次新增 Hook 模块，让用户在关键执行点插入自定义逻辑（审计/通知/改写/拦截），不改动 agent.py 主流程。

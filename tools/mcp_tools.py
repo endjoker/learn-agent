@@ -50,7 +50,7 @@ class MCPTool(BaseTool):
                 - name: str — 工具名称（已加 {server_name}/ 前缀，用于注册表和 LLM）
                 - description: str — 工具描述
                 - inputSchema: dict — 参数定义的 JSON Schema
-            trust: 是否受信任（来自 mcp_config.json 的服务器 trust 标志）。
+            trust: 是否受信任（来自 config.json 的 mcp.servers 中的 trust 标志）。
                    True 时 SecurityGate 直接放行，False 时每次调用需确认。
         """
         self.name = tool_desc["name"]

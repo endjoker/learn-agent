@@ -1,16 +1,13 @@
 ﻿"""
 LLM 客户端模块 —— 与各种大语言模型 API 通信的核心组件
 
-支持两类部署方式：
-  1. 云端 API（OpenAI、DeepSeek 等 OpenAI 兼容服务）
-  2. 本地模型（Ollama、LM Studio、vLLM、llama.cpp 等）
+支持三种协议（通过适配器自动选择）：
+  1. OpenAI Chat Completions（OpenAI / DeepSeek / Ollama / vLLM 等）
+  2. Anthropic Messages API（Claude 系列）
+  3. Gemini generateContent（Gemini 系列）
 
-通过 .env 配置：
-    LLM_TYPE=cloud              # cloud / local
-    LLM_MODEL_ID=deepseek-v4-flash
-    LLM_API_KEY=sk-xxx
-    LLM_BASE_URL=https://api.deepseek.com
-    LLM_CONTEXT_LENGTH=1048576  # 可选，自动检测时无需设置
+通过 config.json 的 llm section 配置：
+    model_id / timeout / models（各模型的 api_key、base_url、protocol 等）
 """
 
 import os
@@ -20,29 +17,9 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Optional
 
-from dotenv import load_dotenv
-from openai import OpenAI
+from .protocols import create_adapter
 
 logger = logging.getLogger('hello_agent')
-
-
-# ============================================================
-# 环境变量加载
-# ============================================================
-
-def _load_env_file():
-    """自动寻找项目根目录的 .env 文件"""
-    loaded = load_dotenv(verbose=False)
-    if loaded:
-        return
-    current_dir = Path(__file__).resolve().parent
-    for parent in [current_dir, current_dir.parent]:
-        env_path = parent / ".env"
-        if env_path.exists():
-            load_dotenv(env_path, verbose=False)
-            return
-
-_load_env_file()
 
 
 # ============================================================
@@ -218,40 +195,57 @@ class HelloAgentsLLM:
             context_length: 模型上下文窗口大小（token）
                      默认自动检测，环境变量 LLM_CONTEXT_LENGTH 可覆盖
         """
-        # ---- 获取模型名称 ----
-        self.model = model or os.getenv("LLM_MODEL_ID")
-        model_prefix = f"{self.model}_" if self.model else ""
+        # ---- 加载统一配置 ----
+        from .config_loader import load_config as _load_cfg
+        _cfg = _load_cfg()
+        _llm_cfg = _cfg.get("llm", {})
+        _models_cfg = _llm_cfg.get("models", {})
 
-        # ---- 读取 model-prefixed 参数（优先），后备通用变量 ----
-        def _get(key: str, default=None):
-            """先读 {model}_{key}，再读 {key}"""
-            return os.getenv(f"{model_prefix}{key}") or os.getenv(key) or default
+        # ---- 获取模型名称 ----
+        self.model = model or _llm_cfg.get("model_id") or os.getenv("LLM_MODEL_ID")
+        _model_cfg = _models_cfg.get(self.model, {}) if self.model else {}
+
+        # ---- 当前模型配置（优先从 config.json，fallback 到环境变量） ----
+        def _get_from_cfg(key: str, default=None):
+            """先从 config.json 当前模型取，再 fallback 到环境变量"""
+            cfg_key = key.lower()
+            val = _model_cfg.get(cfg_key)
+            if val is not None:
+                return val
+            # fallback: {model}_KEY > LLM_KEY > KEY
+            model_prefix = f"{self.model}_" if self.model else ""
+            return (os.getenv(f"{model_prefix}{key}")
+                    or os.getenv(f"LLM_{key}")
+                    or os.getenv(key)
+                    or default)
 
         # 提供者：用于本地模型判断
-        provider_name = provider or _get("PROVIDER", "")
+        provider_name = provider or _get_from_cfg("PROVIDER", "")
         self.provider = provider_name
 
         # ---- 判断模式 ----
         if provider_name:
             self.llm_type = "local"
         else:
-            self.llm_type = (llm_type or _get("TYPE") or "cloud").lower()
+            self.llm_type = (llm_type or _get_from_cfg("TYPE") or "cloud").lower()
 
-        # ---- base_url：传参 > {model}_BASE_URL > provider 默认 > LLM_BASE_URL ----
+        # ---- base_url：传参 > config > provider 默认 ----
+        cfg_base_url = _get_from_cfg("BASE_URL")
         if base_url:
             self.base_url = base_url
-        elif _get("BASE_URL"):
-            self.base_url = _get("BASE_URL")
+        elif cfg_base_url:
+            self.base_url = cfg_base_url
         elif provider_name and provider_name in LOCAL_PROVIDERS:
             self.base_url = LOCAL_PROVIDERS[provider_name]["base_url"]
         else:
             self.base_url = None
 
-        # ---- api_key：传参 > {model}_API_KEY > LLM_API_KEY > provider 默认 > 兜底 ----
+        # ---- api_key：传参 > config > provider 默认 > 兜底 ----
+        cfg_api_key = _get_from_cfg("API_KEY")
         if api_key is not None:
             api_key_value = api_key
-        elif _get("API_KEY"):
-            api_key_value = _get("API_KEY")
+        elif cfg_api_key:
+            api_key_value = cfg_api_key
         elif self.llm_type == "local" and provider_name in LOCAL_PROVIDERS:
             api_key_value = LOCAL_PROVIDERS[provider_name]["api_key"]
         elif self.llm_type == "local":
@@ -259,22 +253,51 @@ class HelloAgentsLLM:
         else:
             api_key_value = ""
 
-        # ---- 上下文长度：传参 > {model}_CONTEXT_LENGTH > 自动检测 ----
+        # ---- 上下文长度：传参 > config > 自动检测 ----
+        cfg_ctx_len = _get_from_cfg("CONTEXT_LENGTH")
         if context_length is not None:
             self.context_length = context_length
-        elif _get("CONTEXT_LENGTH"):
-            self.context_length = int(_get("CONTEXT_LENGTH"))
+        elif cfg_ctx_len:
+            try:
+                self.context_length = int(cfg_ctx_len)
+            except (ValueError, TypeError):
+                self.context_length = detect_context_length(self.model)
         else:
             self.context_length = detect_context_length(self.model)
 
         # ---- 超时 ----
-        timeout_value = timeout or int(os.getenv("LLM_TIMEOUT", "60"))
+        timeout_value = timeout
+        if not timeout_value:
+            timeout_value = _llm_cfg.get("timeout")
+        if not timeout_value:
+            timeout_value = int(os.getenv("LLM_TIMEOUT", "60"))
+        self._config_timeout = timeout_value
+
+        # ---- 检测协议（必须在参数校验之前，因为校验依赖协议类型） ----
+        # 优先级：config > {model}_PROTOCOL > LLM_PROTOCOL > base_url 自动检测 > openai
+        protocol = _get_from_cfg("PROTOCOL") or ""
+        if not protocol and self.base_url:
+            from .protocols import detect_protocol
+            protocol = detect_protocol(self.base_url)
+        if not protocol:
+            protocol = "openai"
+        self._protocol = protocol
+
+        # ---- 协议专用 API Key fallback ----
+        if not api_key_value and protocol == "anthropic":
+            api_key_value = os.getenv("ANTHROPIC_API_KEY", "")
+        elif not api_key_value and protocol == "gemini":
+            api_key_value = os.getenv("GEMINI_API_KEY", "")
 
         # ---- 参数校验 ----
+        # 注意：Anthropic / Gemini SDK 有默认端点，base_url 非必填
+        _requires_base_url = (protocol == "openai" and self.llm_type == "cloud"
+                              and not provider_name)
+
         missing = []
         if not self.model:
             missing.append("LLM_MODEL_ID（模型名称）")
-        if not self.base_url:
+        if not self.base_url and _requires_base_url:
             if provider_name and provider_name not in LOCAL_PROVIDERS:
                 missing.append(
                     f"LLM_BASE_URL 或有效的 LLM_PROVIDER\n"
@@ -285,7 +308,7 @@ class HelloAgentsLLM:
                 missing.append("LLM_BASE_URL（API服务地址）")
         if self.llm_type == "cloud" and not api_key_value:
             missing.append("LLM_API_KEY（云端模式必填，本地模式可忽略）")
-        if self.llm_type == "cloud" and not self.base_url:
+        if self.llm_type == "cloud" and not self.base_url and _requires_base_url:
             missing.append("LLM_BASE_URL（API服务地址）")
 
         if missing:
@@ -293,11 +316,13 @@ class HelloAgentsLLM:
                 "LLM 客户端初始化失败，缺少以下配置：\n"
                 + "\n".join(f"  - {m}" for m in missing)
                 + f"\n\n当前模式: {self.llm_type}"
+                + f"\n协议: {protocol}"
                 + (f"\n提供商: {provider_name}" if provider_name else "")
             )
 
-        # ---- 创建 OpenAI 客户端 ----
-        self.client = OpenAI(
+        # ---- 创建协议适配器 ----
+        self._adapter = create_adapter(
+            protocol=protocol,
             api_key=api_key_value,
             base_url=self.base_url,
             timeout=timeout_value,
@@ -305,24 +330,6 @@ class HelloAgentsLLM:
 
         # ---- 最后一次 API 调用的 token 用量（锚点） ----
         self.last_usage: Optional[Dict[str, int]] = None
-
-    @staticmethod
-    def _extract_usage(usage) -> Optional[Dict[str, int]]:
-        """
-        从 API 返回的 usage 对象中提取 token 数。
-
-        兼容两种字段命名：
-          - OpenAI 格式: prompt_tokens / completion_tokens
-          - DeepSeek 格式: input_tokens / output_tokens
-        """
-        if not usage:
-            return None
-        return {
-            "input_tokens": getattr(usage, "input_tokens", None)
-                            or getattr(usage, "prompt_tokens", 0) or 0,
-            "output_tokens": getattr(usage, "output_tokens", None)
-                             or getattr(usage, "completion_tokens", 0) or 0,
-        }
 
     # ============================================================
     # 核心方法：调用 LLM
@@ -409,39 +416,32 @@ class HelloAgentsLLM:
         for attempt in range(1, MAX_RETRIES + 1):
             use_stream = stream if attempt == 1 else False
 
-            # ---- 超时（参数优先，无则环境变量，默认 60s） ----
-            req_timeout = timeout or int(os.getenv("LLM_TIMEOUT", "60"))
+            # ---- 超时（参数 > 配置 > 环境变量 > 60s） ----
+            req_timeout = timeout or self._config_timeout or int(os.getenv("LLM_TIMEOUT", "60"))
 
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=temperature,
-                    stream=use_stream,
-                    timeout=req_timeout,
-                )
-
                 if use_stream:
                     collected = []
-                    for chunk in response:
-                        if chunk.usage:
-                            self.last_usage = self._extract_usage(chunk.usage)
-                        if not chunk.choices:
-                            continue
-                        content = chunk.choices[0].delta.content or ""
+                    for chunk in self._adapter.generate_stream(
+                        self.model, messages, temperature, req_timeout
+                    ):
                         if not silent:
-                            print(content, end="", flush=True)
-                        collected.append(content)
+                            print(chunk, end="", flush=True)
+                        collected.append(chunk)
+                    adapter_usage = self._adapter.last_usage
+                    if adapter_usage is not None:
+                        self.last_usage = adapter_usage
                     if not silent:
                         print()
                     return "".join(collected)
                 else:
-                    content = response.choices[0].message.content
-                    if response.usage:
-                        self.last_usage = self._extract_usage(response.usage)
+                    resp = self._adapter.generate(
+                        self.model, messages, temperature, req_timeout
+                    )
+                    self.last_usage = resp.usage
                     if stream and attempt > 1 and not silent:
-                        print(content)
-                    return content
+                        print(resp.text)
+                    return resp.text
 
             except Exception as e:
                 should_retry = self._is_retryable(e)
@@ -478,7 +478,8 @@ class HelloAgentsLLM:
     def __str__(self) -> str:
         mode = "本地" if self.llm_type == "local" else "云端"
         prov = f" [{self.provider}]" if self.provider else ""
-        return f"HelloAgentsLLM({mode}{prov}, model={self.model}, ctx={self.context_length})"
+        proto = f" [{self._protocol}]"
+        return f"HelloAgentsLLM({mode}{prov}{proto}, model={self.model}, ctx={self.context_length})"
 
     def __repr__(self) -> str:
         return f"<HelloAgentsLLM type={self.llm_type} model='{self.model}'>"
