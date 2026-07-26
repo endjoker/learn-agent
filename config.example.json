@@ -14,7 +14,7 @@
       },
       "ornith": {
         "api_key": "YOUR_API_KEY_HERE",
-        "base_url": "http://192.168.0.210:8080/v1",
+        "base_url": "http://localhost:8080/v1",
         "provider": "ollama",
         "context_length": 204800
       }
