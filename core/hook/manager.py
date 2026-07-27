@@ -128,7 +128,7 @@ class HookManager:
                 words = list(sensitive_words)
 
                 def _check_sensitive(ctx: HookContext) -> HookResult:
-                    prompt = ctx.data.get("prompt", "")
+                    prompt = ctx.payload.get("prompt", "")
                     for w in words:
                         if w in prompt:
                             return HookResult(Decision.BLOCK,
@@ -144,7 +144,7 @@ class HookManager:
                 patterns = list(block_patterns)
 
                 def _check_block_patterns(ctx: HookContext) -> HookResult:
-                    params_str = str(ctx.data.get("params", ""))
+                    params_str = str(ctx.payload.get("params", ""))
                     for pat in patterns:
                         if pat in params_str:
                             return HookResult(Decision.BLOCK,
