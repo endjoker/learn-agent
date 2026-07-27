@@ -20,7 +20,7 @@
 
   bash → ⚠️ 自动适配当前系统
       Linux/macOS → 使用 bash/sh，提示符 $
-      Windows     → 使用 cmd.exe，提示符 >
+      Windows     → 使用 PowerShell，提示符 >
       安装了 Git Bash / WSL 时也可运行 Linux 命令。
       工具会自动检测系统，智能提示命令替代方案。
 
@@ -701,7 +701,7 @@ class BashTool(BaseTool):
 
     【跨平台适配】
     自动检测当前操作系统，选择合适的 shell 执行命令：
-    - Windows  → cmd.exe（支持 dir、type、findstr 等原生命令）
+    - Windows  → PowerShell（支持单引号、管道、Unix 风格别名 ls/cat/cp/mv 等）
     - macOS    → zsh/bash（支持 ls、grep、find 等）
     - Linux    → bash/sh（同 macOS）
     - Git Bash → 可运行 Linux 命令（如果在 Windows 上安装了 Git Bash）
@@ -747,25 +747,27 @@ class BashTool(BaseTool):
     PROMPT_SYMBOL = ">" if IS_WINDOWS else "$"
 
     # Shell 名称（仅用于显示）
-    SHELL_NAME = "cmd.exe" if IS_WINDOWS else f"{Path(os.environ.get('SHELL', '/bin/bash')).name}"
+    SHELL_NAME = "PowerShell" if IS_WINDOWS else f"{Path(os.environ.get('SHELL', '/bin/bash')).name}"
 
     # ============ Linux → Windows 命令映射（用于错误提示） ============
+    # PowerShell 内置了大部分 Linux 命令别名（ls/cat/cp/mv/rm/pwd/mkdir），
+    # 仅少数命令需要提示替代写法。
 
     COMMAND_SUGGESTIONS = {
-        "ls":     {"win": "dir",     "desc": "列出目录内容"},
-        "pwd":    {"win": "cd",      "desc": "显示当前目录"},
-        "cat":    {"win": "type",    "desc": "查看文件内容"},
-        "cp":     {"win": "copy",    "desc": "复制文件"},
-        "mv":     {"win": "move",    "desc": "移动/重命名文件"},
-        "rm":     {"win": "del",     "desc": "删除文件"},
-        "find":   {"win": "dir /s",  "desc": "查找文件"},
-        "grep":   {"win": "findstr", "desc": "搜索文本"},
-        "touch":  {"win": "type nul >", "desc": "创建空文件"},
-        "mkdir":  {"win": "mkdir",   "desc": "创建目录（相同）"},
-        "clear":  {"win": "cls",     "desc": "清屏"},
-        "whoami": {"win": "whoami",  "desc": "当前用户名（相同）"},
-        "diff":   {"win": "fc",      "desc": "比较文件"},
-        "sort":   {"win": "sort",    "desc": "排序（相同）"},
+        "ls":     {"win": "ls (PowerShell 内置)",     "desc": "列出目录内容"},
+        "pwd":    {"win": "pwd (PowerShell 内置)",    "desc": "显示当前目录"},
+        "cat":    {"win": "cat (PowerShell 内置)",    "desc": "查看文件内容"},
+        "cp":     {"win": "cp (PowerShell 内置)",     "desc": "复制文件"},
+        "mv":     {"win": "mv (PowerShell 内置)",     "desc": "移动/重命名文件"},
+        "rm":     {"win": "rm (PowerShell 内置)",     "desc": "删除文件"},
+        "find":   {"win": "Get-ChildItem -Recurse",   "desc": "查找文件"},
+        "grep":   {"win": "Select-String",            "desc": "搜索文本"},
+        "touch":  {"win": "New-Item -ItemType File",  "desc": "创建空文件"},
+        "mkdir":  {"win": "mkdir",                    "desc": "创建目录（相同）"},
+        "clear":  {"win": "cls",                      "desc": "清屏"},
+        "whoami": {"win": "whoami",                   "desc": "当前用户名（相同）"},
+        "diff":   {"win": "Compare-Object",           "desc": "比较文件"},
+        "sort":   {"win": "Sort-Object",              "desc": "排序"},
     }
 
     # ============ 危险命令黑名单（从 guard.py 获取，唯一来源） ============
@@ -804,8 +806,8 @@ class BashTool(BaseTool):
         # --- 沙箱检查（如果注入） ---
         if self._sandbox:
             result = self._sandbox.run(
-                "cmd.exe" if self.IS_WINDOWS else "bash",
-                ["/c", command] if self.IS_WINDOWS else ["-c", command],
+                "powershell" if self.IS_WINDOWS else "bash",
+                ["-NoProfile", "-Command", command] if self.IS_WINDOWS else ["-c", command],
                 tool_name="bash",
             )
             if result.blocked:
@@ -820,16 +822,26 @@ class BashTool(BaseTool):
 
         try:
             # --- 执行命令 ---
-            # 注意：shell=True 在 Windows 上用 cmd.exe，在 Linux/Mac 上用 bash
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                encoding="utf-8",
-                errors="replace",
-            )
+            # Windows 用 PowerShell（单引号/管道/Unix 别名均正常），Linux/Mac 用 bash
+            if self.IS_WINDOWS:
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", command],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            else:
+                result = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    encoding="utf-8",
+                    errors="replace",
+                )
 
             return self._format_output(command, result.stdout, result.stderr, result.returncode, cmd_name)
 
@@ -1273,7 +1285,11 @@ class PythonTool(BaseTool):
         if self._sandbox:
             is_safe, reason = self._sandbox.check_python(code)
             if not is_safe:
-                return f"⛔ 沙箱拦截: {reason}"
+                return (
+                    f"⛔ {reason}\n"
+                    f"   python 工具禁止导入系统模块（os/subprocess/socket 等）和调用 eval/exec/open。\n"
+                    f"   如需执行系统操作（文件管理、运行命令等），请改用 bash 工具。"
+                )
 
         import subprocess
         try:

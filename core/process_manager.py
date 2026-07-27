@@ -32,7 +32,7 @@ _CHUNK = 65536
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
-    """杀整个进程树（cmd.exe /c python 时，杀 cmd.exe 会留下 python 孤儿，
+    """杀整个进程树（shell 包装层启动 python 时，杀 shell 会留下 python 孤儿，
     其仍持有管道 → drain 线程阻塞。必须杀树让子进程退出、管道关闭）。"""
     try:
         if _IS_WINDOWS:
@@ -150,7 +150,7 @@ class ProcessManager:
 
         # Popen 包装 shell（与 BashTool 一致；L2 已查 command 原串）
         # CREATE_NEW_PROCESS_GROUP / start_new_session：便于 _kill_tree 杀整树
-        shell = ["cmd.exe", "/c", command] if _IS_WINDOWS else ["bash", "-c", command]
+        shell = ["powershell", "-NoProfile", "-Command", command] if _IS_WINDOWS else ["bash", "-c", command]
         kwargs = dict(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
