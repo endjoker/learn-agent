@@ -122,6 +122,14 @@ def _normalize_tags(text: str) -> str:
         r"FINAL_ANSWER：\1",
         text, flags=re.DOTALL | re.IGNORECASE,
     )
+    # XML 风格工具调用: <tool-name>json</tool-name> → ACTION + INPUT
+    # 标准标签（THOUGHT/ACTION/INPUT/FINAL_ANSWER）已在上面处理，
+    # 剩余的 XML 标签视为工具名（如 <web-search/search>{...}</web-search/search>）
+    text = re.sub(
+        r"<\s*([\w\-/.]+)\s*>\s*(.*?)\s*<\s*/\s*\1\s*>",
+        r"ACTION：\1\nINPUT：\2",
+        text, flags=re.DOTALL,
+    )
     return text.strip()
 def parse_react_response(response: str) -> dict:
     """
@@ -196,11 +204,16 @@ class Agent:
         sandbox: SandboxExecutor = None,  # 沙箱执行器（可选）
         process_manager = None,           # 长驻子进程管理器（可选）
         hooks_enabled: bool = True,       # Hook 模块（事件驱动自定义扩展）
+        non_interactive: bool = False,    # 非交互模式（gateway 等无 TTY 场景）
+        quiet: bool = False,              # 静默模式（LLM 不流式打印到 stdout）
     ):
         self.name = name
         self.llm = llm
         self.tool_registry = tool_registry
         self.max_steps = max_steps
+        self.non_interactive = non_interactive
+        self.quiet = quiet
+        self.auto_approve_plan = True  # 非交互模式下自动批准 PLAN
         # 上下文预算阈值：0 时取模型上下文长度的一半（留一半给输出）
         if max_history_tokens == 0:
             self.max_history_tokens = max(llm.context_length // 2, 4096)
@@ -410,7 +423,10 @@ class Agent:
         print(f"  ─────────────────────────────")
         print(f"  Y = 确认执行")
         print(f"  N = 拒绝方案，继续讨论")
-        choice = input(f"  确认执行？[Y/n] ").strip().lower()
+        if self.non_interactive:
+            choice = "y" if self.auto_approve_plan else "n"
+        else:
+            choice = input(f"  确认执行？[Y/n] ").strip().lower()
         if choice in ("", "y", "yes", "是"):
             self._task_list = TaskList.from_plan_text(plan_text)
             if not self._task_list.tasks:
@@ -423,6 +439,26 @@ class Agent:
         else:
             print(f"  ⏭️  已取消，可继续讨论或输入 /plan 重新规划")
             return False
+
+    def _ask_user(self, tool_name: str, params: dict) -> str:
+        """
+        工具权限确认统一入口。
+        交互模式：显示操作详情，等待用户输入 A/Y/N/S。
+        非交互模式：自动返回 "y"（允许），不阻塞。
+        """
+        if self.non_interactive:
+            return "y"
+        # 交互模式：原有逻辑
+        print(f"\n  ❓ 需要确认: {tool_name}")
+        for k, v in params.items():
+            v_str = str(v)[:120]
+            print(f"     {k}: {v_str}")
+        print(f"  ─────────────────────────────")
+        print(f"  A = 本次会话工作区内全部放行")
+        print(f"  Y = 允许本次操作")
+        print(f"  N = 拒绝本次操作")
+        print(f"  S = 跳过本次操作")
+        return input(f"  请选择 [A/Y/N/S] (默认Y) ").strip().lower()
 
     def clear_history(self):
         """清空对话历史，但保留系统提示词"""
@@ -820,6 +856,8 @@ class Agent:
             print(f"{'='*55}")
             print(f"  👤 {user_input}")
 
+        format_retry = 0  # 格式纠正重试计数（防无限循环）
+
         for step in range(1, max_steps + 1):
 
             if verbose:
@@ -987,16 +1025,7 @@ class Agent:
                                 print(f"  ⛔ hook 拦截 {tool_name}: {nhr.reason}")
                             continue
                         # 显示要执行的操作，等待用户确认
-                        print(f"\n  ❓ 需要确认: {tool_name}")
-                        for k, v in params.items():
-                            v_str = str(v)[:120]
-                            print(f"     {k}: {v_str}")
-                        print(f"  ─────────────────────────────")
-                        print(f"  A = 本次会话工作区内全部放行")
-                        print(f"  Y = 允许本次操作")
-                        print(f"  N = 拒绝本次操作")
-                        print(f"  S = 跳过本次操作")
-                        prompt_text = input(f"  请选择 [A/Y/N/S] (默认Y) ").strip().lower()
+                        prompt_text = self._ask_user(tool_name, params)
                         if prompt_text == "a":
                             # 工作区全放行
                             self.permission.allow_workspace()
@@ -1104,6 +1133,30 @@ class Agent:
                 })
             else:
                 log_info("→ 走 ELSE 分支（无 Action 无 FinalAnswer）")
+
+                # ---- 格式纠正：回复含代码块但没用工具调用格式 → 提醒一次 ----
+                if format_retry < 1 and re.search(r"```(?:python|bash|shell|sh)\b", response):
+                    format_retry += 1
+                    if verbose:
+                        print(f"  ⚠️  检测到代码块但未使用工具格式，提醒 LLM 纠正（{format_retry}/1）")
+                    self.messages.append({"role": "assistant", "content": response})
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "你的回复中包含代码但没有使用工具调用。\n"
+                            "如需执行代码，请严格使用以下格式：\n"
+                            "THOUGHT: 你的思考\n"
+                            "ACTION: python\n"
+                            'ACTION_INPUT: {"code": "你的代码"}\n'
+                            "如需执行 Shell 命令：\n"
+                            "ACTION: bash\n"
+                            'ACTION_INPUT: {"command": "你的命令"}\n'
+                            "如这确实是最终回答（不需要执行），请输出：\n"
+                            "FINAL_ANSWER: 你的回答"
+                        ),
+                    })
+                    continue
+
                 if verbose:
                     print(f"  💬 直接回复（无标签）")
                 # 无标签时仍将 LLM 回复作为最终答案返回
@@ -1245,11 +1298,7 @@ class Agent:
                             if verbose:
                                 print(f"  ⛔ {tool_name}: {reason}")
                         elif level == ASK:
-                            if verbose:
-                                print(f"\n  ❓ 需要确认: {tool_name}")
-                                for k, v in params.items():
-                                    print(f"     {k}: {str(v)[:120]}")
-                            choice = input(f"  请选择 [A/Y/N/S] (默认Y) ").strip().lower()
+                            choice = self._ask_user(tool_name, params)
                             if choice == "a":
                                 self.permission.allow_workspace()
                                 checked_acts.append(a)
@@ -1455,6 +1504,8 @@ def create_agent(
     sandbox: bool = True,       # 沙箱执行器
     hooks: bool = True,         # Hook 模块（事件驱动自定义扩展）
     mcp_servers: list = None,    # MCP 服务器配置列表（可选）
+    non_interactive: bool = False,  # 非交互模式（gateway 等无 TTY 场景）
+    quiet: bool = False,            # 静默模式（LLM 不流式打印到 stdout）
 ) -> Agent:
     """
     一行创建 Agent（含 read/write/edit/grep/glob/bash + search/web_fetch）
@@ -1479,6 +1530,12 @@ def create_agent(
     setup_logging(debug=debug)
     if debug:
         set_debug(True)
+    # 工作目录：从配置读取，chdir 到该目录（所有模式统一生效）
+    from core.config_loader import load_config as _lc
+    _ws = _lc().get("permission", {}).get("workspace", "./workspace")
+    _ws_path = os.path.abspath(_ws)
+    os.makedirs(_ws_path, exist_ok=True)
+    os.chdir(_ws_path)
     llm = HelloAgentsLLM(model=model, api_key=api_key, base_url=base_url, provider=provider)
     # 记忆系统（跨会话）
     memory_manager = MemoryManager() if memory else None
@@ -1513,6 +1570,8 @@ def create_agent(
         process_manager=process_manager,
         mcp_servers=mcp_servers,
         hooks_enabled=hooks,
+        non_interactive=non_interactive,
+        quiet=quiet,
     )
     # Hook: 绑定 agent 身份，触发 session_start
     agent.hooks.bind_agent(agent.name, agent.store.session_id)
@@ -2087,9 +2146,13 @@ if __name__ == "__main__":
         "  --debug            开启调试日志\n"
         "  --resume <id>      恢复指定会话\n"
         "  --resume last      恢复最新会话\n"
+        "  init               运行交互式初始化向导（配置 LLM/MCP/hooks）\n"
+        "  gateway            启动 gateway 服务（飞书/微信消息网关）\n"
         "\n"
         "示例:\n"
         "  python agent.py                    启动交互模式\n"
+        "  python agent.py init               交互式初始化配置\n"
+        "  python agent.py gateway             启动消息网关服务\n"
         "  python agent.py --debug            启动交互模式（带调试）\n"
         "  python agent.py --resume a7f3e2c9  恢复指定会话\n"
         "  python agent.py --resume last      恢复最新会话\n"
@@ -2127,6 +2190,13 @@ if __name__ == "__main__":
                         sys.exit(1)
                 else:
                     resume_id = raw
+    # ---- gateway 子命令（需在 flag 检查前拦截，gateway 自带 --port/--dry-run 等参数）----
+    non_flag_args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if non_flag_args and non_flag_args[0] == "gateway":
+        gw_idx = sys.argv.index("gateway")
+        gw_args = sys.argv[gw_idx + 1:]  # gateway 后的所有参数
+        from gateway.cli import main as gateway_main
+        sys.exit(gateway_main(gw_args, debug_mode))
     # ---- 检查非法参数 ----
     unknown_flags = [a for a in sys.argv[1:]
                      if a.startswith("-")
@@ -2140,6 +2210,14 @@ if __name__ == "__main__":
     query_args = [a for a in sys.argv[1:]
                   if not a.startswith("-")
                   and a not in skip_args]
+    # ---- init 子命令：交互式初始化向导（不创建 Agent，直接读写 config.json）----
+    if query_args and query_args[0] == "init":
+        if len(query_args) > 1:
+            print(f"❌ init 子命令不接受额外参数: {' '.join(query_args[1:])}\n")
+            print(USAGE)
+            sys.exit(1)
+        from core.init_wizard import run_init_wizard
+        sys.exit(run_init_wizard())
     if query_args:
         query = " ".join(query_args)
         agent = create_agent(debug=debug_mode)
