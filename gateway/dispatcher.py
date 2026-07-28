@@ -191,12 +191,14 @@ class Dispatcher:
 
         if cmd == "/stats":
             stats = agent.store.stats()
+            ratio = stats.get("usage_ratio", 0) * 100
             return (
                 f"📊 上下文统计\n"
-                f"  模型: {stats.get('model', '?')}\n"
-                f"  消息数: {stats.get('message_count', 0)}\n"
-                f"  估算 token: {stats.get('estimated_tokens', 0)}\n"
-                f"  上限: {stats.get('max_tokens', 0)}"
+                f"  模型: {agent.llm.model}\n"
+                f"  消息数: {stats.get('total_messages', 0)}\n"
+                f"  已用 token: {stats.get('total_tokens', 0)}\n"
+                f"  上限: {stats.get('max_tokens', 0)}\n"
+                f"  使用率: {ratio:.1f}%"
             )
 
         if cmd == "/model":
