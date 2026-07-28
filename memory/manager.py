@@ -35,8 +35,12 @@ def _tokenize(text: str) -> List[str]:
 class MemoryManager:
     """跨会话记忆管理器"""
 
-    def __init__(self, memory_dir: str = "memory"):
-        self._memory_dir = Path(memory_dir).resolve()
+    def __init__(self, memory_dir: str = ""):
+        if memory_dir:
+            self._memory_dir = Path(memory_dir).resolve()
+        else:
+            # 基于源文件定位，不受 os.chdir 影响
+            self._memory_dir = Path(__file__).resolve().parent
         self._daily_dir = self._memory_dir / "daily"
         self._index_path = self._daily_dir / "index.json"
         self._config_path = self._memory_dir / "config.json"

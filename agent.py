@@ -513,6 +513,15 @@ class Agent:
         mcp_descs = self.tool_registry.get_mcp_tool_descriptions()
         builder = self.system_prompt_builder or SystemPrompt(name=self.name)
         builder.set_project_root(os.getcwd())
+        # 设置工作区路径（从 config 读取，解析为绝对路径）
+        try:
+            from core.config_loader import load_config
+            from pathlib import Path as _Path
+            _cfg = load_config()
+            _ws = _cfg.get("permission", {}).get("workspace", "./workspace")
+            builder.set_workspace(str(_Path(_ws).resolve()))
+        except Exception:
+            builder.set_workspace(os.getcwd())
         return builder.build(tool_descs=tool_descs, skill_descs=skill_descs, mcp_descs=mcp_descs)
 
     # ============================================================

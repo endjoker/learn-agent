@@ -250,11 +250,51 @@ SAFE_PATTERNS = [
 ]
 
 # ================================================================
-# Python 代码 AST 检查
+# Python 代码 AST 检查（配置化）
 # ================================================================
 
-FORBIDDEN_IMPORTS = {"os", "subprocess", "ctypes", "socket", "sys", "pathlib", "shutil"}
-FORBIDDEN_CALLS = {"eval", "exec", "compile", "__import__", "open"}
+# 硬编码兜底默认值（config.json 不可用时使用）
+_DEFAULT_FORBIDDEN_IMPORTS = {"subprocess", "ctypes", "socket"}
+_DEFAULT_FORBIDDEN_CALLS = {"eval", "exec", "__import__"}
+_DEFAULT_FORBIDDEN_QUALIFIED = {
+    "os.system", "os.popen",
+    "os.execv", "os.execve", "os.execvp", "os.execvpe",
+    "os.remove", "os.unlink", "os.rmdir",
+    "os.kill", "os.killpg",
+    "shutil.rmtree",
+}
+
+# 运行时缓存（load_config 只读一次）
+_python_rules: dict | None = None
+
+
+def _get_python_rules() -> dict:
+    """从 config.json 读取 python 安全规则，失败则用默认值"""
+    global _python_rules
+    if _python_rules is not None:
+        return _python_rules
+    try:
+        from core.config_loader import load_config
+        cfg = load_config()
+        rules = cfg.get("sandbox", {}).get("python", {})
+        _python_rules = {
+            "forbidden_imports": set(rules.get("forbidden_imports", list(_DEFAULT_FORBIDDEN_IMPORTS))),
+            "forbidden_calls": set(rules.get("forbidden_calls", list(_DEFAULT_FORBIDDEN_CALLS))),
+            "forbidden_qualified": set(rules.get("forbidden_qualified_calls", list(_DEFAULT_FORBIDDEN_QUALIFIED))),
+        }
+    except Exception:
+        _python_rules = {
+            "forbidden_imports": _DEFAULT_FORBIDDEN_IMPORTS,
+            "forbidden_calls": _DEFAULT_FORBIDDEN_CALLS,
+            "forbidden_qualified": _DEFAULT_FORBIDDEN_QUALIFIED,
+        }
+    return _python_rules
+
+
+def reload_python_rules():
+    """清除缓存，下次 check 时重新读 config"""
+    global _python_rules
+    _python_rules = None
 
 
 def _top_module(dotted: str | None) -> str:
@@ -264,9 +304,22 @@ def _top_module(dotted: str | None) -> str:
     return dotted.split(".")[0]
 
 
+def _qualified_name(node: ast.Call) -> str | None:
+    """提取调用的限定名（如 os.system），用于 forbidden_qualified 匹配。"""
+    func = node.func
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return f"{func.value.id}.{func.attr}"
+    return None
+
+
 def check_python_code(code: str) -> tuple[bool, str]:
     """
-    AST 级 Python 代码安全检查
+    AST 级 Python 代码安全检查（规则从 config.json 的 sandbox.python 段读取）
+
+    检查三类：
+      1. forbidden_imports — 整个模块禁止导入
+      2. forbidden_calls — 裸函数调用禁止（如 eval()）
+      3. forbidden_qualified_calls — 限定调用禁止（如 os.system()）
 
     返回:
         (is_safe, reason_or_None)
@@ -276,20 +329,30 @@ def check_python_code(code: str) -> tuple[bool, str]:
     except SyntaxError as e:
         return False, f"Python 语法错误: {e}"
 
+    rules = _get_python_rules()
+    forbidden_imports = rules["forbidden_imports"]
+    forbidden_calls = rules["forbidden_calls"]
+    forbidden_qualified = rules["forbidden_qualified"]
+
     for node in ast.walk(tree):
         # import os / import os.path → 禁止（按顶层模块判断）
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if _top_module(alias.name) in FORBIDDEN_IMPORTS:
+                if _top_module(alias.name) in forbidden_imports:
                     return False, f"Python 安全: 禁止导入模块 '{alias.name}'"
-        # from os import * / from os.path import join → 禁止（按顶层模块判断）
+        # from os import * / from subprocess import run → 禁止（按顶层模块判断）
         if isinstance(node, ast.ImportFrom):
-            if _top_module(node.module) in FORBIDDEN_IMPORTS:
+            if _top_module(node.module) in forbidden_imports:
                 return False, f"Python 安全: 禁止导入模块 '{node.module}'"
-        # eval() / exec() → 禁止
+        # 函数调用检查
         if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name) and node.func.id in FORBIDDEN_CALLS:
+            # 裸调用：eval() / exec()
+            if isinstance(node.func, ast.Name) and node.func.id in forbidden_calls:
                 return False, f"Python 安全: 禁止调用 '{node.func.id}'"
+            # 限定调用：os.system() / shutil.rmtree()
+            qname = _qualified_name(node)
+            if qname and qname in forbidden_qualified:
+                return False, f"Python 安全: 禁止调用 '{qname}'"
 
     return True, ""
 

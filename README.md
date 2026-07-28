@@ -23,7 +23,7 @@
 | **web_fetch** | 读取网页正文 | 提取文章/新闻的纯文本内容 |
 | **calculate** | 数学计算 | 安全执行表达式，支持 sqrt/sin 等 |
 | **datetime** | 时间日期 | 获取当前日期、时间、星期 |
-| **notes** | 笔记/记忆 | 跨对话记住关键信息 |
+| **notes** | 临时键值暂存 | 当前会话内的临时上下文（重启后丢失） |
 | **file_mgr** | 文件管理 | 复制/移动/删除/创建目录 |
 | **python** | 执行 Python 代码 | 运行代码片段并返回输出 |
 | **http** | HTTP 请求 | GET/POST，支持外部 API 调用 |
@@ -186,6 +186,12 @@ hello-agent/
 ├── config.example.json      # 配置模板（含全部 section 示例）
 ├── requirements.txt         # Python 依赖列表
 ├── .gitignore               # Git 忽略规则
+│
+├── prompt/                  # 提示词引导文件（OpenClaw 风格，统一管理）
+│   ├── AGENT.md             # 项目概述 + 行为约束 + 工作区目录约定
+│   ├── SOUL.md              # 人格/语气定义
+│   ├── TOOLS.md             # 工具使用规则（静态部分，动态描述代码拼接）
+│   └── MEMORY.md            # 精选长记忆（索引模式，指向 workspace/ref/）
 │
 ├── core/                    # 核心组件
 │   ├── __init__.py

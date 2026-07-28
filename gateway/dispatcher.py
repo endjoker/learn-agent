@@ -104,9 +104,15 @@ class Dispatcher:
             entry.is_busy = True
             entry.last_active = time.time()
             try:
+                t0 = time.time()
                 reply = await self._execute_agent(entry, msg, channel)
+                elapsed = time.time() - t0
                 if reply:
                     reply = _strip_react_tags(reply)
+                    # 附加 meta 信息供 channel 格式化使用
+                    a = entry.agent
+                    model = a.llm.model if a and a.llm else ""
+                    msg._reply_meta = {"model": model, "elapsed": elapsed}
                     await self._send_chunked(channel, msg, reply)
             except Exception as e:
                 logger.error("处理消息异常 [%s]: %s", msg.session_key, e, exc_info=True)
@@ -147,23 +153,24 @@ class Dispatcher:
         cmd_reply = await self._handle_gateway_command(agent, msg.text, loop, executor)
         if cmd_reply is not None:
             return cmd_reply
-        # soft timeout：先发"还在处理"提示
+
+        # ---- agent.run() 含 soft/hard 超时 ----
+        # 注意：必须保存 afuture 引用，软超时后继续等同一个 future
+        # 而不能起第二次 agent.run()——线程池里的旧调用不会因 asyncio 取消而停止
+        afuture = loop.run_in_executor(executor, agent.run, msg.text, False)
         try:
             result = await asyncio.wait_for(
-                loop.run_in_executor(executor, agent.run, msg.text, False),
-                timeout=self._soft_timeout,
+                asyncio.shield(afuture), timeout=self._soft_timeout,
             )
             return result
         except asyncio.TimeoutError:
-            # 超时但继续等 hard timeout
             try:
                 await channel.send_reply(msg, "⏳ 还在处理中，请稍候…")
             except Exception:
                 pass
             try:
                 result = await asyncio.wait_for(
-                    loop.run_in_executor(executor, agent.run, msg.text, False),
-                    timeout=self._hard_timeout - self._soft_timeout,
+                    afuture, timeout=self._hard_timeout - self._soft_timeout,
                 )
                 return result
             except asyncio.TimeoutError:
@@ -210,7 +217,7 @@ class Dispatcher:
                 )
                 return f"✅ 已切换到模型: {arg}"
             except Exception as e:
-                return f"❌ 切换失败: {e}"
+                return f"❌ 切换到 {arg} 失败: {e}\n请检查 config.json 的 llm.models 中是否有该模型的配置（api_key / base_url）"
 
         if cmd == "/session":
             sid = agent.store.session_id
@@ -232,8 +239,11 @@ class Dispatcher:
         return None
 
     async def _send_chunked(self, channel: Channel, msg: InboundMessage, text: str):
-        """分片发送长文本"""
-        max_len = 3500 if msg.channel == "feishu" else 1500
-        chunks = split_text(text, max_len)
-        for chunk in chunks:
-            await channel.send_reply(msg, chunk)
+        """分片发送长文本。平台内部自行分片的 channel 跳过预切。"""
+        if channel.handles_chunking:
+            await channel.send_reply(msg, text)
+        else:
+            max_len = 1500
+            chunks = split_text(text, max_len)
+            for chunk in chunks:
+                await channel.send_reply(msg, chunk)

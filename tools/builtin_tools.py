@@ -831,6 +831,7 @@ class BashTool(BaseTool):
                     timeout=timeout,
                     encoding="utf-8",
                     errors="replace",
+                    stdin=subprocess.DEVNULL,
                 )
             else:
                 result = subprocess.run(
@@ -841,6 +842,7 @@ class BashTool(BaseTool):
                     timeout=timeout,
                     encoding="utf-8",
                     errors="replace",
+                    stdin=subprocess.DEVNULL,
                 )
 
             return self._format_output(command, result.stdout, result.stderr, result.returncode, cmd_name)
@@ -1052,14 +1054,18 @@ class DateTimeTool(BaseTool):
 
 class NoteTool(BaseTool):
     """
-    笔记工具 —— 在对话间记住关键信息
+    临时笔记工具 —— 当前会话内的键值暂存
 
-    可以保存笔记（save）、读取笔记（read）、列出笔记（list）、
-    删除笔记（delete）。笔记存储在内存中，重启后丢失。
+    数据仅保存在内存中，agent 重启后全部丢失。
+    适合存临时上下文（如"用户本次要求的输出格式"），不适合存持久信息。
     """
 
     name: str = "notes"
-    description: str = "存储和检索笔记/记忆。当需要记住用户的关键信息（如名字、偏好、项目信息），或在后续对话中回忆之前说过的内容时使用。操作：save 保存、read 读取、list 列出、delete 删除。"
+    description: str = (
+        "临时键值暂存（仅当前会话有效，重启后丢失）。"
+        "适合保存本次对话中的临时上下文，如用户临时指定的格式要求、中间变量等。"
+        "操作：save 保存、read 读取、list 列出所有、delete 删除。"
+    )
     parameters: dict = {
         "type": "object",
         "properties": {
@@ -1297,6 +1303,7 @@ class PythonTool(BaseTool):
                 [sys.executable, "-c", code],
                 capture_output=True, text=True,
                 timeout=15, encoding="utf-8", errors="replace",
+                stdin=subprocess.DEVNULL,
             )
             parts = [f"🐍 Python 执行（退出码 {result.returncode}）"]
             if result.stdout:

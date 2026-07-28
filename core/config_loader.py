@@ -33,7 +33,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "models": {},
     },
     "permission": {
-        "workspace": ".",
+        "workspace": "./workspace",
         "default_mode": "ask",
         "tool_rules": {
             # 注：只列出有固定权限的工具。bash/read/write/edit/glob/file_mgr
@@ -117,6 +117,43 @@ _DEFAULT_CONFIG: dict[str, Any] = {
                 "*.gq", "*.top", "*.loan", "*.date", "*.men",
             ],
             "blocked_ips": ["10.0.0.0/8", "172.16.0.0/12"],
+        },
+    },
+    "gateway": {
+        "enabled": True,
+        "host": "127.0.0.1",
+        "port": 9120,
+        "worker_pool_size": 4,
+        "agent": {
+            "model": "",
+            "max_steps": 30,
+            "permission_mode": "allow",
+            "auto_approve_plan": True,
+            "quiet": True,
+        },
+        "sessions": {
+            "max_sessions": 50,
+            "idle_timeout_minutes": 60,
+            "persist": True,
+            "soft_timeout_seconds": 90,
+            "hard_timeout_seconds": 600,
+        },
+        "channels": {
+            "debug": {"enabled": True},
+            "feishu": {
+                "enabled": False,
+                "mode": "websocket",
+                "app_id": "",
+                "app_secret": "",
+                "encrypt_key": "",
+                "verification_token": "",
+            },
+            "weixin": {
+                "enabled": False,
+                "credentials_file": "gateway/creds/weixin.json",
+                "allow_from": [],
+                "reply_format": "markdown",
+            },
         },
     },
 }

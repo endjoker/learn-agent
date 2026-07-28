@@ -30,8 +30,12 @@ _VALID_NAME_RE = re.compile(r"^[a-zA-Z0-9\-_]+$")
 class SkillManager:
     """技能管理器：扫描 / 创建 / 删除 / 更新 SKILLS 目录下的技能"""
 
-    def __init__(self, skills_dir: str = "SKILLS"):
-        self._skills_dir = Path(skills_dir).resolve()
+    def __init__(self, skills_dir: str = ""):
+        if skills_dir:
+            self._skills_dir = Path(skills_dir).resolve()
+        else:
+            # 基于项目根目录定位，不受 os.chdir 影响
+            self._skills_dir = Path(__file__).resolve().parent.parent / "SKILLS"
         self._skills: dict[str, Skill] = {}
 
     # ============================================================

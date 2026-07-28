@@ -1,5 +1,40 @@
 # 更新日志
 
+## 2026-07-29 提示词架构 v3 + 代码审查修复 + Python 安全配置化 + 防卡死
+
+**提示词架构 v3（对标 OpenClaw）**：
+- 新建 `prompt/` 目录，4 个引导文件集中管理：`AGENT.md`（行为约束）、`SOUL.md`（人格语气）、`TOOLS.md`（工具规则，仅静态）、`MEMORY.md`（索引模式长记忆）
+- `system_prompt.py` 全面重写：从 `prompt/` 读取引导文件，代码内嵌默认值 fallback；新增引导文件说明段落、截断上限（单文件 8K / 累计 32K 字符）、缓存边界日志
+- 迁移 `memory/memory.md` → `prompt/MEMORY.md`（旧文件删除）；迁移根目录 `AGENT.md` → `prompt/AGENT.md`
+- 工作区分层：`workspace/` 新增 `ref/`/`scripts/`/`downloads/`/`tmp/`/`output/` 子目录约定
+- `config.json` 新增 `prompt`（截断配置）和 `workspace`（路径+子目录）配置段
+- 修复 `_build_system_prompt` 未设置 workspace 路径导致系统提示词声明项目根而非工作区
+
+**代码审查修复（7 项）**：
+- `gateway/dispatcher.py`：修复 `agent.run()` 软超时后双重执行竞态（改用 `asyncio.shield` 保护同一 future）
+- `gateway/agent_factory.py`：修复 `_save_map` 无锁读写竞争（加 `threading.Lock`）
+- `core/llm_client.py`：修复不可达的提供商错误分支（从 `_requires_base_url` 条件内拆出）
+- `gateway/dispatcher.py`：去掉硬编码 `"feishu"` 魔法字符串（Channel 基类加 `handles_chunking` 属性）
+- `gateway/dispatcher.py`：`entry.agent.llm.model` 增加 `llm` None 保护
+- `core/system_prompt.py`：section 数量"五个"→"六个"
+- `gateway/server.py`：消除每次构造 3 次 `load_config()` 冗余调用
+
+**Python 安全配置化 + 放宽**：
+- `FORBIDDEN_IMPORTS`/`FORBIDDEN_CALLS` 从 guard.py 硬编码移至 `config.json` 的 `sandbox.python` 段，用户可按需调整
+- 默认值放宽：`forbidden_imports` 从 7 个减至 3 个（subprocess/ctypes/socket），移除 os/sys/pathlib/shutil 整体禁止
+- `forbidden_calls` 从 5 个减至 3 个（eval/exec/__import__），移除 open/compile
+- 新增 `forbidden_qualified_calls`（函数级精确拦截）：os.system/os.remove/shutil.rmtree 等 11 个危险调用
+- 效果：`import os`/`import pathlib`/`open()` 现在可用，`os.system()` 等仍被拦截
+
+**防命令卡死**：
+- BashTool / SandboxExecutor / PythonTool 的 subprocess 调用全部加 `stdin=subprocess.DEVNULL`
+- 任何等待交互输入的命令（SSH 密码、sudo 提示、确认对话框等）立即拿到 EOF，不再卡住
+- ProcessManager 保持 `stdin=PIPE`（交互式场景需要）
+
+**其他**：
+- `notes` 工具描述修正：明确为"临时键值暂存（仅当前会话有效，重启后丢失）"，与 MEMORY.md 的持久存储流程不再冲突
+- `.gitignore` 补充 `memory/config.json` 规则
+
 ## 2026-07-27 统一配置 + 多协议适配层 + 代码审查全量修复
 
 **背景**：对本轮全部改动（config 统一重构 + 三协议 LLM 适配层，12 个修改文件 + 6 个新文件，约 2400 行）进行 8 角度代码审查，确认 24 条发现（5 CRITICAL / 7 HIGH / 7 MEDIUM / 5 LOW），全部修复。

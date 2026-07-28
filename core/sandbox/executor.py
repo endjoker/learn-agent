@@ -306,6 +306,7 @@ class SandboxExecutor:
                 [command] + (args or []),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
                 cwd=cwd or str(self._workspace),
                 env=sanitize_env(env or os.environ.copy()),
             )

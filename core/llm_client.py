@@ -1,4 +1,4 @@
-﻿"""
+"""
 LLM 客户端模块 —— 与各种大语言模型 API 通信的核心组件
 
 支持三种协议（通过适配器自动选择）：
@@ -291,24 +291,21 @@ class HelloAgentsLLM:
 
         # ---- 参数校验 ----
         # 注意：Anthropic / Gemini SDK 有默认端点，base_url 非必填
-        _requires_base_url = (protocol == "openai" and self.llm_type == "cloud"
-                              and not provider_name)
+        _need_base_url = (protocol == "openai" and self.llm_type == "cloud"
+                          and not provider_name)
 
         missing = []
         if not self.model:
             missing.append("LLM_MODEL_ID（模型名称）")
-        if not self.base_url and _requires_base_url:
-            if provider_name and provider_name not in LOCAL_PROVIDERS:
-                missing.append(
-                    f"LLM_BASE_URL 或有效的 LLM_PROVIDER\n"
-                    f"   提供商 '{provider_name}' 不在支持列表中\n"
-                    f"   支持: {', '.join(LOCAL_PROVIDERS.keys())}"
-                )
-            else:
-                missing.append("LLM_BASE_URL（API服务地址）")
         if self.llm_type == "cloud" and not api_key_value:
             missing.append("LLM_API_KEY（云端模式必填，本地模式可忽略）")
-        if self.llm_type == "cloud" and not self.base_url and _requires_base_url:
+        # 提供商检查（独立于 _need_base_url，之前嵌在条件内永不可达）
+        if provider_name and provider_name not in LOCAL_PROVIDERS:
+            missing.append(
+                f"LLM_PROVIDER: '{provider_name}' 不在支持列表中\n"
+                f"   支持: {', '.join(LOCAL_PROVIDERS.keys())}"
+            )
+        elif not self.base_url and _need_base_url:
             missing.append("LLM_BASE_URL（API服务地址）")
 
         if missing:
