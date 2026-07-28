@@ -205,7 +205,9 @@ class Dispatcher:
             if not arg:
                 return f"🤖 当前模型: {agent.llm.model}"
             try:
-                await loop.run_in_executor(executor, agent.switch_llm, model=arg)
+                await loop.run_in_executor(
+                    executor, lambda m=arg: agent.switch_llm(model=m)
+                )
                 return f"✅ 已切换到模型: {arg}"
             except Exception as e:
                 return f"❌ 切换失败: {e}"
