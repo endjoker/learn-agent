@@ -98,6 +98,14 @@ FINAL_ANSWER：[给用户的最终答案]
 4. 信息足够时输出 FINAL_ANSWER
 5. 标签回复必须用英文
 
+【交互命令（你无法直接执行，仅在合适时机建议用户发送）】
+- /compact — 对话较长、工具调用多、上下文紧张时建议
+- /clear — 用户想重新开始对话时建议
+- /model <名称> — 用户想切换模型时建议
+- /stats — 用户询问上下文占用或剩余空间时建议
+- /session — 用户想保存、恢复或管理历史会话时建议
+- /help — 查看全部命令
+
 </SYSTEM_STATIC_CONTEXT>"""
 
     # ================================================================
@@ -106,8 +114,10 @@ FINAL_ANSWER：[给用户的最终答案]
 
     DYNAMIC_TEMPLATE = """\
 <SYSTEM_DYNAMIC_CONTEXT>
-【当前工作目录】
-{cwd}
+【工作目录】
+你的专属工作目录是: {workspace}
+- 所有文件读写、脚本执行、项目创建等操作都必须在该目录下进行
+- 该目录外的文件属于系统文件，非用户要求禁止修改或删除
 
 【当前日期】
 {date}
@@ -121,6 +131,7 @@ FINAL_ANSWER：[给用户的最终答案]
         self.name = name
         self._session_instructions: list[str] = []
         self._project_root: Optional[str] = None
+        self._workspace: Optional[str] = None
 
     # ================================================================
     # 公开方法
@@ -144,6 +155,15 @@ FINAL_ANSWER：[给用户的最终答案]
             path: 项目根目录的绝对路径
         """
         self._project_root = path
+
+    def set_workspace(self, path: str) -> None:
+        """
+        设置工作目录路径（用于动态区声明 + 工具操作边界）。
+
+        参数:
+            path: 工作目录的绝对路径
+        """
+        self._workspace = path
 
     def build(self, tool_descs: str, skill_descs: str = "", mcp_descs: str = "") -> str:
         """
@@ -185,7 +205,7 @@ FINAL_ANSWER：[给用户的最终答案]
         today = date.today().strftime("%Y-%m-%d")
 
         # 工作目录
-        cwd = os.getcwd()
+        workspace = self._workspace or os.getcwd()
 
         # AGENT.md
         agent_md = self._load_agent_md()
@@ -203,7 +223,7 @@ FINAL_ANSWER：[给用户的最终答案]
             session_section = ""
 
         return self.DYNAMIC_TEMPLATE.format(
-            cwd=cwd,
+            workspace=workspace,
             date=today,
             os_name=os_name,
             agent_md_section=agent_md_section,

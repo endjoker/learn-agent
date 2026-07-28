@@ -21,7 +21,7 @@
     }
   },
   "permission": {
-    "workspace": ".",
+    "workspace": "./workspace",
     "default_mode": "ask",
     "tool_rules": {
       "grep": "allow",
