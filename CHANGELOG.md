@@ -35,6 +35,10 @@
 - `notes` 工具描述修正：明确为"临时键值暂存（仅当前会话有效，重启后丢失）"，与 MEMORY.md 的持久存储流程不再冲突
 - `.gitignore` 补充 `memory/config.json` 规则
 
+**初始化向导修复**：
+- `init_wizard` 写入 config.json 时以 `_DEFAULT_CONFIG` 为底座，确保所有 section（含新增的 prompt/workspace/gateway/sandbox.python 等）都有完整默认值
+- 旧 config.json 缺少新 section 时，向导自动检测并提示补齐
+
 ## 2026-07-27 统一配置 + 多协议适配层 + 代码审查全量修复
 
 **背景**：对本轮全部改动（config 统一重构 + 三协议 LLM 适配层，12 个修改文件 + 6 个新文件，约 2400 行）进行 8 角度代码审查，确认 24 条发现（5 CRITICAL / 7 HIGH / 7 MEDIUM / 5 LOW），全部修复。

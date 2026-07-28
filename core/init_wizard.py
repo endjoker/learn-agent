@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from core.config_loader import _deep_merge, _find_project_root
+from core.config_loader import _deep_merge, _find_project_root, _DEFAULT_CONFIG
 
 # ============================================================
 # 常量（数值与 llm_client.LOCAL_PROVIDERS / protocols 保持一致）
@@ -723,10 +723,24 @@ def run_init_wizard() -> int:
             if frag:
                 fragments.append(frag)
 
-        # ---- 无修改 ----
-        if not fragments:
+        # ---- 检查是否有新增 section 需要补齐 ----
+        merged_with_defaults = copy.deepcopy(_DEFAULT_CONFIG)
+        _deep_merge(merged_with_defaults, existing)
+        missing_sections = [k for k in _DEFAULT_CONFIG if k not in existing]
+
+        # ---- 无修改且无缺失 ----
+        if not fragments and not missing_sections:
             print("\n  😴 没有任何修改，config.json 保持不变")
             return 0
+
+        # ---- 有缺失 section 但无用户修改 → 提示补齐 ----
+        if not fragments and missing_sections:
+            print(f"\n  📋 检测到 config.json 缺少以下配置段: {', '.join(missing_sections)}")
+            if not _ask_yes_no("自动补齐默认值？", default=True):
+                print("  ✋ 已放弃，未做任何修改")
+                return 0
+            # 将补齐视为一个 fragment
+            fragments.append({k: merged_with_defaults[k] for k in missing_sections})
 
         # ---- 预览 & 确认 ----
         _print_summary(fragments, existing)
@@ -737,7 +751,10 @@ def run_init_wizard() -> int:
 
         # ---- 备份 & 合并 & 写入 ----
         bak = _backup_file(cfg_path)
-        final = copy.deepcopy(existing)
+        # 以 _DEFAULT_CONFIG 为底座，确保所有 section 都有完整默认值
+        # 用户已有配置覆盖默认值，向导收集的 fragments 最后覆盖
+        final = copy.deepcopy(_DEFAULT_CONFIG)
+        _deep_merge(final, existing)
         for frag in fragments:
             _deep_merge(final, frag)
 
