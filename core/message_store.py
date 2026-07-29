@@ -19,10 +19,38 @@ from typing import List, Dict, Optional, Callable
 DEFAULT_SESSION_DIR = Path(__file__).resolve().parent.parent / "sessions"
 
 
-def _estimate_tokens(text: str) -> int:
-    """粗略估算 token 数（中文 1.5 字/token，英文 4 字符/token）"""
+def _content_to_text(content) -> str:
+    """将 content（str 或 list）统一转为纯文本（用于搜索/匹配）"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "\n".join(parts)
+    return str(content)
+
+
+def _estimate_tokens(text) -> int:
+    """粗略估算 token 数（中文 1.5 字/token，英文 4 字符/token）。
+
+    支持 str 和 list（多模态 content blocks）。
+    """
     if not text:
         return 0
+    # 多模态 content: list of blocks
+    if isinstance(text, list):
+        total = 0
+        for block in text:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    total += _estimate_tokens(block.get("text", ""))
+                elif block.get("type") == "image":
+                    # 实际视觉 token 随分辨率可达数千；宁高勿低，避免自动压缩阈值失灵
+                    total += 1000
+        return total
+    # 纯文本
     chinese = sum(1 for c in text if '一' <= c <= '鿿')
     other = len(text) - chinese
     return int(chinese / 1.5 + other / 4)
@@ -141,7 +169,7 @@ class MessageStore:
         for msg in self._messages:
             if role and msg.get("role") != role:
                 continue
-            if keyword.lower() in msg.get("content", "").lower():
+            if keyword.lower() in _content_to_text(msg.get("content", "")).lower():
                 results.append(msg)
         return results
 
@@ -150,7 +178,7 @@ class MessageStore:
 
     def get_tool_calls(self) -> List[Dict]:
         return [m for m in self._messages
-                if m.get("role") == "assistant" and "ACTION" in m.get("content", "")]
+                if m.get("role") == "assistant" and "ACTION" in _content_to_text(m.get("content", ""))]
 
     # ============================================================
     # 锚点追踪（API 返回的精确 token 计数）

@@ -157,7 +157,11 @@ class Dispatcher:
         # ---- agent.run() 含 soft/hard 超时 ----
         # 注意：必须保存 afuture 引用，软超时后继续等同一个 future
         # 而不能起第二次 agent.run()——线程池里的旧调用不会因 asyncio 取消而停止
-        afuture = loop.run_in_executor(executor, agent.run, msg.text, False)
+        _images = getattr(msg, 'images', None) or None
+        afuture = loop.run_in_executor(
+            executor,
+            lambda: agent.run(msg.text, False, images=_images),
+        )
         try:
             result = await asyncio.wait_for(
                 asyncio.shield(afuture), timeout=self._soft_timeout,

@@ -19,6 +19,7 @@ class InboundMessage:
     message_id: str       # 平台消息 ID（去重用）
     raw: Any = None       # 原始平台消息对象（回复时需要）
     is_group: bool = False  # 是否群聊
+    images: list = field(default_factory=list)  # 多模态图片块列表
 
 
 class Channel(ABC):

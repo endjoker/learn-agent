@@ -65,12 +65,16 @@ class AnthropicAdapter(ProtocolAdapter):
         merged = self._merge_consecutive_same_role(non_system)
 
         # 3. Anthropic 只接受 "user" 和 "assistant"
+        from core.protocols.vision import content_to_anthropic
         api_messages = []
         for msg in merged:
             role = msg.get("role", "user")
             if role not in ("user", "assistant"):
                 role = "user"
-            api_messages.append({"role": role, "content": msg.get("content", "")})
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = content_to_anthropic(content)
+            api_messages.append({"role": role, "content": content})
 
         return system_text, api_messages
 

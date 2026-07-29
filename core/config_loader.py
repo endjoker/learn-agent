@@ -158,6 +158,19 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     },
 }
 
+def is_enabled(value, default: bool = True) -> bool:
+    """解析配置开关值。
+
+    兼容 bool 与字符串写法：`"false"/"0"/"no"/"off"`（不区分大小写）视为关闭，
+    其他非空字符串视为开启；None 使用默认值。
+    """
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "0", "no", "off")
+    return bool(value)
+
+
 # 缓存
 _config_cache: Optional[dict] = None
 _config_loaded: bool = False

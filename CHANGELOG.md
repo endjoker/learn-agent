@@ -1,5 +1,60 @@
 # 更新日志
 
+## 2026-07-29 多模态图片支持（新功能）+ 8 角度代码审查全量修复
+
+**背景**：新增多模态图片支持后，以 8 个 finder 并行做代码审查（逐行 diff / 删除行为审计 / 跨文件调用追踪 / 效率 / 复用 / 简化 / 深度架构 / 规约），48 条原始候选 → 23 个独立问题 → 逐条读源码验证。最终修复 22 项（CRITICAL 2 / HIGH 5 / MEDIUM 6 / LOW 9），2 项核实后保留，1 项排除（误报）。全部通过 py_compile + 8 组功能烟雾测试。
+
+### 一、多模态图片支持（新功能）
+
+- **新增 `core/protocols/vision.py`**：内部图片块格式（base64/file source）↔ 三协议格式转换（`content_to_openai` / `content_to_anthropic` / `content_to_gemini_parts`）；`resolve_image_block` 统一转 base64 + LRU 缓存（路径+mtime 失效）；Pillow 自动压缩（≤5MB 直用，5-20MB 渐进压缩至 1536→1024，>20MB 拒绝）
+- **`tools/builtin_tools.py`**：ReadTool 检测图片文件，返回 `[IMAGE:path=...]` 标记
+- **`agent.py`**：`run(images=...)` 支持多模态用户输入；工具结果中的图片标记转为多模态 tool_result
+- **三个适配器**：list content 自动转换为各自的 vision 格式
+- **Gateway**：`InboundMessage` 新增 `images` 字段；飞书通道支持纯图片消息（下载 → 缓存 → 询问意图）与富文本图片提取；dispatcher 透传 images 给 agent
+- **`core/message_store.py`**：token 估算 / 搜索 / 会话持久化全面支持 list content
+- **新增 `GUIDE.md`**：项目配置指南（MCP / 技能 / Hook / 模型 / 权限 / 沙箱 / 多模态），并注册进 system prompt 引导文件清单
+- **`requirements.txt`**：新增 Pillow 等依赖
+
+### 二、审查修复 — CRITICAL（2 项，阻断级）
+
+1. `core/protocols/base.py`：`_join_contents` 是类 staticmethod 却被裸名调用 → NameError 导致**所有 Anthropic/Gemini 调用必崩**（纯文本亦然，仅 OpenAI 幸免）→ 改为 `ProtocolAdapter._join_contents`
+2. `tools/builtin_tools.py`：从 vision 导入不存在的 `_format_size` → ReadTool 每次调用（含读普通文件）都 ImportError、完全瘫痪 → 只导入 `is_image_file`，复用本模块同名函数
+
+### 三、审查修复 — HIGH（5 项）
+
+3. `core/compressor.py`：轻量压缩对 list 型 tool_result 做 `'一' <= dict` 比较 → 用过图片的会话下一轮起 TypeError **永久卡死** → `_compress_tool_result` / `_format_messages_for_summary` / `light_compress` 统一用 `_content_to_text` 归一化
+4. `agent.py`：正则扫描任意工具输出注入图片标记——读自身源码即**自污染永久坏会话**（随会话持久化跨重启），且模型可**伪造标记读取任意本地文件**外泄给 provider → 新增 `_build_tool_result_content` 助手：标记必须指向真实存在的图片文件才采纳（+ 去重），两处重复逻辑合并
+5. `core/protocols/vision.py`：坏图片块（文件缺失 / >20MB）异常穿透适配器 → 该聊天每轮必失败且跨重启持续 → `_iter_content_blocks` 统一降级为 `[图片不可用: ...]` 文本占位
+6. `gateway/channels/feishu_channel.py`：`_pending_images` 按 chat_id 键控 → 群聊中 **A 的图被附到 B 的对话**；无 TTL 无限增长 → 改为 `chat_id:user_id` 键 + 30 分钟 TTL + 上限 50 条
+7. `agent.py`：富文本只发图不说话时插入空 text block → Anthropic 400 → `user_input` 为空时不再插入
+
+### 四、审查修复 — MEDIUM（6 项）
+
+8. `vision.py`：`.svg` 移出 `IMAGE_EXTENSIONS`（三家 vision API 均不接受 SVG，应按文本读）；`IMAGE_EXTENSIONS` 改为从 `_MIME_MAP` 派生，消除扩展名/MIME 双清单失配风险
+9. `vision.py` + `feishu_channel.py`：图片每轮 LLM 调用都重读/重压缩/重编码 → 新增解析结果 LRU 缓存；5 处相同的 `lark.Client` 构造 → 懒加载共享 `_api_client`；飞书图片下载前加 20MB 大小检查；`workspace/tmp` 下载图片 7 天自动清理
+10. `core/message_store.py`：图片 token 估算固定 300 → 1000（实际随分辨率可达数千，宁高勿低，避免 AUTO_RATIO 自动压缩永不触发 → 上下文溢出）
+11. `core/protocols/base.py`：多模态 tool_result 丢失 `[工具返回结果]` 框定标签 → list content 在最前面插入标签文本块（不就地污染原消息）
+12. `agent.py`：`/history` 对 list content 预览抛 AttributeError → 归一化为纯文本
+13. `agent.py` + `core/init_wizard.py`：MCP `"enabled": "false"`（字符串）是 truthy，服务器照跑 → 新增 `core/config_loader.is_enabled()` 容错解析，过滤与展示两处统一使用
+
+### 五、审查修复 — LOW / 清理（9 项）
+
+14. `vision.py`：删除无调用方的 `workspace_tmp` 死参数链 + `_save_compressed`（~25 行 YAGNI）
+15. `vision.py`：删除无生产者的 `source=="url"` 死分支
+16. `vision.py`：三个 `content_to_*` 同构循环收敛为共享 `_iter_content_blocks`
+17. `agent.py`：img_markers 两处逐字重复（~30 行，各自内联 `import re as _re`）合并为单一助手
+18. `memory/manager.py`：内联的 list→text 提取改为复用 `message_store._content_to_text`
+19. `agent.py`：删除死代码 `_estimate_tokens` / `_count_history_tokens`（grep 确认无调用方）
+20. `feishu_channel.py`：`_parse_post_content` 三个分支合并为候选字典循环，docstring 对齐实际三种格式
+21. `feishu_channel.py`：恢复被删的 `@_user_1` 消息格式注释
+22. `core/message_store.py`：回退与多模态无关的 `lower()` 微优化（diff 清理）
+
+**保留未改（2 项）**：`_on_bot_added/_on_bot_removed` 空处理器（docstring 说明是防 SDK 报 processor not found，有正当理由）；`_try_pillow_compress` 的 ImportError 回退（requirements 虽钉死 Pillow，但已部署环境未必装，保留更稳健）。
+
+**排除（1 项）**：agent.py 旧 `_estimate_tokens` 对 list 抛 TypeError 的担忧——验证确认其唯一用户 `_count_history_tokens` 无任何调用方，崩溃路径不可达（按死代码删除，见 #19）。
+
+**已知限制**：无视觉能力检测——纯文本模型（DeepSeek 全系等）收到图片块会 400（`unknown variant 'image_url'`）。需用 `/model` 切换到视觉模型（如阿里云 `qwen-vl-max-latest`、GPT-4o、Gemini、Claude）；详见 `GUIDE.md` 的「多模态图片」一节。
+
 ## 2026-07-29 提示词架构 v3 + 代码审查修复 + Python 安全配置化 + 防卡死
 
 **提示词架构 v3（对标 OpenClaw）**：

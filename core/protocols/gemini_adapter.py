@@ -67,6 +67,7 @@ class GeminiAdapter(ProtocolAdapter):
         merged = self._merge_consecutive_same_role(non_system)
 
         # 3. 翻译为 Gemini Content 格式
+        from core.protocols.vision import content_to_gemini_parts
         contents = []
         for msg in merged:
             role = msg.get("role", "user")
@@ -82,10 +83,11 @@ class GeminiAdapter(ProtocolAdapter):
             if not content and gemini_role == "user":
                 content = " "  # 空格占位，防止 API 拒绝
 
+            parts = content_to_gemini_parts(content)
             contents.append(
                 types.Content(
                     role=gemini_role,
-                    parts=[types.Part.from_text(text=content)],
+                    parts=parts,
                 )
             )
 

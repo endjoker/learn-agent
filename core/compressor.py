@@ -14,6 +14,8 @@
 import re
 from typing import List, Dict, Optional
 
+from core.message_store import _content_to_text
+
 
 # ============================================================
 # 全量压缩用的摘要提示词模板
@@ -70,7 +72,8 @@ def _extract_tool_meta(content: str) -> dict:
 
 def _compress_tool_result(msg: Dict) -> Dict:
     """将单条工具结果压缩为纯元数据（已消费的工具结果无需保留内容）"""
-    content = msg.get("content", "")
+    # 多模态 tool_result（list content）→ 归一化为纯文本
+    content = _content_to_text(msg.get("content", ""))
 
     # 估算原始 token 数（粗略）
     chinese = sum(1 for c in content if '一' <= c <= '鿿')
@@ -170,7 +173,7 @@ def _format_messages_for_summary(messages: List[Dict]) -> str:
     for msg in messages:
         role = msg.get("role", "unknown")
         name = msg.get("name", "")
-        content = msg.get("content", "")
+        content = _content_to_text(msg.get("content", ""))
 
         label = role.upper()
         if name:
@@ -215,9 +218,9 @@ class Compressor:
         返回:
             True 表示有消息被压缩
         """
-        old_total = sum(len(m.get("content", "")) for m in messages)
+        old_total = sum(len(_content_to_text(m.get("content", ""))) for m in messages)
         light_compress_tool_results(messages)
-        new_total = sum(len(m.get("content", "")) for m in messages)
+        new_total = sum(len(_content_to_text(m.get("content", ""))) for m in messages)
         return new_total < old_total
 
     # ---- 全量压缩 ----

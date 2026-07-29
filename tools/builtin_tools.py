@@ -179,6 +179,15 @@ class ReadTool(BaseTool):
             if not path.is_file():
                 return f"❌ 错误：路径不是文件 -> {path}"
 
+            # --- 图片文件检测 ---
+            from core.protocols.vision import is_image_file
+            if is_image_file(str(path)):
+                size = path.stat().st_size
+                return (
+                    f"🖼️ 图片文件: {path} ({_format_size(size)})\n"
+                    f"[IMAGE:path={path}]"
+                )
+
             # --- 读取文件 ---
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()

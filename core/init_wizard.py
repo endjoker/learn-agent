@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from core.config_loader import _deep_merge, _find_project_root, _DEFAULT_CONFIG
+from core.config_loader import _deep_merge, _find_project_root, _DEFAULT_CONFIG, is_enabled
 
 # ============================================================
 # 常量（数值与 llm_client.LOCAL_PROVIDERS / protocols 保持一致）
@@ -412,7 +412,8 @@ def _step_mcp(existing: dict) -> Optional[dict]:
         for i, s in enumerate(work_list, 1):
             transport = s.get("transport", "?")
             target = s.get("url") or s.get("command", "?")
-            print(f"    {i}. {s.get('name', '?')} ({transport} → {target})")
+            status = "✅" if is_enabled(s.get("enabled")) else "❌"
+            print(f"    {i}. {status} {s.get('name', '?')} ({transport} → {target})")
     else:
         print("\n  (暂无 MCP 服务器)")
 
@@ -502,6 +503,9 @@ def _collect_one_server(existing_servers: list) -> Optional[dict]:
         headers = _ask_kv_lines("自定义 Headers")
         if headers:
             server["headers"] = headers
+
+    # 启用/禁用
+    server["enabled"] = _ask_yes_no("立即启用此服务器？", default=True)
 
     return server
 

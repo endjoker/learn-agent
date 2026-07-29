@@ -110,6 +110,22 @@ class ProtocolAdapter(ABC):
         return system_text, non_system
 
     @staticmethod
+    def _join_contents(parts: list) -> str | list:
+        """合并多个 content 片段。全 str → str 拼接；含 list → 合并为 list。"""
+        has_list = any(isinstance(p, list) for p in parts)
+        if not has_list:
+            return "\n\n---\n\n".join(parts)
+        # 含多模态内容 — 合并为 block 列表
+        blocks = []
+        for p in parts:
+            if isinstance(p, str):
+                if p.strip():
+                    blocks.append({"type": "text", "text": p})
+            elif isinstance(p, list):
+                blocks.extend(p)
+        return blocks
+
+    @staticmethod
     def _merge_consecutive_same_role(messages: List[Dict]) -> List[Dict]:
         """
         合并连续同 role 的消息，满足 Anthropic / Gemini 的交替要求。
@@ -137,9 +153,12 @@ class ProtocolAdapter(ABC):
             content = msg.get("content", "")
             name = msg.get("name", "")
 
-            # 添加标记
+            # 添加标记（str 直接加前缀；多模态 list 在最前面插入文本块）
             if name == "tool_result":
-                content = f"[工具返回结果]\n{content}"
+                if isinstance(content, str):
+                    content = f"[工具返回结果]\n{content}"
+                elif isinstance(content, list):
+                    content = [{"type": "text", "text": "[工具返回结果]"}] + list(content)
 
             if role == current_role:
                 parts.append(content)
@@ -147,13 +166,13 @@ class ProtocolAdapter(ABC):
                 # 输出上一组
                 if current_role is not None:
                     merged.append({"role": current_role,
-                                   "content": "\n\n---\n\n".join(parts)})
+                                   "content": ProtocolAdapter._join_contents(parts)})
                 current_role = role
                 parts = [content]
 
         # 输出最后一组
         if current_role is not None:
             merged.append({"role": current_role,
-                           "content": "\n\n---\n\n".join(parts)})
+                           "content": ProtocolAdapter._join_contents(parts)})
 
         return merged

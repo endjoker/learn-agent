@@ -12,6 +12,7 @@
 | 需要什么 | 去哪里读 |
 |---------|---------|
 | 部署的服务组件配置 | `workspace/ref/` 下对应的 .md 文件 |
+| 如何配置/新增 MCP、Skill、Hook、模型 | 项目根目录 `GUIDE.md` |
   如：nginx 配置 → `workspace/ref/nginx.md`
 
 ## 如何保存重要信息

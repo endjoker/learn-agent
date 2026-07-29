@@ -31,6 +31,7 @@ import os
 import sys
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Optional
 
 import logging
@@ -47,7 +48,9 @@ from core.debug import (
     log_info,
     enable_with_agent,
 )
-from core.message_store import MessageStore
+from core.message_store import MessageStore, _content_to_text
+from core.config_loader import is_enabled
+from core.protocols.vision import is_image_file
 from core.permission import PermissionChecker, ALLOW, ASK, DENY
 from core.security_gate import SecurityGate
 from core.process_manager import ProcessManager
@@ -84,6 +87,31 @@ _ACTION_RE = re.compile(
     rf")?",
     re.DOTALL | re.IGNORECASE
 )
+
+
+def _build_tool_result_content(combined: str):
+    """构造 tool_result 的 content：检测 [IMAGE:path=...] 标记并转为多模态块。
+
+    标记必须指向真实存在的图片文件才会被采纳——防止工具输出中恰好包含
+    标记字面量（如 agent 读取本文件源码）时被误匹配而污染会话历史，
+    也防止模型伪造标记读取任意文件。重复标记去重，保持出现顺序。
+    无有效图片时原样返回字符串。
+    """
+    markers = re.findall(r'\[IMAGE:path=(.+?)\]', combined)
+    if not markers:
+        return combined
+    valid_paths = []
+    for p in dict.fromkeys(markers):
+        if Path(p).is_file() and is_image_file(p):
+            valid_paths.append(p)
+        else:
+            logger.debug(f"忽略无效图片标记: {p}")
+    if not valid_paths:
+        return combined
+    content = [{"type": "text", "text": combined}]
+    for p in valid_paths:
+        content.append({"type": "image", "source": "file", "path": p})
+    return content
 
 
 def _normalize_tags(text: str) -> str:
@@ -267,29 +295,6 @@ class Agent:
     # 对话历史管理
 
     # ============================================================
-
-    @staticmethod
-
-    def _estimate_tokens(text: str) -> int:
-        """
-
-        粗略估算文本的 token 数量
-        中文约 1.5 字/token，英文约 4 字符/token
-        """
-
-        if not text:
-            return 0
-        chinese_chars = sum(1 for c in text if '一' <= c <= '鿿')
-        other_chars = len(text) - chinese_chars
-        return int(chinese_chars / 1.5 + other_chars / 4)
-
-    def _count_history_tokens(self) -> int:
-        """统计当前历史消息的总 token 数"""
-
-        total = 0
-        for msg in self.messages:
-            total += self._estimate_tokens(msg.get("content", ""))
-        return total
 
     def _truncate_history(self):
         """
@@ -599,8 +604,11 @@ class Agent:
             if cfg.get("name")
         }
 
-        # 1. 添加所有服务器配置
+        # 1. 添加所有服务器配置（跳过 enabled=false 的，兼容 "false" 等字符串写法）
         for cfg in configs:
+            if not is_enabled(cfg.get("enabled")):
+                logger.info(f"跳过已禁用的 MCP 服务器: {cfg.get('name')}")
+                continue
             try:
                 self.mcp_manager.add_server(cfg)
             except Exception as e:
@@ -827,7 +835,8 @@ class Agent:
 
     # ============================================================
 
-    def run(self, user_input: str, verbose: bool = True) -> str:
+    def run(self, user_input: str, verbose: bool = True,
+            images: list | None = None) -> str:
         """
 
         执行完整的 ReAct 循环
@@ -835,6 +844,9 @@ class Agent:
         用 agent.clear_history() 清空历史。
         消息流:
           user → assistant(tool_use) → user(tool_result) → assistant → ...
+
+        参数:
+            images: 可选的图片块列表（多模态输入），格式见 core/protocols/vision.py
         """
 
         max_steps = self.max_steps
@@ -853,8 +865,16 @@ class Agent:
             return f"⛔ 输入被 hook 拦截: {hr.reason}"
         if hr.decision == Decision.MODIFY and hr.data:
             user_input = hr.data.get("prompt", user_input)
-        # ---- 追加本次用户输入 ----
-        self.messages.append({"role": "user", "content": user_input})
+        # ---- 追加本次用户输入（支持多模态）----
+        if images:
+            # user_input 为空时不插入空 text block（Anthropic 拒绝空 text block）
+            content = []
+            if user_input:
+                content.append({"type": "text", "text": user_input})
+            content.extend(images)
+            self.messages.append({"role": "user", "content": content})
+        else:
+            self.messages.append({"role": "user", "content": user_input})
         # ---- 紧急截断（压缩仍超阈值时，丢弃最早的消息兜底） ----
         self._truncate_history()
         # 调试：打印当前消息列表
@@ -1135,10 +1155,11 @@ class Agent:
 
                 # ====== 只添加一条 assistant + 一条合并的 tool_result ======
                 self.messages.append({"role": "assistant", "content": response})
+                combined = self._combine_results(results)
+                # 检测工具结果中的图片标记 → 构造多模态 tool_result
                 self.messages.append({
-                    "role": "user",
-                    "name": "tool_result",
-                    "content": self._combine_results(results),
+                    "role": "user", "name": "tool_result",
+                    "content": _build_tool_result_content(combined),
                 })
             else:
                 log_info("→ 走 ELSE 分支（无 Action 无 FinalAnswer）")
@@ -1330,9 +1351,10 @@ class Agent:
                                 t_results.append((a["name"], a["input"], obs, obs.startswith("❌")))
                     for tool_name, input_str, reason in denied_acts:
                         t_results.append((tool_name, input_str, f"⏭️ 跳过: {reason}", True))
+                    combined = self._combine_results(t_results)
                     self.messages.append({
                         "role": "user", "name": "tool_result",
-                        "content": self._combine_results(t_results),
+                        "content": _build_tool_result_content(combined),
                     })
                     # 上下文管理（与 Phase 1 保持一致）
                     self._light_compress()
@@ -1932,7 +1954,8 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                 for i, msg in enumerate(agent.messages):
                     role = msg.get("role", "?")
                     name = msg.get("name", "")
-                    content = msg.get("content", "")
+                    # 多模态 list content → 纯文本预览
+                    content = _content_to_text(msg.get("content", ""))
                     # 角色图标
                     icon = {"system": "⚙️", "user": "👤", "assistant": "🤖", "tool": "🔧"}.get(role, "❓")
                     label = f"{role}"

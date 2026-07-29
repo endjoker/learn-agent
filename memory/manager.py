@@ -21,6 +21,8 @@ from typing import List, Dict, Optional
 from rank_bm25 import BM25Okapi
 import jieba
 
+from core.message_store import _content_to_text
+
 
 def _tokenize(text: str) -> List[str]:
     """
@@ -233,7 +235,8 @@ class MemoryManager:
             if role == "user" and name == "tool_result":
                 continue
 
-            content = msg.get("content", "")
+            # 多模态 content（list）→ 提取纯文本
+            content = _content_to_text(msg.get("content", ""))
             # 转义反斜杠，防止 Windows 路径（如 D:\path）被后续操作当成非法转义
             content = content.replace("\\", "\\\\")
             # 对 assistant 消息过滤掉 ACTION/INPUT

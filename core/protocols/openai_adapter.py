@@ -38,8 +38,18 @@ class OpenAIAdapter(ProtocolAdapter):
     # ============================================================
 
     def _prepare_messages(self, messages: List[Dict]) -> List[Dict]:
-        """OpenAI 格式直接透传"""
-        return messages
+        """OpenAI 格式：content 为 list 时转 vision 格式，str 透传"""
+        from core.protocols.vision import content_to_openai
+        result = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                new_msg = dict(msg)
+                new_msg["content"] = content_to_openai(content)
+                result.append(new_msg)
+            else:
+                result.append(msg)
+        return result
 
     # ============================================================
     # 核心方法
