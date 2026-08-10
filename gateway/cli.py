@@ -145,6 +145,69 @@ def _cmd_doctor(args: list[str]) -> int:
     debug = config.get("channels", {}).get("debug", {})
     print(f"  调试通道:   {'✅ 已启用' if debug.get('enabled', True) else '⬜ 未启用'}")
 
+    # 定时任务
+    sched = config.get("scheduler", {})
+    if sched.get("enabled", True):
+        from croniter import croniter
+        jobs = sched.get("jobs") or []
+        issues = []
+        for j in jobs:
+            nm = j.get("name", "?")
+            if not j.get("prompt"):
+                issues.append(f"{nm}: 缺少 prompt")
+                continue
+            try:
+                croniter(j.get("schedule", ""))
+            except Exception:
+                issues.append(f"{nm}: cron 表达式无效 {j.get('schedule')!r}")
+            d = j.get("deliver") or {}
+            if d.get("mode") == "announce" and not (d.get("channel") and d.get("target")):
+                issues.append(f"{nm}: announce 投递必须显式指定 channel+target")
+        if issues:
+            ok = False
+            print(f"  定时任务:   ❌ {len(jobs)} 个 job，{len(issues)} 个问题")
+            for i in issues:
+                print(f"             - {i}")
+        else:
+            print(f"  定时任务:   ✅ 已启用（{len(jobs)} 个 job）")
+    else:
+        print(f"  定时任务:   ⬜ 未启用")
+
+    # 心跳
+    hb = config.get("heartbeat", {})
+    if hb.get("enabled", True):
+        from gateway.heartbeat import _resolve_prompt_file
+        pf = _resolve_prompt_file(hb.get("prompt_file", "workspace/HEARTBEAT.md"))
+        exists = pf.exists()
+        status = "✅" if exists else f"⚠️ 清单文件不存在: {pf}"
+        print(f"  心跳:       {status}（每 {hb.get('every', '30m')}，"
+              f"时段 {hb.get('active_hours', 'always')}）")
+    else:
+        print(f"  心跳:       ⬜ 未启用")
+
+    # WebUI
+    webui_ch = config.get("channels", {}).get("webui", {})
+    if webui_ch.get("enabled", True):
+        from gateway.webui import STATIC_DIR
+        host = config.get("host", "127.0.0.1")
+        allow_nb = config.get("webui", {}).get("allow_non_loopback", False)
+        loopback = host in ("127.0.0.1", "::1", "localhost")
+        if not loopback and not allow_nb:
+            print(f"  WebUI:      ❌ host={host} 非环回且未开 allow_non_loopback，"
+                  f"WebUI 将被 403")
+            ok = False
+        elif not loopback and allow_nb:
+            print(f"  WebUI:      ⚠️  红色告警: host={host} 非环回且已开 "
+                  f"allow_non_loopback。WebUI 可写 config/改 prompt/切权限，"
+                  f"暴露到非环回请确认风险")
+        else:
+            print(f"  WebUI:      ✅ http://{host}:{config.get('port', 9120)}/ui/")
+        if not STATIC_DIR.exists():
+            print(f"             ⚠️  static 目录不存在: {STATIC_DIR}")
+            ok = False
+    else:
+        print(f"  WebUI:      ⬜ 未启用")
+
     if dry_run:
         print(f"\n  (dry-run 模式，不启动服务)")
 

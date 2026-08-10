@@ -9,6 +9,9 @@ bak/
 # 统一配置文件（含 API Key）
 config.json
 
+# config 写盘备份（ConfigService 每写必备份，含明文密钥）
+config.json.bak-*
+
 # 环境变量（含 API Key）
 .env
 
@@ -47,6 +50,9 @@ gateway/creds/
 
 # Gateway 会话映射（session_key → session_id）
 gateway/sessions_map.json
+
+# Gateway 定时任务运行状态（运行时生成）
+gateway/scheduler_state.json
 
 # Agent 工作目录（运行时生成）
 workspace/

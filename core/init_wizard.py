@@ -155,24 +155,15 @@ def _ask_kv_lines(prompt: str) -> dict:
 
 
 # ============================================================
-# 文件 I/O
+# 文件 I/O（实现已提升为 core.config_writer，此处保留别名兼容旧调用）
 # ============================================================
 
-def _read_raw_config(path: Path) -> tuple[dict, str]:
-    """
-    裸读 config.json（不合并默认值、不叠加环境变量）。
-    返回 (data, status)，status ∈ "new" / "loaded" / "corrupt"
-    """
-    if not path.exists():
-        return {}, "new"
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return {}, "corrupt"
-        return data, "loaded"
-    except (json.JSONDecodeError, OSError):
-        return {}, "corrupt"
+from core.config_writer import (  # noqa: E402
+    read_raw_config as _read_raw_config,
+    backup_file as _backup_file,
+    write_config as _write_config,
+    mask_key as _mask_key,
+)
 
 
 def _handle_corrupt(path: Path) -> Optional[dict]:
@@ -191,46 +182,6 @@ def _handle_corrupt(path: Path) -> Optional[dict]:
             print(f"  📦 已改名: {broken.name}")
             return {}
         print("  ❗ 请输入 1 或 2")
-
-
-def _backup_file(path: Path) -> Optional[Path]:
-    """备份现有 config.json → config.json.bak-YYYYmmdd-HHMMSS"""
-    if not path.exists():
-        return None
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    bak = path.parent / f"config.json.bak-{ts}"
-    shutil.copy2(path, bak)
-    return bak
-
-
-def _write_config(path: Path, data: dict) -> None:
-    """原子写入：tmp → os.replace"""
-    tmp = path.parent / "config.json.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        os.replace(tmp, path)
-    except OSError as e:
-        # 清理残留 tmp
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise OSError(f"写入 config.json 失败: {e}") from e
-
-
-# ============================================================
-# 展示辅助
-# ============================================================
-
-def _mask_key(key: str) -> str:
-    """API Key 打码：sk-f1…d412，≤8 位全掩"""
-    if not key or key in ("not-needed", "ollama", "lm_studio", "YOUR_API_KEY_HERE"):
-        return key or "(空)"
-    if len(key) <= 8:
-        return "****"
-    return f"{key[:4]}…{key[-4:]}"
 
 
 def _overview(existing: dict) -> None:

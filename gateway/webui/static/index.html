@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>hello-agent 控制台</title>
+  <link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+  <div id="layout">
+    <nav id="sidebar">
+      <div class="brand">hello-agent</div>
+      <a class="nav-item" href="#/chat" data-page="chat">💬 会话</a>
+      <a class="nav-item" href="#/mcp" data-page="mcp">🔌 MCP</a>
+      <a class="nav-item" href="#/skills" data-page="skills">🧩 Skills</a>
+      <a class="nav-item" href="#/prompt" data-page="prompt">📝 Prompt</a>
+      <a class="nav-item" href="#/status" data-page="status">📊 状态</a>
+      <a class="nav-item" href="#/cron" data-page="cron">⏰ 定时任务</a>
+      <a class="nav-item" href="#/settings" data-page="settings">⚙️ 设置</a>
+      <div id="sse-state" class="sse-state">SSE: 连接中…</div>
+    </nav>
+    <main id="main"></main>
+  </div>
+  <div id="toast-root"></div>
+  <script src="/ui/vendor/marked.min.js"></script>
+  <script src="/ui/components.js"></script>
+  <script src="/ui/pages/chat.js"></script>
+  <script src="/ui/pages/mcp.js"></script>
+  <script src="/ui/pages/skills.js"></script>
+  <script src="/ui/pages/prompt.js"></script>
+  <script src="/ui/pages/status.js"></script>
+  <script src="/ui/pages/cron.js"></script>
+  <script src="/ui/pages/settings.js"></script>
+  <script src="/ui/app.js"></script>
+</body>
+</html>

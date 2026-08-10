@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Agent 工厂 —— 为 gateway 会话创建非交互 Agent 实例
-支持 session_key → session_id 持久化映射，重启后恢复会话
+支持 session_key → 会话元数据 持久化映射，重启后恢复会话
+
+sessions_map v2 结构（兼容旧版扁平字符串值）：
+    { session_key: { "session_id": "...", "model": "...",
+                     "permission_mode": "allow" } }
 """
 
 import json
@@ -13,7 +17,7 @@ from typing import Optional
 
 logger = logging.getLogger("hello_agent.gateway")
 
-# session_key → session_id 的持久化映射文件
+# session_key → 会话元数据 的持久化映射文件
 _MAP_FILE = Path(__file__).parent / "sessions_map.json"
 _map_lock = threading.Lock()
 
@@ -38,6 +42,28 @@ def _save_map(mapping: dict):
         logger.error("保存 sessions_map.json 失败: %s", e)
 
 
+def remove_map_entry(session_key: str):
+    """删除 session_key 的持久化映射条目（isolated 定时会话清理用）"""
+    with _map_lock:
+        mapping = _load_map()
+        if session_key in mapping:
+            del mapping[session_key]
+            _save_map(mapping)
+
+
+def update_map_meta(session_key: str, **fields):
+    """更新 sessions_map v2 条目的元数据字段（model / permission_mode 等）"""
+    with _map_lock:
+        mapping = _load_map()
+        raw = mapping.get(session_key)
+        if raw is None:
+            return
+        entry = raw if isinstance(raw, dict) else {"session_id": raw}
+        entry.update(fields)
+        mapping[session_key] = entry
+        _save_map(mapping)
+
+
 def create_gateway_agent(
     session_key: str,
     model: str = "",
@@ -48,7 +74,8 @@ def create_gateway_agent(
 ) -> "Agent":
     """
     创建 gateway 专用的非交互 Agent。
-    如果 session_key 有历史会话，自动恢复上下文。
+    如果 session_key 有历史会话，自动恢复上下文，
+    并按 sessions_map v2 / session_data 中的记录回填运行期切换过的模型。
     """
     from agent import create_agent
 
@@ -75,10 +102,16 @@ def create_gateway_agent(
             agent.permission.set_rule(tool, DENY)
 
     # ---- 会话恢复：检查是否有该 session_key 的历史 session_id ----
+    resumed = False
+    saved_model = ""
+    saved_perm_mode = ""
     with _map_lock:
         mapping = _load_map()
-        old_session_id = mapping.get(session_key)
-        resumed = False
+        raw = mapping.get(session_key)
+        # 兼容旧版扁平字符串值
+        meta = raw if isinstance(raw, dict) else (
+            {"session_id": raw} if raw else {})
+        old_session_id = meta.get("session_id")
 
         if old_session_id:
             from core.message_store import DEFAULT_SESSION_DIR
@@ -91,15 +124,48 @@ def create_gateway_agent(
                     agent.store.load_session_data(session_data)
                     agent.messages.insert(0, {"role": "system", "content": agent.system_prompt})
                     resumed = True
+                    # 模型回填来源：map v2 元数据优先（运行期切换即时写入），
+                    # 其次 session_data.model_id（save_session 时落盘）
+                    saved_model = meta.get("model") or session_data.get("model_id") or ""
+                    saved_perm_mode = meta.get("permission_mode") or ""
                     logger.info("恢复会话: %s → session=%s (%d 条消息)",
                                session_key, old_session_id, len(agent.messages))
                 except Exception as e:
                     logger.warning("恢复会话失败 %s: %s，将创建新会话", session_key, e)
 
         if not resumed:
-            mapping[session_key] = agent.store.session_id
+            mapping[session_key] = {
+                "session_id": agent.store.session_id,
+                "model": agent.llm.model,
+                "permission_mode": permission_mode,
+            }
             _save_map(mapping)
             logger.info("创建 gateway agent: %s → session=%s, model=%s",
                        session_key, agent.store.session_id, agent.llm.model)
+        elif isinstance(raw, str):
+            # 旧格式惰性升级为 v2
+            mapping[session_key] = {
+                "session_id": old_session_id,
+                "model": saved_model,
+                "permission_mode": saved_perm_mode or permission_mode,
+            }
+            _save_map(mapping)
+
+    # ---- 模型回填（修"运行期 /model 切换重启后丢失"缺口）----
+    if resumed and saved_model and saved_model != agent.llm.model:
+        try:
+            agent.switch_llm(model=saved_model)
+            logger.info("恢复会话回填模型: %s → %s", session_key, saved_model)
+        except Exception as e:
+            logger.warning("恢复会话回填模型 %s 失败，回落默认模型: %s",
+                           saved_model, e)
+
+    # ---- 权限档位重放（无 WebUI 审批桥时仅 unreviewed 可安全重放）----
+    if resumed and saved_perm_mode == "unreviewed":
+        from core.permission import ALLOW
+        for tool in agent.tool_registry.list_tool_names():
+            agent.permission.set_rule(tool, ALLOW)
+        logger.info("恢复会话重放权限档位: %s → unreviewed", session_key)
 
     return agent
+

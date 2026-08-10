@@ -19,6 +19,9 @@ class DebugChannel(Channel):
     """HTTP 调试通道：POST /debug/chat 收消息，回复在 HTTP response 中返回"""
 
     name = "debug"
+    # future 回环只能 set_result 一次：整段回复自行处理，禁用 dispatcher 分片
+    # （原默认 False → 1500 字符切片后仅首片进 future，其余静默丢失）
+    handles_chunking = True
 
     def __init__(self, dispatcher):
         self.dispatcher = dispatcher
@@ -43,12 +46,13 @@ class DebugChannel(Channel):
         key = f"{msg.session_key}:{msg.message_id}"
         fut = self._pending.get(key)
         if fut and not fut.done():
-            # 追加（多片回复）
-            existing = fut.get_result() if fut.done() else ""
-            if not fut.done():
-                fut.set_result(text)
+            fut.set_result(text)
         else:
             logger.debug("debug reply (no pending): %s", text[:100])
+
+    async def send_progress(self, msg: InboundMessage, text: str):
+        """进度提示（软超时）不触碰 future，避免抢占最终回复"""
+        logger.debug("debug progress [%s]: %s", msg.session_key, text[:100])
 
     def status(self) -> dict:
         return {"name": self.name, "status": "ok", "pending": len(self._pending)}

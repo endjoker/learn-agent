@@ -58,6 +58,9 @@ class SessionManager:
             thread_name_prefix="gateway-agent",
         )
         self._janitor_task: Optional[asyncio.Task] = None
+        # 会话生命周期回调（WebUI session.created/.evicted 事件用）
+        self.on_created: list = []
+        self.on_evicted: list = []
 
     async def start(self):
         """启动 janitor 定时任务"""
@@ -91,6 +94,7 @@ class SessionManager:
         self._sessions[session_key] = entry
         logger.info("新建会话: %s (活跃: %d/%d)",
                     session_key, len(self._sessions), self.max_sessions)
+        self._notify(self.on_created, session_key)
         return entry
 
     def get_executor(self) -> ThreadPoolExecutor:
@@ -98,6 +102,68 @@ class SessionManager:
 
     def active_count(self) -> int:
         return len(self._sessions)
+
+    def is_busy(self, session_key: str) -> bool:
+        """指定会话是否正在执行（心跳 defer_when_busy 判定用）"""
+        entry = self._sessions.get(session_key)
+        return bool(entry is not None and entry.is_busy)
+
+    def list_entries(self) -> list[dict]:
+        """内存会话快照（状态面板 / 会话页用）。不含磁盘未加载项。"""
+        out = []
+        for key, e in self._sessions.items():
+            agent = e.agent
+            model = ""
+            msg_count = 0
+            if agent is not None:
+                try:
+                    model = agent.llm.model if agent.llm else ""
+                    msg_count = len(agent.messages)
+                except Exception:
+                    pass
+            out.append({
+                "session_key": key,
+                "session_id": getattr(getattr(agent, "store", None),
+                                      "session_id", ""),
+                "model": model,
+                "message_count": msg_count,
+                "is_busy": e.is_busy,
+                "created_at": e.created_at,
+                "last_active": e.last_active,
+                "loaded": agent is not None,
+            })
+        return out
+
+    @staticmethod
+    def _notify(callbacks: list, session_key: str, reason: str = ""):
+        for cb in callbacks:
+            try:
+                cb(session_key, reason)
+            except Exception as ex:  # 回调异常不影响主流程
+                logger.warning("会话回调异常: %s", ex)
+
+    def executor_stats(self) -> dict:
+        """线程池统计（/health 与状态面板用）"""
+        ex = self._executor
+        return {
+            "workers": getattr(ex, "_max_workers", 0),
+            "pending": ex._work_queue.qsize()
+            if hasattr(ex, "_work_queue") else -1,
+            "busy_sessions": sum(
+                1 for e in self._sessions.values() if e.is_busy),
+        }
+
+    async def evict(self, session_key: str, save: bool = False) -> bool:
+        """从内存移除会话（可选保存）。返回是否移除成功。
+
+        供 WebUI DELETE / 定时任务 isolated 会话投递后清理使用。
+        """
+        entry = self._sessions.pop(session_key, None)
+        if entry is None:
+            return False
+        await self._cleanup_entry(session_key, entry, save=save)
+        self._notify(self.on_evicted, session_key, "evict")
+        return True
 
     async def _janitor_loop(self):
         """每 60s 扫描过期会话"""
@@ -115,6 +181,7 @@ class SessionManager:
                         logger.info("回收过期会话: %s (空闲 %.0fs)",
                                    key, now - entry.last_active)
                         await self._cleanup_entry(key, entry, save=self.persist)
+                        self._notify(self.on_evicted, key, "idle_timeout")
             except asyncio.CancelledError:
                 break
             except Exception as e:

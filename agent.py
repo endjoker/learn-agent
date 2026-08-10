@@ -88,6 +88,29 @@ _ACTION_RE = re.compile(
     re.DOTALL | re.IGNORECASE
 )
 
+# ============================================================
+# Plan 规划（CLI /plan 与 WebUI plan 预览共用）
+# ============================================================
+PLAN_PROMPT_TEXT = (
+    "请分析以下任务需求，输出一个分步骤的执行方案。\n\n"
+    "格式要求：\n"
+    "PLAN：\n"
+    "[1] 步骤1描述\n"
+    "[2] 步骤2描述\n"
+    "...（分步骤列出，5-8 步为宜）\n\n"
+    "只需要输出 PLAN 部分，不要执行任何工具。"
+)
+_PLAN_RE = re.compile(
+    r"PLAN[：:]\s*(\S[\s\S]*?)(?:\Z|(?=\n*(?:THOUGHT|ACTION|FINAL_ANSWER)))",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def extract_plan_text(response: str) -> Optional[str]:
+    """从 LLM 响应中提取 PLAN 正文；未识别返回 None"""
+    m = _PLAN_RE.search(response or "")
+    return m.group(1).strip() if m else None
+
 
 def _build_tool_result_content(combined: str):
     """构造 tool_result 的 content：检测 [IMAGE:path=...] 标记并转为多模态块。
@@ -242,6 +265,10 @@ class Agent:
         self.non_interactive = non_interactive
         self.quiet = quiet
         self.auto_approve_plan = True  # 非交互模式下自动批准 PLAN
+        # 权限审批回调（WebUI ask 档审批桥注入；None = 现状自动放行）
+        self.ask_callback = None
+        # 协作式停止标志（WebUI 暂停按钮；run/_run_task_list 每步检查）
+        self._stop_requested = False
         # 上下文预算阈值：0 时取模型上下文长度的一半（留一半给输出）
         if max_history_tokens == 0:
             self.max_history_tokens = max(llm.context_length // 2, 4096)
@@ -445,13 +472,38 @@ class Agent:
             print(f"  ⏭️  已取消，可继续讨论或输入 /plan 重新规划")
             return False
 
+    def adopt_plan(self, plan_text: str, user_input: str = "") -> int:
+        """激活已批准的方案（WebUI plan 阶段二，漏斗 executor 内调用）。
+
+        等价 _handle_plan 的确认分支，但无交互确认（批准发生在 WebUI 层）。
+        返回任务步数；解析失败抛 ValueError。
+        """
+        task_list = TaskList.from_plan_text(plan_text)
+        if not task_list.tasks:
+            raise ValueError("方案解析失败：未识别出有效任务")
+        self._task_list = task_list
+        self._update_task_list_in_prompt()
+        self.store.save_session()
+        try:
+            self.hooks.dispatch(HookEvent.PLAN_APPROVED, {
+                "plan": plan_text,
+                "task_count": len(task_list.tasks),
+                "user_input": user_input,
+            })
+        except Exception as e:
+            logger.warning(f"PLAN_APPROVED hook 派发失败: {e}")
+        logger.info(f"方案已激活: {len(task_list.tasks)} 步")
+        return len(task_list.tasks)
+
     def _ask_user(self, tool_name: str, params: dict) -> str:
         """
         工具权限确认统一入口。
         交互模式：显示操作详情，等待用户输入 A/Y/N/S。
-        非交互模式：自动返回 "y"（允许），不阻塞。
+        非交互模式：优先走 ask_callback（WebUI 审批桥），否则自动返回 "y"。
         """
         if self.non_interactive:
+            if self.ask_callback is not None:
+                return self.ask_callback(tool_name, params)
             return "y"
         # 交互模式：原有逻辑
         print(f"\n  ❓ 需要确认: {tool_name}")
@@ -465,11 +517,22 @@ class Agent:
         print(f"  S = 跳过本次操作")
         return input(f"  请选择 [A/Y/N/S] (默认Y) ").strip().lower()
 
+    def request_stop(self):
+        """请求协作式停止：run/_run_task_list 在下一步检查点退出。"""
+        self._stop_requested = True
+        logger.info("收到停止请求（将在下一步检查点生效）")
+
+    def _consume_stop(self) -> bool:
+        """检查并消费停止标志。返回 True 表示应停止。"""
+        if self._stop_requested:
+            self._stop_requested = False
+            return True
+        return False
+
     def clear_history(self):
         """清空对话历史，但保留系统提示词"""
 
-        self.store.clear()
-        # 锚点失效——清空历史后 next-think 重新校准
+        self.store.clear()        # 锚点失效——清空历史后 next-think 重新校准
         # store.clear() 已重置 store._anchor_total 和 _anchor_msg_count
         # 清空任务清单
         self._task_list = None
@@ -649,6 +712,130 @@ class Agent:
             logger.info(
                 f"MCP 初始化完成: {len(self._mcp_tool_names)} 个工具已注册"
             )
+
+    # ============================================================
+    # MCP 运行期增删（WebUI /mcp reload·reconnect，executor 线程内调用）
+    # ============================================================
+
+    def reload_mcp(self, configs: list):
+        """按 config 全量 diff 增删 MCP 服务器并重建工具与提示词。
+
+        config.json 是唯一事实源（避免双账本分叉）。须由 executor 线程调用。
+        """
+        if not self.mcp_manager:
+            # 尚未初始化（首跑未完成）→ 只更新待初始化配置，首跑自然生效
+            self._mcp_pending_init = [
+                c for c in (configs or []) if is_enabled(c.get("enabled"))]
+            logger.info("MCP 未初始化，reload 已写入待初始化配置")
+            return
+        from core.mcp_client import run_in_mcp_loop
+        run_in_mcp_loop(self._async_reload_mcp(configs or []))
+
+    async def _async_reload_mcp(self, configs: list):
+        """全量 diff 增删 MCP（MCP 事件循环内执行）"""
+        from tools.mcp_tools import MCPTool
+
+        wanted = {
+            c.get("name"): c for c in configs
+            if c.get("name") and is_enabled(c.get("enabled"))
+        }
+        cfg_trust = {n: bool(c.get("trust", False)) for n, c in wanted.items()}
+        current = set(self.mcp_manager.list_connections())
+
+        # ---- 删除项 ----
+        for name in current - set(wanted):
+            try:
+                self.mcp_manager.remove_server(name)
+            except Exception as e:
+                logger.warning(f"移除 MCP 服务器 '{name}' 失败: {e}")
+            # 注销该服务器的全部工具（按 "{server}/" 前缀匹配）
+            prefix = f"{name}/"
+            for tool_name in list(self.tool_registry._mcp_tool_names):
+                if tool_name.startswith(prefix):
+                    self.tool_registry.remove_tool(tool_name)
+                    self.tool_registry._mcp_tool_names.discard(tool_name)
+            logger.info(f"MCP 服务器已移除: {name}")
+
+        # ---- 新增项 ----
+        for name in set(wanted) - current:
+            try:
+                self.mcp_manager.add_server(wanted[name])
+            except Exception as e:
+                logger.error(f"添加 MCP 服务器 '{name}' 失败: {e}")
+
+        if set(wanted) - current:
+            # initialize_all 只碰未初始化的连接
+            await self.mcp_manager.initialize_all()
+
+        # ---- 工具发现与注册（仅新增的服务器）----
+        all_tools = await self.mcp_manager.discover_all_tools()
+        for server_name, tools in all_tools.items():
+            if server_name not in (set(wanted) - current):
+                continue
+            conn = self.mcp_manager.get_connection(server_name)
+            if not conn or not tools:
+                continue
+            for tool_desc in tools:
+                prefixed_desc = dict(tool_desc)
+                prefixed_desc["name"] = f"{server_name}/{tool_desc['name']}"
+                trust = bool(cfg_trust.get(server_name, False))
+                mcp_tool = MCPTool(connection=conn, tool_desc=prefixed_desc, trust=trust)
+                try:
+                    self.tool_registry.register_mcp_tool(mcp_tool)
+                    logger.info(f"注册 MCP 工具: {mcp_tool.name}")
+                except ValueError as e:
+                    logger.warning(f"注册 MCP 工具失败 '{mcp_tool.name}': {e}")
+
+        # ---- 收尾：重建提示词 ----
+        self._rebuild_system_prompt()
+        logger.info(
+            f"MCP reload 完成: 目标 {len(wanted)} 个服务器, "
+            f"已注册 MCP 工具 {len(self.tool_registry._mcp_tool_names)} 个")
+
+    def reconnect_mcp(self, name: str):
+        """重连单个 MCP 服务器 = remove + add + init + 重注册（无 ping 能力下的重连定义）"""
+        if not self.mcp_manager:
+            logger.warning("MCP 未初始化，reconnect 忽略: %s", name)
+            return
+        from core.config_loader import load_config
+        configs = load_config().get("mcp", {}).get("servers", [])
+        target = next((c for c in configs if c.get("name") == name), None)
+        if target is None:
+            logger.warning("reconnect: config 中无此 MCP 服务器: %s", name)
+            return
+
+        from core.mcp_client import run_in_mcp_loop
+
+        async def _do_reconnect():
+            from tools.mcp_tools import MCPTool
+            try:
+                self.mcp_manager.remove_server(name)
+            except Exception as e:
+                logger.debug(f"reconnect 移除旧连接失败（可忽略）: {e}")
+            # 注销旧工具
+            prefix = f"{name}/"
+            for tool_name in list(self.tool_registry._mcp_tool_names):
+                if tool_name.startswith(prefix):
+                    self.tool_registry.remove_tool(tool_name)
+                    self.tool_registry._mcp_tool_names.discard(tool_name)
+            self.mcp_manager.add_server(target)
+            await self.mcp_manager.initialize_all()
+            tools = (await self.mcp_manager.discover_all_tools()).get(name, [])
+            conn = self.mcp_manager.get_connection(name)
+            trust = bool(target.get("trust", False))
+            if conn:
+                for tool_desc in tools:
+                    prefixed_desc = dict(tool_desc)
+                    prefixed_desc["name"] = f"{name}/{tool_desc['name']}"
+                    mcp_tool = MCPTool(connection=conn, tool_desc=prefixed_desc, trust=trust)
+                    try:
+                        self.tool_registry.register_mcp_tool(mcp_tool)
+                    except ValueError as e:
+                        logger.warning(f"reconnect 注册工具失败 '{mcp_tool.name}': {e}")
+            self._rebuild_system_prompt()
+
+        run_in_mcp_loop(_do_reconnect())
+        logger.info("MCP 重连完成: %s", name)
 
     def add_instruction(self, instruction: str) -> None:
         """
@@ -888,6 +1075,10 @@ class Agent:
         format_retry = 0  # 格式纠正重试计数（防无限循环）
 
         for step in range(1, max_steps + 1):
+            # 协作式停止检查点（WebUI 暂停按钮）
+            if self._consume_stop():
+                self.store.save_session()
+                return "⏹ 已停止"
 
             if verbose:
                 task_tag = ""
@@ -1172,6 +1363,7 @@ class Agent:
                     self.messages.append({"role": "assistant", "content": response})
                     self.messages.append({
                         "role": "user",
+                        "name": "format_hint",  # 内部格式纠正提示，UI 不展示
                         "content": (
                             "你的回复中包含代码但没有使用工具调用。\n"
                             "如需执行代码，请严格使用以下格式：\n"
@@ -1248,6 +1440,9 @@ class Agent:
         # plan 模式：自动信任工作区，区内操作免确认，区外仍需审批
         self.permission.allow_workspace()
         while not self._task_list.is_all_done():
+            if self._consume_stop():
+                self.store.save_session()
+                return "⏹ 已停止（任务清单中断）"
             current = self._task_list.get_current()
             if not current:
                 break
@@ -1977,38 +2172,24 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                 if plan_input:
                     agent.messages.append({"role": "user", "content": plan_input})
                 print(f"\n  📐 正在分析任务并生成方案…")
-                plan_prompt = (
-                    "请分析以下任务需求，输出一个分步骤的执行方案。\n\n"
-                    "格式要求：\n"
-                    "PLAN：\n"
-                    "[1] 步骤1描述\n"
-                    "[2] 步骤2描述\n"
-                    "...（分步骤列出，5-8 步为宜）\n\n"
-                    "只需要输出 PLAN 部分，不要执行任何工具。"
-                )
                 plan_response = agent.llm.think(
-                    agent.messages + [{"role": "user", "content": plan_prompt}],
+                    agent.messages + [{"role": "user", "content": PLAN_PROMPT_TEXT}],
                     temperature=0.3,
                     stream=False,
                     silent=True,
                 )
-                if plan_response:
-                    plan_match = re.search(
-                        r"PLAN[：:]\s*(\S[\s\S]*?)(?:\Z|(?=\n*(?:THOUGHT|ACTION|FINAL_ANSWER)))",
-                        plan_response, re.IGNORECASE | re.DOTALL,
-                    )
-                    if plan_match:
-                        plan_text = plan_match.group(1).strip()
-                        if agent._handle_plan(plan_text, verbose=True):
-                            # 用户确认 → 进入任务执行阶段
-                            result = agent._run_task_list(
-                                user_input=plan_input or "plan execution",
-                                max_steps=agent.max_steps,
-                                verbose=True,
-                            )
-                            print(f"\n  🤖 {result}")
-                    else:
-                        print(f"  ❌ 未能识别出方案内容，请重试")
+                plan_text = extract_plan_text(plan_response) if plan_response else None
+                if plan_text:
+                    if agent._handle_plan(plan_text, verbose=True):
+                        # 用户确认 → 进入任务执行阶段
+                        result = agent._run_task_list(
+                            user_input=plan_input or "plan execution",
+                            max_steps=agent.max_steps,
+                            verbose=True,
+                        )
+                        print(f"\n  🤖 {result}")
+                elif plan_response:
+                    print(f"  ❌ 未能识别出方案内容，请重试")
                 else:
                     print(f"  ❌ LLM 返回空")
                 continue

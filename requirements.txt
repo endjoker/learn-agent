@@ -10,3 +10,4 @@ google-genai>=1.0.0
 lark-oapi>=1.7.0
 weixin-ilink[qr]>=0.3.5
 Pillow>=10.0.0
+croniter>=2.0.0

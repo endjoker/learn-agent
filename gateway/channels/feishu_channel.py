@@ -109,35 +109,49 @@ class FeishuChannel(Channel):
             self._pending_images.pop(oldest, None)
 
     def _run_ws_client(self):
-        """daemon 线程入口：lazy import + WS 长连接"""
+        """daemon 线程入口：lazy import + WS 长连接 + 断线重连（#3）
+
+        lark SDK 的 receive 循环在 keepalive ping 超时时会退出（1011），
+        start() 返回后线程即结束、连接永久丢失。这里在 start() 返回/异常后
+        按退避间隔重建 client 重启，保证长连接自愈。
+        """
         try:
-            # 必须在线程内 lazy import，避免抢主循环
             import lark_oapi as lark
-
-            # 构建事件处理器
-            handler = lark.EventDispatcherHandler.builder(
-                self.encrypt_key, self.verification_token
-            ).register_p2_im_message_receive_v1(
-                self._on_message
-            ).register_p2_im_chat_member_bot_added_v1(
-                self._on_bot_added
-            ).register_p2_im_chat_member_bot_deleted_v1(
-                self._on_bot_removed
-            ).build()
-
-            # WS 长连接客户端（阻塞）
-            self._client = lark.ws.Client(
-                self.app_id,
-                self.app_secret,
-                event_handler=handler,
-                log_level=lark.LogLevel.INFO,
-            )
-            logger.info("飞书 WS 客户端启动中…")
-            self._client.start()  # 阻塞，SDK 自带 auto_reconnect
         except ImportError:
             logger.error("缺少 lark-oapi 依赖: pip install lark-oapi")
-        except Exception as e:
-            logger.error("飞书 WS 客户端异常: %s", e, exc_info=True)
+            return
+
+        backoff = 5
+        while self._running:
+            try:
+                # 构建事件处理器
+                handler = lark.EventDispatcherHandler.builder(
+                    self.encrypt_key, self.verification_token
+                ).register_p2_im_message_receive_v1(
+                    self._on_message
+                ).register_p2_im_chat_member_bot_added_v1(
+                    self._on_bot_added
+                ).register_p2_im_chat_member_bot_deleted_v1(
+                    self._on_bot_removed
+                ).build()
+
+                # WS 长连接客户端（阻塞）
+                self._client = lark.ws.Client(
+                    self.app_id,
+                    self.app_secret,
+                    event_handler=handler,
+                    log_level=lark.LogLevel.INFO,
+                )
+                logger.info("飞书 WS 客户端启动中…")
+                self._client.start()  # 阻塞；receive 循环退出即返回
+                if self._running:
+                    logger.warning("飞书 WS 连接断开（keepalive/内部错误），%ss 后重连", backoff)
+            except Exception as e:
+                logger.error("飞书 WS 客户端异常: %s", e, exc_info=True)
+            if not self._running:
+                break
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
     @staticmethod
     def _on_bot_added(data) -> None:
@@ -449,28 +463,37 @@ class FeishuChannel(Channel):
 
     def _do_create_message(self, msg: InboundMessage, text: str):
         """降级：主动发送消息（message_id 过期时）"""
+        chat_id = msg.raw.chat_id if msg.raw else ""
+        self.send_to_chat(chat_id, text)
+
+    def send_to_chat(self, chat_id: str, text: str):
+        """主动向指定会话推送文本。
+
+        定时任务 announce 投递用——合成消息没有 msg.raw，
+        走不通 reply API 与 _do_create_message 的 raw 取值路径。
+        """
+        if not chat_id:
+            logger.warning("飞书主动发送失败: chat_id 为空")
+            return
         try:
             from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
             client = self._get_api_client()
 
-            receive_id_type = "chat_id"
-            receive_id = msg.raw.chat_id if msg.raw else ""
-
             body = CreateMessageRequestBody.builder() \
-                .receive_id(receive_id) \
+                .receive_id(chat_id) \
                 .msg_type("text") \
                 .content(json.dumps({"text": text})) \
                 .build()
 
             req = CreateMessageRequest.builder() \
-                .receive_id_type(receive_id_type) \
+                .receive_id_type("chat_id") \
                 .request_body(body) \
                 .build()
 
             resp = client.im.v1.message.create(req)
             if not resp.success():
-                logger.warning("飞书主动发送也失败: code=%d", resp.code)
+                logger.warning("飞书主动发送失败: code=%d", resp.code)
         except Exception as e:
             logger.error("飞书主动发送异常: %s", e)
 

@@ -31,6 +31,9 @@ class OpenAIAdapter(ProtocolAdapter):
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
+            # 部分中转站 WAF 会拦截 SDK 默认的 "OpenAI/Python" User-Agent，
+            # 返回 403 "Your request was blocked."；改用自定义 UA 规避。
+            default_headers={"User-Agent": "hello-agent"},
         )
 
     # ============================================================

@@ -1509,4 +1509,12 @@ def register_all_tools(registry, memory_manager=None, sandbox=None, process_mana
         from .process_tools import register_process_tools
         register_process_tools(registry, process_manager=process_manager)
 
+    # 定时任务工具（cron_*）—— 无额外依赖
+    from tools.cron_tools import (
+        CronAddJobTool, CronDeleteJobTool, CronListJobsTool, CronRunJobTool)
+    registry.register_tool(CronAddJobTool())
+    registry.register_tool(CronDeleteJobTool())
+    registry.register_tool(CronListJobsTool())
+    registry.register_tool(CronRunJobTool())
+
     return registry

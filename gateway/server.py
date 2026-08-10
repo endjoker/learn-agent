@@ -46,6 +46,9 @@ class GatewayServer:
         )
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
+        self.scheduler = None
+        self.heartbeat = None
+        self.webui = None
 
     async def start(self):
         """启动所有服务"""
@@ -68,6 +71,50 @@ class GatewayServer:
             self.dispatcher.register_channel(debug)
             debug.register_routes(self._app)
 
+        # 定时任务（P1）
+        sched_cfg = self.config.get("scheduler", {})
+        if sched_cfg.get("enabled", True):
+            from gateway.scheduler import Scheduler
+            self.scheduler = Scheduler(sched_cfg, self.dispatcher, self.session_mgr)
+            self.dispatcher.register_channel(self.scheduler.channel)
+            self.dispatcher.add_command(
+                "/cron", self.scheduler.handle_command,
+                "/cron [list|run|pause|resume|history|reload] — 定时任务管理")
+            await self.scheduler.start()
+
+        # 心跳检查（P2，依赖 scheduler 引用做 defer_when_busy 判定）
+        hb_cfg = self.config.get("heartbeat", {})
+        if hb_cfg.get("enabled", True):
+            from gateway.heartbeat import Heartbeat
+            self.heartbeat = Heartbeat(
+                hb_cfg, self.dispatcher, self.session_mgr, self.scheduler)
+            self.dispatcher.register_channel(self.heartbeat.channel)
+            self.dispatcher.add_command(
+                "/heartbeat", self.heartbeat.handle_command,
+                "/heartbeat [status|pause|resume|run] — 心跳管理")
+            await self.heartbeat.start()
+
+        # WebUI 六模块控制台（P3a 基建，AppRunner 之前挂载）
+        webui_ch_cfg = channels_cfg.get("webui", {})
+        if webui_ch_cfg.get("enabled", True):
+            from gateway.webui import WebUIModule
+            self.webui = WebUIModule(
+                self.dispatcher, self.session_mgr,
+                {**webui_ch_cfg, **self.config.get("webui", {})})
+            await self.webui.start()
+            self.webui.register_routes(self._app)
+
+        # scheduler/heartbeat 注入 webui（/api/scheduler 用）+ 注册 status provider
+        if self.webui:
+            self.webui.scheduler = self.scheduler
+            self.webui.heartbeat = self.heartbeat
+            if self.scheduler:
+                self.webui.add_status_provider(
+                    "scheduler", lambda: self.scheduler.channel.status())
+            if self.heartbeat:
+                self.webui.add_status_provider(
+                    "heartbeat", lambda: self.heartbeat.channel.status())
+
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.host, self.port)
@@ -79,6 +126,13 @@ class GatewayServer:
     async def stop(self):
         """优雅停机"""
         logger.info("🛑 Gateway 停止中…")
+        # 先停 WebUI（探针与 SSE），再停心跳与调度器（不再产生新触发）
+        if self.webui:
+            await self.webui.stop()
+        if self.heartbeat:
+            await self.heartbeat.stop()
+        if self.scheduler:
+            await self.scheduler.stop()
         # 停止 channels
         for ch in self.dispatcher._channels.values():
             try:
@@ -87,9 +141,12 @@ class GatewayServer:
                 logger.error("停止 channel %s 失败: %s", ch.name, e)
         # 停止会话管理
         await self.session_mgr.stop()
-        # 停止 aiohttp
+        # 停止 aiohttp（超时兜底，防常驻连接/慢 handler 卡住停机）
         if self._runner:
-            await self._runner.cleanup()
+            try:
+                await asyncio.wait_for(self._runner.cleanup(), timeout=5)
+            except asyncio.TimeoutError:
+                logger.warning("aiohttp 清理超时(5s)，强制继续停机")
         logger.info("👋 Gateway 已停止")
 
     async def _start_channels(self):
@@ -130,7 +187,13 @@ class GatewayServer:
             "active_sessions": self.session_mgr.active_count(),
             "max_sessions": self.session_mgr.max_sessions,
             "channels": channels_status,
+            "executor": self.session_mgr.executor_stats(),
         }
+        # scheduler / heartbeat 状态（探针已周期采集，直接取快照）
+        if self.scheduler:
+            data["scheduler"] = self.scheduler.channel.status()
+        if self.heartbeat:
+            data["heartbeat"] = self.heartbeat.channel.status()
         return web.json_response(data)
 
     def run_forever(self):

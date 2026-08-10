@@ -152,13 +152,26 @@ class PermissionChecker:
                 config = {}
 
         # workspace: 参数 > config > 当前目录
+        # 注意：必须锚定项目根解析（create_agent 会 os.chdir 到 workspace，
+        # 此处 CWD 不可靠），否则出现 workspace\workspace 递归（#7）
+        try:
+            from core.config_loader import _find_project_root
+            _root = _find_project_root()
+        except Exception:
+            _root = Path.cwd()
         if workspace:
             self.workspace = Path(workspace).resolve()
         elif config.get("workspace"):
             ws = config["workspace"]
-            self.workspace = Path(ws).resolve() if ws != "." else Path.cwd().resolve()
+            self.workspace = (_root / ws).resolve() if ws != "." else _root.resolve()
         else:
-            self.workspace = Path.cwd().resolve()
+            self.workspace = (_root / "workspace").resolve()
+
+        # 额外白名单根（#8：默认含项目根，允许 LLM 修改根目录配置文件）
+        extra = config.get("extra_workspaces", ["."])
+        self._extra_roots = []
+        for x in extra:
+            self._extra_roots.append((_root / x).resolve() if x != "." else _root.resolve())
 
         # 工具权限规则表
         self._rules: Dict[str, Union[str, Callable]] = {}
@@ -168,6 +181,22 @@ class PermissionChecker:
 
         # 加载默认规则（从 config 或硬编码）
         self._init_default_rules(config)
+
+    def _within(self, p: Path) -> bool:
+        """路径是否在 workspace 或任一额外白名单根内（#8 多根判断）"""
+        if is_within_workspace(p, self.workspace):
+            return True
+        return any(is_within_workspace(p, r) for r in self._extra_roots)
+
+    def _resolve(self, path_str: str) -> Path:
+        """解析路径：workspace 相对优先，回退额外根（相对 config.json 等根文件）"""
+        p = resolve_path(path_str, self.workspace)
+        if not p.exists() and not Path(path_str).is_absolute():
+            for r in self._extra_roots:
+                cand = resolve_path(path_str, r)
+                if cand.exists():
+                    return cand
+        return p
 
     def _init_default_rules(self, config: dict = None):
         """设置各工具的默认权限规则（可从 config.json 的 permission.tool_rules 覆盖）"""
@@ -226,13 +255,59 @@ class PermissionChecker:
             tool_name: 工具名称
             rule: 允许值:
                   - "allow" / "ask" / "deny"（固定权限）
-                  - 回调函数 (tool_name, params, workspace) → "allow"|"ask"|"deny"
+                  - 回调函数 (tool_name, params) → "allow"|"ask"|"deny"
         """
         self._rules[tool_name] = rule
 
     def get_rule(self, tool_name: str) -> Optional[Union[str, Callable]]:
         """获取工具的权限规则"""
         return self._rules.get(tool_name)
+
+    # ============================================================
+    # 规则列举（WebUI 权限档位展示用）
+    # ============================================================
+
+    # 标准探针参数集：对每个工具求值，刻画当前规则的实际效果
+    _PROBE_PARAMS = [
+        ("empty_args", {}),
+        ("workspace_path", {"file_path": "probe.txt", "path": "probe.txt"}),
+        ("bash_readonly", {"command": "ls"}),
+        ("bash_write", {"command": "git commit -m probe"}),
+    ]
+
+    def describe_rules(self) -> dict:
+        """列举每个工具的规则类型与标准探针求值结果。
+
+        返回:
+            {"tools": {tool: {"rule_type": fixed|dynamic,
+                              "rule": 固定值或 "callable",
+                              "probes": {探针名: allow|ask|deny}}},
+             "meta": {"workspace": ..., "workspace_trusted": ...}}
+
+        探针只求值 check()，无副作用（dynamic 规则应为纯函数）。
+        """
+        tools = {}
+        for tool, rule in self._rules.items():
+            if callable(rule):
+                info = {"rule_type": "dynamic", "rule": "callable"}
+            else:
+                info = {"rule_type": "fixed", "rule": rule}
+            probes = {}
+            for name, params in self._PROBE_PARAMS:
+                try:
+                    probes[name] = self.check(tool, dict(params))
+                except Exception:
+                    probes[name] = "error"
+            info["probes"] = probes
+            tools[tool] = info
+        return {
+            "tools": tools,
+            "meta": {
+                "workspace": str(self.workspace),
+                "workspace_trusted": self._workspace_trusted,
+            },
+        }
+
 
     # ============================================================
     # 动态规则函数
@@ -247,8 +322,8 @@ class PermissionChecker:
         if not path_str:
             return ALLOW
 
-        path = resolve_path(path_str, self.workspace)
-        if is_within_workspace(path, self.workspace):
+        path = self._resolve(path_str)
+        if self._within(path):
             return ALLOW
         return ASK
 
@@ -260,7 +335,10 @@ class PermissionChecker:
         path_str = self._extract_path(params)
         if not path_str:
             return ASK
-        return ASK  # 无论区内区外，写操作都需确认
+        # 已信任工作区（plan/A 键）时，白名单根内写操作直接放行（#8）
+        if self._workspace_trusted and self._within(self._resolve(path_str)):
+            return ALLOW
+        return ASK  # 未信任时写操作都需确认
 
     def _check_file_path_delete(self, tool_name: str, params: dict) -> str:  # noqa: ARG001
         """
@@ -271,8 +349,8 @@ class PermissionChecker:
         if not path_str:
             return ASK
 
-        path = resolve_path(path_str, self.workspace)
-        if is_within_workspace(path, self.workspace):
+        path = self._resolve(path_str)
+        if self._within(path):
             return ASK
         return DENY
 
@@ -297,8 +375,8 @@ class PermissionChecker:
 
         # ls/mkdir：类似读操作
         if action in ("ls", "mkdir", "list"):
-            path = resolve_path(path_str, self.workspace)
-            return ALLOW if is_within_workspace(path, self.workspace) else ASK
+            path = self._resolve(path_str)
+            return ALLOW if self._within(path) else ASK
 
         # copy/move / delete：全 ask（A 按钮再将区内升为 allow）
         return ASK
@@ -320,8 +398,8 @@ class PermissionChecker:
         if level == ALLOW:
             cmd_path = self._extract_bash_path(command)
             if cmd_path:
-                path = resolve_path(cmd_path, self.workspace)
-                if path.exists() and not is_within_workspace(path, self.workspace):
+                path = self._resolve(cmd_path)
+                if path.exists() and not self._within(path):
                     return ASK  # 工作区外只读操作 → ask
 
         return level

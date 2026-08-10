@@ -138,8 +138,25 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "soft_timeout_seconds": 90,
             "hard_timeout_seconds": 600,
         },
+        "scheduler": {
+            "enabled": True,
+            "max_concurrent": 2,
+            "misfire_policy": "skip",
+            "history_limit": 50,
+            "jobs": [],
+        },
+        "heartbeat": {
+            "enabled": True,
+            "every": "30m",
+            "session_key": "heartbeat:main",
+            "active_hours": "08:00-22:00",
+            "prompt_file": "workspace/HEARTBEAT.md",
+            "deliver": {"mode": "none"},
+            "defer_when_busy": True,
+        },
         "channels": {
             "debug": {"enabled": True},
+            "webui": {"enabled": True},
             "feishu": {
                 "enabled": False,
                 "mode": "websocket",
@@ -154,6 +171,9 @@ _DEFAULT_CONFIG: dict[str, Any] = {
                 "allow_from": [],
                 "reply_format": "markdown",
             },
+        },
+        "webui": {
+            "allow_non_loopback": False,
         },
     },
 }

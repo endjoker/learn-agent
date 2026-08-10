@@ -43,6 +43,15 @@ class Channel(ABC):
         """向用户发送回复文本"""
         ...
 
+    async def send_progress(self, msg: InboundMessage, text: str) -> None:
+        """发送中间进度提示（如软超时提醒）。
+
+        默认转调 send_reply（飞书/微信等普通通道保持现行为）；
+        基于 future 回环的通道（debug/webui/scheduler）必须覆写为
+        不触碰 pending future，否则进度消息会抢占最终回复。
+        """
+        await self.send_reply(msg, text)
+
     def status(self) -> dict:
         """返回 channel 状态（/health 聚合用）"""
         return {"name": self.name, "status": "unknown"}
