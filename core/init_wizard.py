@@ -14,6 +14,7 @@
 
 import copy
 import getpass
+import ipaddress
 import json
 import os
 import shutil
@@ -548,6 +549,42 @@ def _step_agent_runtime(existing: dict) -> Optional[dict]:
         changes["protocol_retry_limit"] = retries
     return {"agent_runtime": changes} if changes else None
 
+
+def _step_webui_security(existing: dict) -> Optional[dict]:
+    """Collect remote WebUI allowlist settings without exposing a token."""
+    gateway = existing.get("gateway", {})
+    webui = gateway.get("webui", {})
+    print("\n  🌐 WebUI 远程访问")
+
+    current_remote = is_enabled(webui.get("allow_non_loopback"), False)
+    allow_remote = _ask_yes_no("允许从非本机访问 WebUI？", default=current_remote)
+    changes: dict[str, Any] = {}
+    if allow_remote != current_remote:
+        changes["allow_non_loopback"] = allow_remote
+
+    if allow_remote:
+        current_ips = webui.get("allowed_ips", []) or []
+        if isinstance(current_ips, str):
+            current_ips = [current_ips]
+        default_ips = ", ".join(str(item) for item in current_ips)
+        while True:
+            raw = _ask("允许的客户端 IP/CIDR（逗号分隔）", default_ips)
+            allowed_ips = [item.strip() for item in raw.split(",") if item.strip()]
+            if not allowed_ips:
+                print("  ❌ 远程访问必须至少配置一个允许的 IP 或 CIDR")
+                continue
+            try:
+                for item in allowed_ips:
+                    ipaddress.ip_network(item, strict=False)
+            except ValueError:
+                print(f"  ❌ 无效的 IP 或 CIDR：{item}")
+                continue
+            if allowed_ips != current_ips:
+                changes["allowed_ips"] = allowed_ips
+            break
+
+    return {"gateway": {"webui": changes}} if changes else None
+
 def _step_advanced(existing: dict) -> Optional[dict]:
     """高级配置步骤。返回 {"permission": ..., "sandbox": ...} 或 None"""
     print("\n" + "═" * 18 + " 高级选项 · Permission / Sandbox " + "═" * 8)
@@ -636,10 +673,13 @@ def _print_summary(fragments: list[dict], existing: dict) -> None:
             elif section == "sandbox":
                 for k, v in value.items():
                     print(f"  sandbox.{k}:  → {v}")
+            elif section == "gateway":
+                for k, v in value.get("webui", {}).items():
+                    print(f"  gateway.webui.{k}: → {v}")
 
     # 未修改的 section
     touched = {k for frag in fragments for k in frag}
-    untouched = [s for s in ("llm", "mcp", "hooks", "permission", "sandbox") if s not in touched]
+    untouched = [s for s in ("llm", "mcp", "hooks", "permission", "sandbox", "gateway") if s not in touched]
     if untouched:
         print(f"  {'/'.join(untouched)}: 不修改")
 
@@ -694,11 +734,14 @@ def run_init_wizard() -> int:
                 fragments.append(frag)
 
         # ---- 可选：高级选项 ----
-        if _ask_yes_no("\n⚙️  是否配置高级选项（permission / sandbox / runtime）？", default=False):
+        if _ask_yes_no("\n⚙️  是否配置高级选项（permission / sandbox / runtime / WebUI）？", default=False):
             frag = _step_advanced(existing)
             if frag:
                 fragments.append(frag)
             frag = _step_agent_runtime(existing)
+            if frag:
+                fragments.append(frag)
+            frag = _step_webui_security(existing)
             if frag:
                 fragments.append(frag)
 

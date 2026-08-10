@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 from aiohttp import web
 
+from core.init_wizard import _step_webui_security
 from gateway.webui import WebUIModule, _parse_allowed_networks
 
 
@@ -60,3 +62,14 @@ class WebUiIpAllowlistTests(unittest.IsolatedAsyncioTestCase):
     def test_invalid_allowlist_entry_is_rejected_at_startup(self):
         with self.assertRaisesRegex(ValueError, "无效地址"):
             _parse_allowed_networks(["not-an-ip"])
+
+    def test_init_wizard_collects_and_validates_allowlist(self):
+        with patch("core.init_wizard._ask_yes_no", return_value=True), \
+             patch("core.init_wizard._ask", side_effect=["not-an-ip", "10.20.0.0/16, 192.168.1.10"]), \
+             patch("core.init_wizard.print"):
+            changes = _step_webui_security({"gateway": {"webui": {}}})
+
+        self.assertEqual(changes, {"gateway": {"webui": {
+            "allow_non_loopback": True,
+            "allowed_ips": ["10.20.0.0/16", "192.168.1.10"],
+        }}})
