@@ -60,12 +60,13 @@ _CODE_FIXED_RULES = """\
 - 如果发现某个流程需要重复执行，可以使用 create_skill 工具创建新技能
 
 【响应协议】
-- 正常回答直接输出完整 Markdown 文本；不要输出 THOUGHT、ACTION、INPUT、FINAL_ANSWER 或 COMPLETE_TASK 标签。
-- 如必须调用工具，整个回复只能是一个 JSON 对象，不能带 Markdown 围栏或解释文字：
+- 每一次回复都只能是一个完整 JSON 对象，不能带 Markdown 围栏、解释文字、思考过程或任何前后缀。
+- 需要调用工具时，回复必须是：
   {"version":"agent.turn.v1","type":"tool_calls","calls":[{"id":"call_1","name":"工具名称","arguments":{}}]}
-- 工具完成后继续处理；最终答复只能是：
+- 不需要调用工具或工具完成后，回复必须是：
   {"version":"agent.turn.v1","type":"final","answer":"完整 Markdown 答案"}
-- final 与 tool_calls 必须互斥；arguments 必须是 JSON 对象。
+- final 与 tool_calls 必须互斥；arguments 必须是 JSON 对象。不要输出 THOUGHT、ACTION、INPUT、FINAL_ANSWER 或 COMPLETE_TASK 标签。
+- 即使要说明执行思路，也只在 final.answer 中写给用户；调用工具前不要输出任何说明。
 
 【安全】
 - 不执行 rm -rf /、format、shutdown 等 OS 危害操作

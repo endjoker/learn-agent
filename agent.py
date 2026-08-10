@@ -893,7 +893,8 @@ class Agent:
             f"返回结果:\n{observation}\n"
             f"【工具执行完毕】\n\n"
             f"（这是工具 '{tool_name}' 返回的数据，请基于此继续。\n"
-            f"信息足够 → FINAL_ANSWER；需要更多 → 继续 ACTION + INPUT）"
+            f"信息足够时输出 agent.turn.v1/final JSON 信封；需要更多时输出 "
+            f"agent.turn.v1/tool_calls JSON 信封。）"
         )
 
     @staticmethod
@@ -932,7 +933,8 @@ class Agent:
             parts.append("")
         parts.append("【批量执行完毕】\n\n"
                      "以上是所有工具的执行结果（✅ 成功 / ❌ 失败），请综合分析后继续。\n"
-                     "信息足够 → FINAL_ANSWER；需要更多 → 继续 ACTION + INPUT")
+                     "信息足够时输出 agent.turn.v1/final JSON 信封；需要更多时输出 "
+                     "agent.turn.v1/tool_calls JSON 信封。")
         return "\n".join(parts)
 
     # ============================================================
@@ -1504,7 +1506,7 @@ class Agent:
                 break
             task_prompt = (
                 f"## 请执行任务 {current.id}/{self._task_list.total}：{current.description}\n"
-                f"执行此任务，完成后输出 FINAL_ANSWER。"
+                f"执行此任务，完成后只输出 agent.turn.v1/final JSON 信封。"
             )
             self.messages.append({"role": "user", "content": task_prompt})
             if verbose:
@@ -2152,7 +2154,7 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
                                 f'用户通过 /skill 命令调用了技能 "{skill_name}"，{kwargs_desc}。\n\n'
                                 f"请按以下技能指令逐步执行，可调用其他工具：\n"
                                 f"{skill.instruction}\n\n"
-                                f"所有步骤完成后，输出 FINAL_ANSWER。"
+                                f"所有步骤完成后，只输出 agent.turn.v1/final JSON 信封。"
                             )
                             agent.run(msg)
                 continue
