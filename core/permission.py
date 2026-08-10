@@ -74,6 +74,14 @@ def classify_bash_command(command: str) -> str:
     if _match_dangerous(cmd_lower):
         return DENY
 
+    # A command that begins with a read-only program can still execute a
+    # second command through shell composition (for example,
+    # ``git status && git commit``).  Classifying the entire expression from
+    # its prefix would incorrectly auto-approve that write.  Treat composed
+    # shell syntax conservatively; callers may still request confirmation.
+    if re.search(r"(?:&&|\|\||\$\(|[;|&<>`\r\n])", cmd_lower):
+        return ASK
+
     # 只读命令
     for pattern in READONLY_COMMANDS:
         if cmd_lower.startswith(pattern):
