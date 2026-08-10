@@ -28,12 +28,12 @@ logger = logging.getLogger("hello_agent")
 
 _DEFAULT_CONFIG: dict[str, Any] = {
     "agent_runtime": {
-        "response_protocol": "auto",
+        "response_protocol": "native",
         "legacy_execute": False,
-        "protocol_retry_limit": 1,
+        "protocol_retry_limit": 0,
         "raw_response_audit": "errors",
         "raw_response_max_chars": 20000,
-        "native_tool_streaming": False,
+        "native_tool_streaming": True,
     },
     "llm": {
         "model_id": "",

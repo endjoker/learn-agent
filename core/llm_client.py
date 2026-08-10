@@ -10,6 +10,7 @@ LLM 客户端模块 —— 与各种大语言模型 API 通信的核心组件
     model_id / timeout / models（各模型的 api_key、base_url、protocol 等）
 """
 
+import json
 import os
 import re
 import time
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Callable
 
 from .protocols import create_adapter
+from .protocols.base import ChatResponse, ProviderToolCall
 
 logger = logging.getLogger('hello_agent')
 
@@ -480,6 +482,54 @@ class HelloAgentsLLM:
                 self.model, messages, tools, temperature, req_timeout)
         else:
             response = self._adapter.generate(self.model, messages, temperature, req_timeout)
+        self.last_usage = response.usage
+        return response
+
+    def stream_with_tools(self, messages: List[Dict], tools: List[Dict], *,
+                          temperature: float = 0, timeout: Optional[int] = None,
+                          on_event=None) -> ChatResponse:
+        """Return one native structured turn while forwarding provider events.
+
+        No textual command grammar is used as a fallback.  Providers without
+        tool streaming still use native non-streaming function calls.
+        """
+        req_timeout = timeout or self._config_timeout
+        try:
+            events = self._adapter.generate_stream_with_tools(
+                self.model, messages, tools, temperature, req_timeout)
+        except (AttributeError, NotImplementedError):
+            response = self.complete(messages, tools=tools,
+                                     temperature=temperature, timeout=req_timeout)
+            for call in response.tool_calls:
+                if on_event:
+                    on_event({"type": "tool_call_start", "call_id": call.call_id,
+                              "name": call.name, "order": call.order})
+                    on_event({"type": "tool_call_end", "call_id": call.call_id,
+                              "name": call.name, "arguments": call.arguments,
+                              "order": call.order})
+            if response.text and on_event:
+                on_event({"type": "text_delta", "text": response.text})
+            return response
+
+        text_parts: List[str] = []
+        calls: List[ProviderToolCall] = []
+        for event in events:
+            payload = {
+                "type": event.type, "text": event.text, "call_id": event.call_id,
+                "name": event.name, "arguments_delta": event.arguments_delta,
+                "arguments": event.arguments, "order": event.order,
+            }
+            if on_event:
+                on_event(payload)
+            if event.type == "text_delta":
+                text_parts.append(event.text)
+            elif event.type == "tool_call_end":
+                raw = json.dumps(event.arguments or {}, ensure_ascii=False)
+                calls.append(ProviderToolCall(event.call_id, event.name,
+                                              event.arguments or {}, raw, event.order))
+        response = ChatResponse(text="".join(text_parts), tool_calls=calls,
+                                finish_reason="tool_calls" if calls else "stop",
+                                usage=self._adapter.last_usage)
         self.last_usage = response.usage
         return response
 

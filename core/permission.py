@@ -458,14 +458,14 @@ class PermissionChecker:
         for key in ("file_path", "path", "dest"):
             val = params.get(key)
             if val:
-                p = resolve_path(val, self.workspace)
-                if not is_within_workspace(p, self.workspace):
+                p = self._resolve(val)
+                if not self._within(p):
                     return True
         paths_list = params.get("paths", [])
         if isinstance(paths_list, list):
             for p_str in paths_list:
-                p = resolve_path(p_str, self.workspace)
-                if not is_within_workspace(p, self.workspace):
+                p = self._resolve(p_str)
+                if not self._within(p):
                     return True
         return False
 

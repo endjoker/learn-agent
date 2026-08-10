@@ -15,7 +15,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 
 @dataclass
@@ -36,6 +36,18 @@ class ChatResponse:
     usage: Optional[Dict[str, int]] = None
     raw_metadata: Optional[Dict] = None
     """{"input_tokens": N, "output_tokens": M}"""
+
+
+@dataclass
+class ProviderStreamEvent:
+    """A normalized provider event; control data never shares the text channel."""
+    type: str
+    text: str = ""
+    call_id: str = ""
+    name: str = ""
+    arguments_delta: str = ""
+    arguments: Optional[dict] = None
+    order: int = 0
 
 
 class ProtocolAdapter(ABC):
@@ -95,6 +107,17 @@ class ProtocolAdapter(ABC):
             str: 增量文本块
         """
         ...
+
+    def generate_stream_with_tools(self, model: str, messages: List[Dict],
+                                   tools: List[Dict], temperature: float = 0,
+                                   timeout: int = 60) -> Iterator[ProviderStreamEvent]:
+        """Optional native tool-call stream.
+
+        Adapters that do not implement this are handled by the non-streaming
+        native fallback in ``HelloAgentsLLM``; they must not fall back to a
+        textual tool protocol.
+        """
+        raise NotImplementedError
 
     # ============================================================
     # 消息翻译辅助

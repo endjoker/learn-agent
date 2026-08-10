@@ -1,11 +1,11 @@
 {
   "agent_runtime": {
-    "response_protocol": "auto",
+    "response_protocol": "native",
     "legacy_execute": false,
-    "protocol_retry_limit": 1,
+    "protocol_retry_limit": 0,
     "raw_response_audit": "errors",
     "raw_response_max_chars": 20000,
-    "native_tool_streaming": false
+    "native_tool_streaming": true
   },
   "llm": {
     "model_id": "ornith",
@@ -30,6 +30,9 @@
   },
   "permission": {
     "workspace": "./workspace",
+    "extra_workspaces": [
+      "."
+    ],
     "default_mode": "ask",
     "tool_rules": {
       "grep": "allow",

@@ -31,6 +31,7 @@ import os
 import sys
 import queue
 import threading
+import uuid
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -65,6 +66,24 @@ from memory import MemoryManager
 from skills import SkillManager, SkillTool, CreateSkillTool
 from core.sandbox import SandboxExecutor
 from core.hook import HookManager, HookEvent, Decision
+
+
+def _configured_workspace_path(config: Optional[dict] = None) -> Path:
+    """Return the configured workspace anchored to the project root.
+
+    ``create_agent`` changes the process CWD to the workspace.  Resolving a
+    relative setting against that mutable CWD would turn ``./workspace`` into
+    ``workspace/workspace`` on later agent creation or prompt rebuilding.
+    """
+    if config is None:
+        config = load_config()
+    configured = config.get("permission", {}).get("workspace", "./workspace")
+    path = Path(configured)
+    if path.is_absolute():
+        return path.resolve()
+    from core.config_loader import _find_project_root
+    return (_find_project_root() / path).resolve()
+
 
 # ============================================================
 # ReAct 关键字（英文，避免中文编码兼容问题）
@@ -593,10 +612,8 @@ class Agent:
         # 设置工作区路径（从 config 读取，解析为绝对路径）
         try:
             from core.config_loader import load_config
-            from pathlib import Path as _Path
             _cfg = load_config()
-            _ws = _cfg.get("permission", {}).get("workspace", "./workspace")
-            builder.set_workspace(str(_Path(_ws).resolve()))
+            builder.set_workspace(str(_configured_workspace_path(_cfg)))
         except Exception:
             builder.set_workspace(os.getcwd())
         return builder.build(tool_descs=tool_descs, skill_descs=skill_descs, mcp_descs=mcp_descs)
@@ -1028,10 +1045,14 @@ class Agent:
             return f"❌ 工具出错: {type(e).__name__}: {e}"
 
     def _emit_event(self, event_type: str, **payload) -> None:
-        """Best-effort runtime event sink used by WebUI and stream_run."""
+        """Emit one ordered, typed runtime event to every presentation layer."""
         sink = getattr(self, "_event_sink", None)
         if sink:
             try:
+                self._event_seq = getattr(self, "_event_seq", 0) + 1
+                payload.setdefault("run_id", getattr(self, "_run_id", ""))
+                payload.setdefault("turn_id", getattr(self, "_turn_id", ""))
+                payload.setdefault("sequence", self._event_seq)
                 sink({"type": event_type, "data": payload})
             except Exception:
                 logger.debug("运行事件投递失败", exc_info=True)
@@ -1046,6 +1067,194 @@ class Agent:
     # ============================================================
 
     def run(self, user_input: str, verbose: bool = True,
+            images: list | None = None, event_sink=None) -> str:
+        """Run the native, typed tool-call loop.
+
+        Tools are never parsed from model text.  The provider yields native
+        function calls; this loop validates, authorizes, executes and records
+        them as separate assistant/tool messages, mirroring Pi's agent loop.
+        """
+        self._event_sink = event_sink
+        self._run_id = uuid.uuid4().hex
+        self._event_seq = 0
+        if not hasattr(self, "hooks"):
+            self.hooks = HookManager(enabled=False)
+        if not hasattr(self, "_task_list"):
+            self._task_list = None
+        if not hasattr(self, "_stop_block_count"):
+            self._stop_block_count = 0
+        self._init_mcp_if_needed()
+        if not self.messages:
+            self.messages.append({"role": "system", "content": self.system_prompt})
+        self._light_compress()
+        self._check_context(verbose=verbose)
+        hr = self.hooks.run_user_prompt(user_input)
+        if hr.decision == Decision.BLOCK:
+            return f"⛔ 输入被 hook 拦截: {hr.reason}"
+        if hr.decision == Decision.MODIFY and hr.data:
+            user_input = hr.data.get("prompt", user_input)
+        user_message = {"role": "user", "content": user_input}
+        if images:
+            blocks = ([{"type": "text", "text": user_input}] if user_input else []) + list(images)
+            user_message["content"] = blocks
+        self.messages.append(user_message)
+        self._truncate_history()
+        self._emit_event("agent_start", message_id="user")
+        self._emit_event("message_start", role="user", content=user_input)
+        self._emit_event("message_end", role="user")
+        provider_tools, name_map = self.tool_registry.get_provider_tools()
+
+        for step in range(1, self.max_steps + 1):
+            if self._consume_stop():
+                self.store.save_session()
+                self._emit_event("agent_end", reason="stopped")
+                return "⏹️ 已停止"
+            self._turn_id = f"turn_{step}"
+            self._emit_event("turn_start", step=step)
+            assistant_id = uuid.uuid4().hex
+            self._emit_event("message_start", message_id=assistant_id, role="assistant")
+            try:
+                native_stream = is_enabled(
+                    load_config().get("agent_runtime", {}).get("native_tool_streaming"), True)
+                if native_stream:
+                    response = self.llm.stream_with_tools(
+                        self.messages, provider_tools, temperature=0,
+                        on_event=lambda event: self._forward_provider_event(assistant_id, event),
+                    )
+                else:
+                    response = self.llm.complete(self.messages, tools=provider_tools, temperature=0)
+                    for call in response.tool_calls:
+                        self._forward_provider_event(assistant_id, {
+                            "type": "tool_call_start", "call_id": call.call_id,
+                            "name": call.name, "order": call.order,
+                        })
+                        self._forward_provider_event(assistant_id, {
+                            "type": "tool_call_end", "call_id": call.call_id,
+                            "name": call.name, "arguments": call.arguments, "order": call.order,
+                        })
+                    if response.text:
+                        self._forward_provider_event(assistant_id,
+                                                     {"type": "text_delta", "text": response.text})
+            except Exception as exc:
+                logger.error("原生工具调用失败: %s", exc, exc_info=True)
+                self._emit_event("message_end", message_id=assistant_id, status="error")
+                self._emit_event("agent_end", reason="error")
+                return f"❌ LLM 调用失败: {exc}"
+            self.store.set_anchor(self.llm.last_usage)
+
+            if not response.tool_calls:
+                answer = response.text.strip()
+                self.messages.append({"role": "assistant", "content": answer, "kind": "final"})
+                self._emit_event("message_end", message_id=assistant_id, role="assistant",
+                                 content=answer, finish_reason=response.finish_reason)
+                self._emit_event("turn_end", step=step, tool_calls=0)
+                self._emit_event("agent_end", reason="completed")
+                self.store.save_session()
+                self._save_memory(user_input)
+                return answer or "（模型未返回可见文本）"
+
+            native_calls = []
+            for call in sorted(response.tool_calls, key=lambda item: item.order):
+                call_id = call.call_id or uuid.uuid4().hex
+                internal_name = name_map.get(call.name)
+                if internal_name is None and self.tool_registry.get_tool(call.name):
+                    internal_name = call.name
+                native_calls.append((call_id, call.name, internal_name, call.arguments, call.raw_arguments))
+            self.messages.append({
+                "role": "assistant", "content": response.text or None, "kind": "tool_calls",
+                "tool_calls": [{"id": call_id, "type": "function", "function": {
+                    "name": provider_name, "arguments": raw_arguments or "{}"}}
+                    for call_id, provider_name, _, _, raw_arguments in native_calls],
+            })
+            self._emit_event("message_end", message_id=assistant_id, role="assistant",
+                             finish_reason="tool_calls")
+
+            result_count = 0
+            for call_id, provider_name, tool_name, arguments, raw_arguments in native_calls:
+                observation, is_error = self._execute_native_tool_call(
+                    call_id, provider_name, tool_name, arguments, raw_arguments)
+                self.messages.append({"role": "tool", "tool_call_id": call_id,
+                                      "name": provider_name, "content": observation,
+                                      "kind": "tool_result", "is_error": is_error})
+                self._emit_event("message_start", message_id=f"result_{call_id}", role="tool",
+                                 tool_call_id=call_id, tool=tool_name or provider_name)
+                self._emit_event("message_end", message_id=f"result_{call_id}", role="tool",
+                                 tool_call_id=call_id, tool=tool_name or provider_name,
+                                 content=observation, is_error=is_error)
+                result_count += 1
+            self._emit_event("turn_end", step=step, tool_calls=result_count)
+            self._light_compress()
+            self._check_context(verbose=False)
+            self._truncate_history()
+
+        self.store.save_session()
+        self._emit_event("agent_end", reason="max_steps")
+        return f"⚠️ 已达最大步骤数 {self.max_steps}"
+
+    def _forward_provider_event(self, assistant_id: str, event: dict) -> None:
+        """Project provider-native events into the stable Agent event schema."""
+        event_type = event.get("type")
+        if event_type == "text_delta":
+            self._emit_event("text_delta", message_id=assistant_id, text=event.get("text", ""))
+        elif event_type == "tool_call_start":
+            self._emit_event("tool_call_start", message_id=assistant_id,
+                             tool_call_id=event.get("call_id", ""), tool=event.get("name", ""),
+                             order=event.get("order", 0))
+        elif event_type == "tool_call_delta":
+            self._emit_event("tool_call_delta", message_id=assistant_id,
+                             tool_call_id=event.get("call_id", ""), tool=event.get("name", ""),
+                             arguments_delta=event.get("arguments_delta", ""), order=event.get("order", 0))
+        elif event_type == "tool_call_end":
+            self._emit_event("tool_call_end", message_id=assistant_id,
+                             tool_call_id=event.get("call_id", ""), tool=event.get("name", ""),
+                             arguments=event.get("arguments", {}), order=event.get("order", 0))
+
+    def _execute_native_tool_call(self, call_id, provider_name, tool_name, arguments, raw_arguments):
+        """Validate and execute one typed tool call, always producing a result."""
+        display_name = tool_name or provider_name
+        self._emit_event("tool_execution_start", tool_call_id=call_id, tool=display_name,
+                         arguments=arguments)
+        if not tool_name:
+            observation, is_error = f"❌ 未知工具: {provider_name}", True
+        elif not isinstance(arguments, dict) or "__invalid_raw_arguments__" in arguments:
+            observation, is_error = "❌ 工具参数不是完整 JSON 对象", True
+        else:
+            errors = self.tool_registry.validate_arguments(tool_name, arguments)
+            if errors:
+                observation, is_error = "❌ 参数校验失败: " + "; ".join(errors), True
+            else:
+                level, reason = self._gate_check(tool_name, arguments)
+                if level == DENY:
+                    self.hooks.run_denied(tool_name, reason or "权限不足", level="gate")
+                    observation, is_error = f"⛔ 已拒绝: {reason or '权限不足'}", True
+                elif level == ASK:
+                    answer = self._ask_user(tool_name, arguments)
+                    if answer not in ("", "y", "yes", "a"):
+                        observation, is_error = "⏭️ 用户未批准工具调用", True
+                    else:
+                        observation, is_error = self._execute_native_tool(tool_name, arguments)
+                else:
+                    observation, is_error = self._execute_native_tool(tool_name, arguments)
+        self._emit_event("tool_execution_end", tool_call_id=call_id, tool=display_name,
+                         result=observation, is_error=is_error)
+        return observation, is_error
+
+    def _execute_native_tool(self, tool_name: str, arguments: dict):
+        phr = self.hooks.run_pre_tool(tool_name, arguments, gate_level="allow")
+        if phr.decision == Decision.BLOCK:
+            return f"⛔ hook 拦截: {phr.reason}", True
+        if phr.decision == Decision.MODIFY and phr.data:
+            arguments = phr.data
+        observation = self._execute_tool(tool_name, json.dumps(arguments, ensure_ascii=False))
+        is_error = observation.startswith(("❌", "⛔", "⏭️"))
+        phr = self.hooks.run_post_tool(tool_name, arguments, observation, is_error)
+        if phr.decision == Decision.MODIFY and phr.data:
+            observation = phr.data.get("result", observation)
+        elif phr.decision == Decision.BLOCK:
+            observation, is_error = f"⛔ hook 拦截: {phr.reason}", True
+        return observation, is_error
+
+    def _run_legacy(self, user_input: str, verbose: bool = True,
             images: list | None = None, event_sink=None) -> str:
         """
 
@@ -1680,17 +1889,20 @@ class Agent:
 
     def stream_run(self, user_input: str, images: list | None = None):
         """Backward-compatible text view over the canonical Agent loop."""
+        visible_text_emitted = False
         for event in self.run_events(user_input, images=images):
             event_type = event["type"]
             data = event["data"]
             if event_type == "text_delta":
+                visible_text_emitted = True
                 yield data.get("text", "")
             elif event_type == "text_reset":
                 yield "\n"
-            elif event_type == "tool_result":
+            elif event_type in {"tool_result", "tool_execution_end"}:
                 yield f"\n{data.get('result', '')}\n"
             elif event_type == "final":
-                yield data.get("answer", "")
+                if not visible_text_emitted:
+                    yield data.get("answer", "")
             elif event_type == "error":
                 yield f"❌ {data.get('message', '流式运行失败')}"
         return
@@ -1879,8 +2091,7 @@ def create_agent(
         set_debug(True)
     # 工作目录：从配置读取，chdir 到该目录（所有模式统一生效）
     from core.config_loader import load_config as _lc
-    _ws = _lc().get("permission", {}).get("workspace", "./workspace")
-    _ws_path = os.path.abspath(_ws)
+    _ws_path = str(_configured_workspace_path(_lc()))
     os.makedirs(_ws_path, exist_ok=True)
     os.chdir(_ws_path)
     llm = HelloAgentsLLM(model=model, api_key=api_key, base_url=base_url, provider=provider)

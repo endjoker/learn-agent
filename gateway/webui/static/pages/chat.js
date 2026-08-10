@@ -19,6 +19,7 @@ window.PageChat = class {
     this._busy = false;
     this._streamBubble = null;
     this._streamText = "";
+    this._streamMessageId = "";
     this._closedStreamIds = new Set();
   }
 
@@ -291,6 +292,25 @@ window.PageChat = class {
         i++; continue;
       }
       const content = m.content_text ?? (typeof m.content === "string" ? m.content : "");
+      if (m.role === "assistant" && m.kind === "tool_calls") {
+        const group = HA.el("div", { class: "tool-group" });
+        let j = i + 1;
+        while (j < messages.length && messages[j].role === "tool") {
+          const toolResult = messages[j];
+          group.appendChild(this._toolCard({
+            tool: toolResult.name || "tool",
+            input: "",
+            result: toolResult.content_text ?? toolResult.content ?? "",
+            ok: !toolResult.is_error,
+          }, false));
+          j++;
+        }
+        if (j > i + 1) {
+          this._msgArea.appendChild(group);
+          i = j;
+          continue;
+        }
+      }
       const isStructuredToolCall = m.role === "assistant" && (
         m.kind === "tool_calls" ||
         (content.includes("agent.turn.v1") &&
@@ -472,9 +492,10 @@ window.PageChat = class {
   _appendAssistant(text) { this._msgArea.appendChild(this._bubble({ role: "assistant", content: text })); this._scrollBottom(); }
   _appendSystem(text) { this._msgArea.appendChild(this._bubble({ role: "system", content: text })); this._scrollBottom(); }
 
-  _startStream() {
-    if (this._streamBubble) return;
+  _startStream(messageId) {
+    if (this._streamBubble && this._streamMessageId === messageId) return;
     this._streamText = "";
+    this._streamMessageId = messageId || "";
     this._streamBubble = this._bubble({ role: "assistant", content: "" });
     this._msgArea.appendChild(this._streamBubble);
   }
@@ -482,7 +503,7 @@ window.PageChat = class {
   _appendStreamDelta(text, messageId) {
     if (messageId && this._closedStreamIds.has(messageId)) return;
     if (!text) return;
-    this._startStream();
+    this._startStream(messageId);
     this._streamText += text;
     const body = this._streamBubble.querySelector(".bubble-text");
     body.innerHTML = HA.renderMd(this._streamText);
@@ -494,6 +515,7 @@ window.PageChat = class {
     if (this._streamBubble) this._streamBubble.remove();
     this._streamBubble = null;
     this._streamText = "";
+    this._streamMessageId = "";
   }
 
   _finishStream(answer, messageId) {
@@ -509,6 +531,7 @@ window.PageChat = class {
       body.innerHTML = HA.renderMd(answer);
       this._streamBubble = null;
       this._streamText = "";
+      this._streamMessageId = "";
       this._scrollBottom();
     } else if (answer) {
       this._appendAssistant(answer);
@@ -605,21 +628,28 @@ window.PageChat = class {
     this._offs.push(HA.onSSE("chat.stop_requested", d => {
       if (d.session_key === sk()) this._setBusy(false);
     }));
-    this._offs.push(HA.onSSE("chat.tool.start", d => {
+    this._offs.push(HA.onSSE("chat.tool_call_start", d => {
       if (d.session_key !== sk()) return;
-      const card = this._toolCard({ tool: d.tool, input: d.params_preview, result: "" }, true);
-      card.dataset.tool = d.tool;
+      const card = this._toolCard({ tool: d.tool, input: "", result: "" }, true);
+      card.dataset.toolCallId = d.tool_call_id;
       this._msgArea.appendChild(card);
       this._scrollBottom();
     }));
-    this._offs.push(HA.onSSE("chat.tool.done", d => {
+    this._offs.push(HA.onSSE("chat.tool_call_end", d => {
       if (d.session_key !== sk()) return;
-      const cards = [...this._msgArea.querySelectorAll(".tool-card")];
-      const card = [...cards].reverse().find(c => c.dataset.tool === d.tool);
+      const card = this._msgArea.querySelector(`.tool-card[data-tool-call-id="${d.tool_call_id}"]`);
       if (card) {
-        card.querySelector(".tool-ico").textContent = d.ok ? "✅" : "❌";
         const pres = card.querySelectorAll(".tool-io pre");
-        if (pres.length > 1) pres[1].textContent = d.preview || "";
+        if (pres.length) pres[0].textContent = JSON.stringify(d.arguments || {}, null, 2);
+      }
+    }));
+    this._offs.push(HA.onSSE("chat.tool_execution_end", d => {
+      if (d.session_key !== sk()) return;
+      const card = this._msgArea.querySelector(`.tool-card[data-tool-call-id="${d.tool_call_id}"]`);
+      if (card) {
+        card.querySelector(".tool-ico").textContent = d.is_error ? "❌" : "✅";
+        const pres = card.querySelectorAll(".tool-io pre");
+        if (pres.length > 1) pres[1].textContent = d.result || "";
       }
     }));
     this._offs.push(HA.onSSE("chat.tool.denied", d => {

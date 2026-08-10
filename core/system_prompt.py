@@ -52,6 +52,14 @@ _DEFAULT_TOOLS = """\
 - 工具能满足需求就不要拼 shell 命令"""
 
 # 代码固定规则（不文件化——这些是框架级的，不由用户编辑）
+_NATIVE_TOOL_RULES = """\
+【工具调用协议】
+- 工具由运行时通过原生 function calling 提供；需要工具时直接选择工具并填写参数。
+- 不要输出 ACTION、INPUT、FINAL_ANSWER、agent.turn.v1 或任何 JSON 工具调用协议。
+- 只输出给用户阅读的自然语言或 Markdown；工具结果会自动进入下一轮上下文。
+【安全】
+- 高风险操作前说明风险并请求确认；不得泄露密钥或执行破坏性系统操作。"""
+
 _CODE_FIXED_RULES = """\
 【技能使用规则】
 - 技能是 AI 学习到的可复用能力，调用后返回操作指令，不是最终结果
@@ -221,7 +229,7 @@ class SystemPrompt:
         parts.append(dynamic_descs)
 
         # 4. 代码固定规则（格式/安全/命令/配置）
-        parts.append(_CODE_FIXED_RULES)
+        parts.append(_NATIVE_TOOL_RULES)
 
         body = "\n\n".join(parts)
         return f"<SYSTEM_STATIC_CONTEXT>\n{body}\n</SYSTEM_STATIC_CONTEXT>"

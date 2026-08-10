@@ -458,6 +458,8 @@ def _collect_one_server(existing_servers: list) -> Optional[dict]:
 
     # 启用/禁用
     server["enabled"] = _ask_yes_no("立即启用此服务器？", default=True)
+    server["trust"] = _ask_yes_no(
+        "信任此服务器可提供可执行工具？", default=False)
 
     return server
 
@@ -529,25 +531,162 @@ def _load_example_filters() -> Optional[dict]:
 # ============================================================
 
 def _step_agent_runtime(existing: dict) -> Optional[dict]:
-    """Collect safe response-protocol settings for config.json."""
-    print("\n  🔄 Agent 响应协议")
+    """Configure the Pi-style native tool/event runtime.
+
+    Textual ACTION/JSON envelopes were removed from the execution path.  The
+    wizard therefore writes the fixed native mode instead of offering unsafe
+    legacy protocol choices.
+    """
+    print("\n  Agent 原生工具调用与流式事件")
     runtime = existing.get("agent_runtime", {})
-    protocol = _ask_choice("响应协议:", [
-        ("auto", "auto — 结构化工具调用（推荐）"),
-        ("json_envelope", "json_envelope — 完整 JSON 信封"),
-        ("legacy", "legacy — 仅兼容旧格式"),
-    ], default=1)
     changes: dict[str, Any] = {}
-    if protocol != runtime.get("response_protocol", "auto"):
-        changes["response_protocol"] = protocol
-    legacy = _ask_yes_no("允许旧 ACTION/INPUT 执行工具？（不推荐）",
-                         default=is_enabled(runtime.get("legacy_execute"), False))
-    if legacy != is_enabled(runtime.get("legacy_execute"), False):
-        changes["legacy_execute"] = legacy
-    retries = _ask_int("协议纠正重试次数", runtime.get("protocol_retry_limit", 1))
-    if retries != runtime.get("protocol_retry_limit", 1):
-        changes["protocol_retry_limit"] = retries
+    native_stream = _ask_yes_no(
+        "启用原生工具调用流式事件？",
+        default=is_enabled(runtime.get("native_tool_streaming"), True),
+    )
+    if runtime.get("response_protocol") != "native":
+        changes["response_protocol"] = "native"
+    if runtime.get("legacy_execute") is not False:
+        changes["legacy_execute"] = False
+    if runtime.get("protocol_retry_limit") != 0:
+        changes["protocol_retry_limit"] = 0
+    if runtime.get("native_tool_streaming") is not native_stream:
+        changes["native_tool_streaming"] = native_stream
     return {"agent_runtime": changes} if changes else None
+
+
+def _step_gateway_runtime(existing: dict) -> Optional[dict]:
+    """Configure gateway/session defaults that affect every channel."""
+    gateway = existing.get("gateway", {})
+    agent = gateway.get("agent", {})
+    sessions = gateway.get("sessions", {})
+    print("\n  Gateway / 会话运行参数")
+    changes: dict[str, Any] = {}
+
+    enabled = _ask_yes_no("启用 Gateway？", default=is_enabled(gateway.get("enabled"), True))
+    if enabled != is_enabled(gateway.get("enabled"), True):
+        changes["enabled"] = enabled
+    host = _ask("监听地址", str(gateway.get("host", "127.0.0.1")))
+    if host != gateway.get("host", "127.0.0.1"):
+        changes["host"] = host
+    port = _ask_int("监听端口", int(gateway.get("port", 9120)))
+    if port != gateway.get("port", 9120):
+        changes["port"] = port
+    workers = _ask_int("工作线程数", int(gateway.get("worker_pool_size", 4)))
+    if workers != gateway.get("worker_pool_size", 4):
+        changes["worker_pool_size"] = workers
+
+    agent_changes: dict[str, Any] = {}
+    max_steps = _ask_int("单轮最大工具步骤", int(agent.get("max_steps", 30)))
+    if max_steps != agent.get("max_steps", 30):
+        agent_changes["max_steps"] = max_steps
+    permission_mode = _ask_choice("Gateway 默认权限:", [
+        ("ask", "ask — 需要确认"), ("allow", "allow — 允许"),
+        ("unreviewed", "unreviewed — 不审查"),
+    ], default=1)
+    if permission_mode != agent.get("permission_mode", "ask"):
+        agent_changes["permission_mode"] = permission_mode
+    quiet = _ask_yes_no("静默运行（不向终端输出模型分片）？", default=is_enabled(agent.get("quiet"), True))
+    if quiet != is_enabled(agent.get("quiet"), True):
+        agent_changes["quiet"] = quiet
+    if agent_changes:
+        changes["agent"] = agent_changes
+
+    session_changes: dict[str, Any] = {}
+    for key, label, default in (
+        ("max_sessions", "最大并发会话数", 32),
+        ("idle_timeout_minutes", "会话空闲回收分钟数", 60),
+        ("soft_timeout_seconds", "软超时秒数", 90),
+        ("hard_timeout_seconds", "硬超时秒数", 300),
+    ):
+        value = _ask_int(label, int(sessions.get(key, default)))
+        if value != sessions.get(key, default):
+            session_changes[key] = value
+    persist = _ask_yes_no("持久化会话历史？", default=is_enabled(sessions.get("persist"), True))
+    if persist != is_enabled(sessions.get("persist"), True):
+        session_changes["persist"] = persist
+    if session_changes:
+        changes["sessions"] = session_changes
+
+    channel_changes: dict[str, Any] = {}
+    for channel_name in ("debug", "feishu", "weixin"):
+        current = gateway.get("channels", {}).get(channel_name, {})
+        current_enabled = is_enabled(current.get("enabled") if isinstance(current, dict) else current, False)
+        enabled_value = _ask_yes_no(f"启用渠道 {channel_name}？", default=current_enabled)
+        if enabled_value != current_enabled:
+            channel_changes[channel_name] = {"enabled": enabled_value}
+    if channel_changes:
+        changes["channels"] = channel_changes
+    return {"gateway": changes} if changes else None
+
+
+def _step_workspace_and_prompt(existing: dict) -> Optional[dict]:
+    """Configure workspace layout and prompt bootstrap budgets."""
+    workspace = existing.get("workspace", {})
+    permission = existing.get("permission", {})
+    prompt = existing.get("prompt", {})
+    print("\n  工作区与提示词预算")
+    changes: dict[str, Any] = {}
+    workspace_changes: dict[str, Any] = {}
+    # permission.workspace is the runtime source of truth.  Keep the
+    # workspace section in sync because it is exposed by the WebUI settings.
+    current_path = str(permission.get("workspace", workspace.get("path", "./workspace")))
+    path = _ask("工作区路径", current_path)
+    if path != workspace.get("path", "./workspace"):
+        workspace_changes["path"] = path
+    dirs = workspace.get("dirs", []) or []
+    raw_dirs = _ask("工作区子目录（逗号分隔）", ",".join(dirs))
+    new_dirs = [item.strip() for item in raw_dirs.split(",") if item.strip()]
+    if new_dirs != dirs:
+        workspace_changes["dirs"] = new_dirs
+    if workspace_changes:
+        changes["workspace"] = workspace_changes
+    if path != permission.get("workspace", "./workspace"):
+        changes["permission"] = {"workspace": path}
+
+    prompt_changes: dict[str, Any] = {}
+    for key, label, default in (
+        ("bootstrap_max_chars_per_file", "单个引导文件最大字符数", 8000),
+        ("bootstrap_max_chars_total", "引导文件总最大字符数", 32000),
+    ):
+        value = _ask_int(label, int(prompt.get(key, default)))
+        if value != prompt.get(key, default):
+            prompt_changes[key] = value
+    warning = _ask_choice("提示词截断警告:", [
+        ("once", "once — 每次会话提示一次"), ("always", "always — 每次截断提示"),
+        ("never", "never — 不提示"),
+    ], default=1)
+    if warning != prompt.get("truncation_warning", "once"):
+        prompt_changes["truncation_warning"] = warning
+    if prompt_changes:
+        changes["prompt"] = prompt_changes
+    return changes or None
+
+
+def _step_tool_security(existing: dict) -> Optional[dict]:
+    """Optionally collect explicit tool rules and sandbox network deny lists."""
+    if not _ask_yes_no("配置工具权限和网络封锁策略？", default=False):
+        return None
+    permission = existing.get("permission", {})
+    sandbox = existing.get("sandbox", {})
+    changes: dict[str, Any] = {}
+    if _ask_yes_no("编辑工具规则（每行 工具名=ask/allow/deny）？", default=False):
+        rules = _ask_kv_lines("工具规则")
+        invalid = {k: v for k, v in rules.items() if v not in {"ask", "allow", "deny"}}
+        if invalid:
+            print("  ⚠️ 已忽略无效规则值，仅允许 ask/allow/deny")
+            rules = {k: v for k, v in rules.items() if k not in invalid}
+        if rules:
+            changes["permission"] = {"tool_rules": rules}
+    if _ask_yes_no("编辑网络封锁域名/IP 列表？", default=False):
+        network = sandbox.get("network", {})
+        domains = _ask("封锁域名（逗号分隔）", ",".join(network.get("blocked_domains", [])))
+        ips = _ask("封锁 IP/CIDR（逗号分隔）", ",".join(network.get("blocked_ips", [])))
+        changes["sandbox"] = {"network": {
+            "blocked_domains": [x.strip() for x in domains.split(",") if x.strip()],
+            "blocked_ips": [x.strip() for x in ips.split(",") if x.strip()],
+        }}
+    return changes or None
 
 
 def _step_webui_security(existing: dict) -> Optional[dict]:
@@ -608,6 +747,18 @@ def _step_advanced(existing: dict) -> Optional[dict]:
     ws = _ask("工作区路径", current_ws)
     if ws != current_ws:
         perm_changes["workspace"] = ws
+
+    # The project root is an explicit extra root by default.  It lets the
+    # agent edit project source/config files while keeping unrelated paths
+    # outside the permission boundary.
+    current_extra = perm_cfg.get("extra_workspaces", ["."])
+    if not isinstance(current_extra, list):
+        current_extra = ["."]
+    extra_raw = _ask("额外允许访问的工作区根路径（逗号分隔，. 表示项目根目录）",
+                     ",".join(str(item) for item in current_extra))
+    extra_workspaces = [item.strip() for item in extra_raw.split(",") if item.strip()]
+    if extra_workspaces != current_extra:
+        perm_changes["extra_workspaces"] = extra_workspaces
 
     if perm_changes:
         changes["permission"] = perm_changes
@@ -734,11 +885,20 @@ def run_init_wizard() -> int:
                 fragments.append(frag)
 
         # ---- 可选：高级选项 ----
-        if _ask_yes_no("\n⚙️  是否配置高级选项（permission / sandbox / runtime / WebUI）？", default=False):
+        if _ask_yes_no("\n⚙️  是否配置高级选项（安全 / runtime / Gateway / 工作区 / WebUI）？", default=False):
             frag = _step_advanced(existing)
             if frag:
                 fragments.append(frag)
             frag = _step_agent_runtime(existing)
+            if frag:
+                fragments.append(frag)
+            frag = _step_gateway_runtime(existing)
+            if frag:
+                fragments.append(frag)
+            frag = _step_workspace_and_prompt(existing)
+            if frag:
+                fragments.append(frag)
+            frag = _step_tool_security(existing)
             if frag:
                 fragments.append(frag)
             frag = _step_webui_security(existing)

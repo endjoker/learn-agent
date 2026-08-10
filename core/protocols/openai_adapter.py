@@ -12,7 +12,7 @@ from typing import Dict, Iterator, List, Optional
 
 from openai import OpenAI
 
-from .base import ChatResponse, ProtocolAdapter, ProviderToolCall
+from .base import ChatResponse, ProtocolAdapter, ProviderStreamEvent, ProviderToolCall
 
 logger = logging.getLogger('hello_agent')
 
@@ -47,12 +47,16 @@ class OpenAIAdapter(ProtocolAdapter):
         result = []
         for msg in messages:
             content = msg.get("content", "")
+            # ``kind`` is local persistence/UI metadata and is not an OpenAI
+            # Chat Completions field.  Native tool messages otherwise pass
+            # through unchanged (assistant.tool_calls and role=tool).
+            new_msg = {k: v for k, v in msg.items()
+                       if k not in {"kind", "content_text", "tokens"}}
             if isinstance(content, list):
-                new_msg = dict(msg)
                 new_msg["content"] = content_to_openai(content)
                 result.append(new_msg)
             else:
-                result.append(msg)
+                result.append(new_msg)
         return result
 
     # ============================================================
@@ -121,6 +125,53 @@ class OpenAIAdapter(ProtocolAdapter):
             content = chunk.choices[0].delta.content or ""
             collected.append(content)
             yield content
+
+    def generate_stream_with_tools(self, model: str, messages: List[Dict],
+                                   tools: List[Dict], temperature: float = 0,
+                                   timeout: int = 60) -> Iterator[ProviderStreamEvent]:
+        """Normalize OpenAI-compatible text and tool-call deltas."""
+        response = self.client.chat.completions.create(
+            model=model, messages=self._prepare_messages(messages), tools=tools,
+            tool_choice="auto", temperature=temperature, stream=True, timeout=timeout,
+        )
+        calls: dict[int, dict] = {}
+        for chunk in response:
+            if getattr(chunk, "usage", None):
+                self.last_usage = self._extract_usage(chunk.usage)
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield ProviderStreamEvent(type="text_delta", text=delta.content)
+            for partial in delta.tool_calls or []:
+                index = partial.index
+                item = calls.setdefault(index, {
+                    "id": partial.id or "", "name": "", "arguments": "", "started": False,
+                })
+                if partial.id:
+                    item["id"] = partial.id
+                function = partial.function
+                if function and function.name:
+                    item["name"] = function.name
+                if not item["started"] and item["id"] and item["name"]:
+                    item["started"] = True
+                    yield ProviderStreamEvent(type="tool_call_start", call_id=item["id"],
+                                              name=item["name"], order=index)
+                if function and function.arguments:
+                    item["arguments"] += function.arguments
+                    yield ProviderStreamEvent(type="tool_call_delta", call_id=item["id"],
+                                              name=item["name"], arguments_delta=function.arguments,
+                                              order=index)
+        for index, item in sorted(calls.items()):
+            raw = item["arguments"] or "{}"
+            try:
+                arguments = json.loads(raw)
+            except json.JSONDecodeError:
+                arguments = {"__invalid_raw_arguments__": raw}
+            if not isinstance(arguments, dict):
+                arguments = {"__invalid_raw_arguments__": raw}
+            yield ProviderStreamEvent(type="tool_call_end", call_id=item["id"],
+                                      name=item["name"], arguments=arguments, order=index)
 
     # ============================================================
     # Usage 提取

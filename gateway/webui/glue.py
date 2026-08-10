@@ -182,10 +182,9 @@ class Glue:
 
     def init_agent(self, agent, entry):
         """agent 创建后（executor 线程）：挂 BridgeHook 工具事件桥"""
-        hook = BridgeHook(self.module.bus, entry.session_key)
-        agent.hooks.register(HookEvent.PRE_TOOL, hook)
-        agent.hooks.register(HookEvent.POST_TOOL, hook)
-        agent.hooks.register(HookEvent.DENIED, hook)
+        # Runtime tool events carry call IDs and are forwarded by Dispatcher.
+        # Do not duplicate them through a hook side channel.
+        return None
 
     # ---------- 权限三档 ----------
 
