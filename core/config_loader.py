@@ -183,6 +183,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "webui": {
             "allow_non_loopback": False,
             "auth_token": "",
+            "allowed_ips": [],
         },
     },
 }

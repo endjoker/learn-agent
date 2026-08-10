@@ -59,8 +59,11 @@ class GatewayServer:
         is_loopback = self.host in {"127.0.0.1", "::1", "localhost"}
         if (webui_cfg.get("enabled", True)
                 and (webui_cfg.get("allow_non_loopback") or not is_loopback)
-                and not webui_cfg.get("auth_token")):
-            raise ValueError("非环回 WebUI 必须配置 gateway.webui.auth_token")
+                and not (webui_cfg.get("auth_token")
+                         or webui_cfg.get("allowed_ips"))):
+            raise ValueError(
+                "非环回 WebUI 必须配置 gateway.webui.auth_token "
+                "或 gateway.webui.allowed_ips")
 
         # 启动会话管理
         await self.session_mgr.start()

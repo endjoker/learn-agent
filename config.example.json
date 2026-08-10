@@ -165,6 +165,20 @@
       }
     ]
   },
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 9120,
+    "channels": {
+      "webui": {
+        "enabled": true
+      }
+    },
+    "webui": {
+      "allow_non_loopback": false,
+      "allowed_ips": [],
+      "auth_token": ""
+    }
+  },
   "sandbox": {
     "enabled": true,
     "idle_timeout_seconds": 300,

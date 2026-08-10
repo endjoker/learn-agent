@@ -8,6 +8,7 @@ WebUIModule —— 六模块控制台装配入口（P3a 基建）
 
 import asyncio
 import hmac
+import ipaddress
 import logging
 from pathlib import Path
 from urllib.parse import urlparse
@@ -39,6 +40,26 @@ def _is_loopback(remote: str) -> bool:
     return tail in _LOOPBACK or tail.startswith("127.")
 
 
+def _parse_allowed_networks(values) -> tuple[ipaddress._BaseNetwork, ...]:
+    """Parse configured client IPs/CIDRs once when the WebUI starts."""
+    if not values:
+        return ()
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, (list, tuple)):
+        raise ValueError("gateway.webui.allowed_ips 必须是 IP 或 CIDR 字符串列表")
+
+    networks = []
+    for value in values:
+        try:
+            networks.append(ipaddress.ip_network(str(value).strip(), strict=False))
+        except ValueError as exc:
+            raise ValueError(
+                f"gateway.webui.allowed_ips 包含无效地址: {value!r}"
+            ) from exc
+    return tuple(networks)
+
+
 class WebUIModule:
     """WebUI 装配类"""
 
@@ -47,6 +68,8 @@ class WebUIModule:
         self.session_mgr = session_mgr
         self.config = config or {}
         self._auth_token = str(self.config.get("auth_token") or "")
+        self._allowed_networks = _parse_allowed_networks(
+            self.config.get("allowed_ips", []))
         self.bus = EventBus()
         self.channel = WebuiChannel(self.bus)
         self._sse = SSEHandler(self.bus)
@@ -205,11 +228,22 @@ class WebUIModule:
                                "gateway.webui.allow_non_loopback（并知悉风险）"},
                     status=403)
             if not _is_loopback(remote):
-                supplied = request.headers.get("Authorization", "")
-                if (not supplied.startswith("Bearer ") or not self._auth_token
-                        or not hmac.compare_digest(supplied[7:], self._auth_token)):
-                    return web.json_response(
-                        {"error": "authentication required"}, status=401)
+                if self._allowed_networks:
+                    try:
+                        remote_ip = ipaddress.ip_address(remote)
+                    except ValueError:
+                        return web.json_response(
+                            {"error": "invalid client IP"}, status=403)
+                    if not any(remote_ip in network
+                               for network in self._allowed_networks):
+                        return web.json_response(
+                            {"error": "client IP is not allowed"}, status=403)
+                else:
+                    supplied = request.headers.get("Authorization", "")
+                    if (not supplied.startswith("Bearer ") or not self._auth_token
+                            or not hmac.compare_digest(supplied[7:], self._auth_token)):
+                        return web.json_response(
+                            {"error": "authentication required"}, status=401)
             # Origin：仅当存在且与 host 不匹配时拒绝（防跨站发起环回请求；
             # 缺失放行，不误杀同源 SSE/curl）
             origin = request.headers.get("Origin")
