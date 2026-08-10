@@ -15,6 +15,7 @@ ToolRegistry 负责：
 
 from typing import Dict, List, Optional
 from .base_tool import BaseTool
+from core.tool_schema import ToolNameCodec, validate_arguments
 
 
 class ToolRegistry:
@@ -102,6 +103,26 @@ class ToolRegistry:
             工具实例，如果没找到返回 None
         """
         return self._tools.get(name)
+
+    def validate_arguments(self, name: str, arguments: dict) -> list[str]:
+        """Validate before security checks or ``execute``; unknown tools fail closed."""
+        tool = self.get_tool(name)
+        if tool is None:
+            return [f"unknown tool: {name}"]
+        return validate_arguments(tool.parameters, arguments)
+
+    def get_provider_tools(self) -> tuple[list[dict], dict[str, str]]:
+        """OpenAI-compatible schemas plus provider-name -> internal-name mapping."""
+        mapping: dict[str, str] = {}
+        tools: list[dict] = []
+        for tool in self.list_tools():
+            provider_name = ToolNameCodec.encode(tool.name)
+            mapping[provider_name] = tool.name
+            tools.append({"type": "function", "function": {
+                "name": provider_name, "description": tool.description,
+                "parameters": tool.parameters,
+            }})
+        return tools, mapping
 
     def list_tools(self) -> List[BaseTool]:
         """

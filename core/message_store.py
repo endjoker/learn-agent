@@ -9,7 +9,10 @@
 """
 
 import json
+import os
 import secrets
+import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Callable
@@ -17,6 +20,15 @@ from typing import List, Dict, Optional, Callable
 
 # 会话文件存放目录
 DEFAULT_SESSION_DIR = Path(__file__).resolve().parent.parent / "sessions"
+_SESSION_LOCKS: dict[str, threading.RLock] = {}
+_SESSION_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(path: Path) -> threading.RLock:
+    """Return a process-local lock for a session path."""
+    key = str(path.resolve())
+    with _SESSION_LOCKS_GUARD:
+        return _SESSION_LOCKS.setdefault(key, threading.RLock())
 
 
 def _content_to_text(content) -> str:
@@ -178,7 +190,8 @@ class MessageStore:
 
     def get_tool_calls(self) -> List[Dict]:
         return [m for m in self._messages
-                if m.get("role") == "assistant" and "ACTION" in _content_to_text(m.get("content", ""))]
+                if m.get("role") == "assistant" and (
+                    m.get("kind") == "tool_calls" or m.get("tool_calls"))]
 
     # ============================================================
     # 锚点追踪（API 返回的精确 token 计数）
@@ -262,17 +275,17 @@ class MessageStore:
         将会话序列化为字典（不含 system prompt）
         """
         messages = [
-            {
-                "role": msg["role"],
-                "name": msg.get("name"),
+            {**{
+                "role": msg["role"], "name": msg.get("name"),
                 "content": msg["content"],
                 "tokens": _estimate_tokens(msg.get("content", "")),
-            }
+            }, **{key: msg[key] for key in ("kind", "tool_calls", "tool_call_id", "is_error") if key in msg}}
             for msg in self._messages
             if msg.get("role") != "system"
         ]
 
         result = {
+            "schema_version": 2,
             "session_id": self.session_id,
             "created_at": self._created_at.isoformat(),
             "model_id": self.model_id,
@@ -302,10 +315,23 @@ class MessageStore:
             session_dir.mkdir(parents=True, exist_ok=True)
             filepath = str(session_dir / f"{self.session_id}.json")
 
+        target = Path(filepath)
+        target.parent.mkdir(parents=True, exist_ok=True)
         data = self.to_session_data()
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return filepath
+        # Write + fsync + replace keeps the old session recoverable if a
+        # process crashes or is interrupted during persistence.
+        with _lock_for(target):
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_name, target)
+            finally:
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
+        return str(target)
 
     def load_session_data(self, data: Dict):
         """
@@ -324,10 +350,17 @@ class MessageStore:
         # 注意：使用 clear + extend 保持列表对象不变，避免外部引用断开
         loaded = data.get("messages", [])
         self._messages.clear()
-        self._messages.extend(
-            {"role": m["role"], "content": m["content"], **({"name": m["name"]} if m.get("name") else {})}
-            for m in loaded
-        )
+        for m in loaded:
+            msg = {"role": m["role"], "content": m.get("content", "")}
+            if m.get("name"):
+                msg["name"] = m["name"]
+            for key in ("kind", "tool_calls", "tool_call_id", "is_error"):
+                if key in m:
+                    msg[key] = m[key]
+            # v1 tool results were stored as user/name=tool_result.
+            if msg["role"] == "user" and msg.get("name") == "tool_result":
+                msg.setdefault("kind", "tool_result")
+            self._messages.append(msg)
 
         # 恢复创建时间
         created = data.get("created_at")

@@ -73,6 +73,15 @@ class WebuiChannel(Channel):
             "text": text,
         })
 
+    def publish_agent_event(self, msg: InboundMessage, event: dict) -> None:
+        """Forward a worker-thread Agent runtime event to the SSE bus."""
+        event_type = event.get("type")
+        if not event_type:
+            return
+        payload = dict(event.get("data") or {})
+        payload.update({"session_key": msg.session_key, "message_id": msg.message_id})
+        self.bus.publish(f"chat.{event_type}", payload)
+
     def status(self) -> dict:
         return {"name": self.name, "status": "ok",
                 "pending": len(self._pending)}

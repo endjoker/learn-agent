@@ -1,4 +1,12 @@
 {
+  "agent_runtime": {
+    "response_protocol": "auto",
+    "legacy_execute": false,
+    "protocol_retry_limit": 1,
+    "raw_response_audit": "errors",
+    "raw_response_max_chars": 20000,
+    "native_tool_streaming": false
+  },
   "llm": {
     "model_id": "ornith",
     "timeout": 60,

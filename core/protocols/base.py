@@ -14,15 +14,27 @@
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional
+
+
+@dataclass
+class ProviderToolCall:
+    call_id: str
+    name: str
+    arguments: dict
+    raw_arguments: str | None = None
+    order: int = 0
 
 
 @dataclass
 class ChatResponse:
     """非流式响应的统一数据结构"""
     text: str
+    tool_calls: List[ProviderToolCall] = field(default_factory=list)
+    finish_reason: str = "unknown"
     usage: Optional[Dict[str, int]] = None
+    raw_metadata: Optional[Dict] = None
     """{"input_tokens": N, "output_tokens": M}"""
 
 

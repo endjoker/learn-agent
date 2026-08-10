@@ -22,6 +22,7 @@ import requests
 from typing import Optional
 from urllib.parse import urlparse
 from .base_tool import BaseTool
+from core.safe_http import UnsafeUrl, request as safe_request
 
 logger = logging.getLogger('hello_agent')
 
@@ -216,12 +217,7 @@ class WebFetchTool(BaseTool):
 
         # ---- 2. 请求网页 ----
         try:
-            resp = requests.get(
-                url,
-                headers=self.HEADERS,
-                timeout=15,
-                allow_redirects=True,
-            )
+            resp = safe_request("GET", url, headers=self.HEADERS, timeout=15)
             resp.raise_for_status()
 
         except requests.Timeout:
@@ -230,6 +226,8 @@ class WebFetchTool(BaseTool):
             return f"❌ HTTP 错误 {e.response.status_code}: {url}"
         except requests.ConnectionError:
             return f"❌ 无法连接: {url}"
+        except UnsafeUrl as e:
+            return f"⛔ 安全拦截: {e}"
         except Exception as e:
             logger.error(f"请求失败: {e}", exc_info=True)
             return f"❌ 请求失败: {type(e).__name__}: {e}"

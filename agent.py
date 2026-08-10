@@ -29,6 +29,8 @@ import json
 import re
 import os
 import sys
+import queue
+import threading
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -50,6 +52,8 @@ from core.debug import (
 )
 from core.message_store import MessageStore, _content_to_text
 from core.config_loader import is_enabled
+from core.config_loader import load_config
+from core.agent_protocol import parse_text_response
 from core.protocols.vision import is_image_file
 from core.permission import PermissionChecker, ALLOW, ASK, DENY
 from core.security_gate import SecurityGate
@@ -110,6 +114,16 @@ def extract_plan_text(response: str) -> Optional[str]:
     """从 LLM 响应中提取 PLAN 正文；未识别返回 None"""
     m = _PLAN_RE.search(response or "")
     return m.group(1).strip() if m else None
+
+
+def _looks_like_structured_protocol_attempt(response: str) -> bool:
+    """Identify a malformed JSON-envelope attempt without extracting it.
+
+    This is deliberately only used to request one corrected response.  It
+    must never turn embedded JSON in prose into an executable tool call.
+    """
+    lowered = (response or "").lower()
+    return '"version"' in lowered and "agent.turn.v1" in lowered and '"type"' in lowered
 
 
 def _build_tool_result_content(combined: str):
@@ -190,33 +204,28 @@ def parse_react_response(response: str) -> dict:
     actions 可能包含多个工具调用（分批执行+合并结果）
     """
 
-    # 0. 标准化标签格式（支持 XML 风格的 <THOUGHT> 等标签）
-    response = _normalize_tags(response)
-    # 1. FINAL_ANSWER
-    final_answer = None
-    m = re.search(
-        rf"(?:{TAG_FINAL}|最终回答)[：:]\s*(.*)",
-        response, re.DOTALL | re.IGNORECASE
+    runtime = load_config().get("agent_runtime", {})
+    turn = parse_text_response(
+        response or "",
+        mode=runtime.get("response_protocol", "legacy"),
+        legacy_execute=is_enabled(runtime.get("legacy_execute"), False),
     )
-    if m:
-        final_answer = m.group(1).strip().rstrip('\n')
-    # 2. 所有 THOUGHT
-    thought = None
-    m = re.search(
-        rf"(?:{TAG_THOUGHT}|思考)[：:]\s*(.*?)"
-        rf"(?=\n*(?:{TAG_ACTION}|行动)[：:]|\n*(?:{TAG_FINAL}|最终回答)[：:]|$)",
-        response, re.DOTALL
-    )
-    if m:
-        thought = m.group(1).strip()
-    # 3. 所有 ACTION + INPUT（支持多个）
-    actions = []
-    for name, input_str in _ACTION_RE.findall(response):
-        actions.append({"name": name.strip(), "input": (input_str or "{}").strip()})
+    final_answer = (turn.visible_text if not turn.tool_calls
+                    and turn.protocol_mode.value in {"legacy", "json_envelope"} else None)
+    thought = turn.thought
+    actions = [
+        {"name": call.internal_name, "input": call.raw_arguments or json.dumps(call.arguments, ensure_ascii=False)}
+        for call in turn.tool_calls
+    ]
     return {
         "thought": thought,
         "actions": actions,
         "final_answer": final_answer,
+        "raw_text": turn.raw_text,
+        "visible_text": turn.visible_text,
+        "protocol_mode": turn.protocol_mode.value,
+        "parse_status": turn.parse_status.value,
+        "diagnostics": [{"code": d.code, "message": d.message} for d in turn.diagnostics],
     }
 
 # ============================================================
@@ -524,7 +533,7 @@ class Agent:
 
     def _consume_stop(self) -> bool:
         """检查并消费停止标志。返回 True 表示应停止。"""
-        if self._stop_requested:
+        if getattr(self, "_stop_requested", False):
             self._stop_requested = False
             return True
         return False
@@ -644,7 +653,7 @@ class Agent:
         4. 发现工具并注册到 ToolRegistry
         5. 重建 System Prompt 以包含 MCP 工具描述
         """
-        if not self._mcp_pending_init:
+        if not getattr(self, "_mcp_pending_init", None):
             return
 
         from core.mcp_client import MCPClientManager, run_in_mcp_loop
@@ -1001,6 +1010,9 @@ class Agent:
                 return f"❌ 参数不是合法 JSON: {e}\n收到: {input_str}"
         if not isinstance(kwargs, dict):
             return "❌ 参数必须是 JSON 对象"
+        validation_errors = self.tool_registry.validate_arguments(tool_name, kwargs)
+        if validation_errors:
+            return "❌ 参数校验失败: " + "; ".join(validation_errors)
         try:
             return tool.execute(**kwargs)
         except TypeError as e:
@@ -1013,6 +1025,15 @@ class Agent:
             logger.error(f"工具 '{tool_name}' 执行失败: {e}", exc_info=True)
             return f"❌ 工具出错: {type(e).__name__}: {e}"
 
+    def _emit_event(self, event_type: str, **payload) -> None:
+        """Best-effort runtime event sink used by WebUI and stream_run."""
+        sink = getattr(self, "_event_sink", None)
+        if sink:
+            try:
+                sink({"type": event_type, "data": payload})
+            except Exception:
+                logger.debug("运行事件投递失败", exc_info=True)
+
     # ============================================================
     # 核心运行方法
 
@@ -1023,7 +1044,7 @@ class Agent:
     # ============================================================
 
     def run(self, user_input: str, verbose: bool = True,
-            images: list | None = None) -> str:
+            images: list | None = None, event_sink=None) -> str:
         """
 
         执行完整的 ReAct 循环
@@ -1036,6 +1057,13 @@ class Agent:
             images: 可选的图片块列表（多模态输入），格式见 core/protocols/vision.py
         """
 
+        self._event_sink = event_sink
+        if not hasattr(self, "hooks"):
+            self.hooks = HookManager(enabled=False)
+        if not hasattr(self, "_task_list"):
+            self._task_list = None
+        if not hasattr(self, "_stop_block_count"):
+            self._stop_block_count = 0
         max_steps = self.max_steps
         # ---- 首次运行时初始化 MCP 连接（如果有配置） ----
         self._init_mcp_if_needed()
@@ -1091,7 +1119,22 @@ class Agent:
             log_messages(step, self.messages, f"第 {step} 步 → 发送给 LLM")
             # --- 调用 LLM ---
             try:
-                response = self.llm.think(self.messages, temperature=0)
+                self._emit_event("llm_start", step=step)
+                stream_chunks = []
+                try:
+                    response = self.llm.think(
+                        self.messages, temperature=0,
+                        silent=getattr(self, "quiet", False),
+                        # Do not send undecoded protocol bytes to the browser.
+                        # A tool envelope is control data, and a model may
+                        # emit it after a friendly preamble.  We publish only
+                        # validated visible content below.
+                        on_chunk=stream_chunks.append,
+                    )
+                except TypeError as exc:
+                    if "silent" not in str(exc) and "on_chunk" not in str(exc):
+                        raise
+                    response = self.llm.think(self.messages, temperature=0)
             except Exception as e:
                 logger.error(f"LLM 调用失败: {e}", exc_info=True)
                 return f"❌ LLM 调用失败: {e}"
@@ -1108,6 +1151,31 @@ class Agent:
                     print(f"  💭 {m.group(1).strip()[:200]}")
             parsed = parse_react_response(response)
             actions = parsed.get("actions", [])
+            # Models sometimes add a friendly sentence before an otherwise
+            # valid envelope.  Do not extract or execute that embedded JSON;
+            # ask once for a complete, standalone envelope instead.
+            if (not actions and not parsed.get("final_answer")
+                    and _looks_like_structured_protocol_attempt(response)):
+                retry_limit = load_config().get("agent_runtime", {}).get(
+                    "protocol_retry_limit", 1)
+                if format_retry < max(0, int(retry_limit)):
+                    format_retry += 1
+                    logger.warning("结构化响应混入展示文本，要求模型按完整信封重试 (%s/%s)",
+                                   format_retry, retry_limit)
+                    self.messages.append({"role": "assistant",
+                                          "content": "[invalid agent protocol hidden]",
+                                          "kind": "protocol_error"})
+                    self.messages.append({
+                        "role": "user", "name": "protocol_correction",
+                        "content": (
+                            "协议错误：你的上一条响应混入了解释文字与 JSON，"
+                            "不会执行任何工具。请重发且只能输出一个完整 JSON 对象："
+                            "工具调用用 agent.turn.v1/tool_calls，最终回答用 agent.turn.v1/final；"
+                            "不要输出任何前后说明、Markdown 围栏或标签。"
+                        ),
+                    })
+                    self._emit_event("text_reset", reason="protocol_correction")
+                    continue
             # ---- PLAN 检测（仅第一轮，无任务清单时） ----
             if step == 1 and not self._task_list:
                 plan_match = re.search(
@@ -1153,6 +1221,8 @@ class Agent:
                 f"final_answer={'有' if parsed['final_answer'] else '无'}"
             )
             if parsed["final_answer"] and not actions:
+                self._emit_event("text_reset", reason="final_answer")
+                self._emit_event("text_delta", text=parsed["final_answer"])
                 log_info("→ 走 FINAL_ANSWER 分支")
                 self.messages.append({"role": "assistant", "content": parsed["final_answer"]})
                 if verbose:
@@ -1197,6 +1267,10 @@ class Agent:
                 return parsed["final_answer"]
             # --- 批量 ACTION（支持多个工具并发执行） ---
             if actions:
+                # A complete structured tool envelope is internal protocol,
+                # not user-facing text.  Clear deltas from this model turn
+                # before the browser renders the tool events.
+                self._emit_event("text_reset", reason="tool_calls")
                 log_info(f"→ 走 ACTIONS 分支: {len(actions)} 个工具")
                 n = len(actions)
                 if verbose:
@@ -1345,7 +1419,11 @@ class Agent:
                         results[_i] = (_tname, _input_str, _obs, True)
 
                 # ====== 只添加一条 assistant + 一条合并的 tool_result ======
-                self.messages.append({"role": "assistant", "content": response})
+                self.messages.append({"role": "assistant", "content": response,
+                                      "kind": "tool_calls"})
+                for _tname, _input_str, _obs, _is_err in results:
+                    self._emit_event("tool_result", tool=_tname,
+                                     result=_obs, is_error=_is_err)
                 combined = self._combine_results(results)
                 # 检测工具结果中的图片标记 → 构造多模态 tool_result
                 self.messages.append({
@@ -1355,34 +1433,12 @@ class Agent:
             else:
                 log_info("→ 走 ELSE 分支（无 Action 无 FinalAnswer）")
 
-                # ---- 格式纠正：回复含代码块但没用工具调用格式 → 提醒一次 ----
-                if format_retry < 1 and re.search(r"```(?:python|bash|shell|sh)\b", response):
-                    format_retry += 1
-                    if verbose:
-                        print(f"  ⚠️  检测到代码块但未使用工具格式，提醒 LLM 纠正（{format_retry}/1）")
-                    self.messages.append({"role": "assistant", "content": response})
-                    self.messages.append({
-                        "role": "user",
-                        "name": "format_hint",  # 内部格式纠正提示，UI 不展示
-                        "content": (
-                            "你的回复中包含代码但没有使用工具调用。\n"
-                            "如需执行代码，请严格使用以下格式：\n"
-                            "THOUGHT: 你的思考\n"
-                            "ACTION: python\n"
-                            'ACTION_INPUT: {"code": "你的代码"}\n'
-                            "如需执行 Shell 命令：\n"
-                            "ACTION: bash\n"
-                            'ACTION_INPUT: {"command": "你的命令"}\n'
-                            "如这确实是最终回答（不需要执行），请输出：\n"
-                            "FINAL_ANSWER: 你的回答"
-                        ),
-                    })
-                    continue
-
                 if verbose:
                     print(f"  💬 直接回复（无标签）")
                 # 无标签时仍将 LLM 回复作为最终答案返回
                 answer = response.strip()
+                self._emit_event("text_reset", reason="final_answer")
+                self._emit_event("text_delta", text=answer)
                 self.messages.append({"role": "assistant", "content": answer})
                 if verbose:
                     print(f"  🤖 {answer}")
@@ -1595,7 +1651,47 @@ class Agent:
     # 流式运行
     # ============================================================
 
-    def stream_run(self, user_input: str):
+    def run_events(self, user_input: str, images: list | None = None):
+        """Run the canonical Agent loop in a worker and yield runtime events."""
+        events: queue.Queue = queue.Queue()
+
+        def sink(event):
+            events.put(event)
+
+        def worker():
+            try:
+                answer = self.run(user_input, verbose=False, images=images,
+                                  event_sink=sink)
+                events.put({"type": "final", "data": {"answer": answer}})
+            except Exception as exc:
+                logger.exception("流式运行失败")
+                events.put({"type": "error", "data": {"message": str(exc)}})
+            finally:
+                events.put(None)
+
+        threading.Thread(target=worker, name="agent-stream", daemon=True).start()
+        while True:
+            event = events.get()
+            if event is None:
+                return
+            yield event
+
+    def stream_run(self, user_input: str, images: list | None = None):
+        """Backward-compatible text view over the canonical Agent loop."""
+        for event in self.run_events(user_input, images=images):
+            event_type = event["type"]
+            data = event["data"]
+            if event_type == "text_delta":
+                yield data.get("text", "")
+            elif event_type == "text_reset":
+                yield "\n"
+            elif event_type == "tool_result":
+                yield f"\n{data.get('result', '')}\n"
+            elif event_type == "final":
+                yield data.get("answer", "")
+            elif event_type == "error":
+                yield f"❌ {data.get('message', '流式运行失败')}"
+        return
         """逐步输出 Agent 的思考过程"""
 
         max_steps = self.max_steps
@@ -1631,33 +1727,56 @@ class Agent:
                 yield f"\n✅ {parsed['final_answer']}\n"
                 return
             if actions:
-                action = actions[0]
-                tool_name = action["name"]
-                input_str = action.get("input", "{}")
-                try:
-                    params = json.loads(input_str) if input_str else {}
-                except json.JSONDecodeError:
-                    params = {}
-                if not isinstance(params, dict):
-                    params = {}
-                level, gate_reason = self._gate_check(tool_name, params)
-                if level == DENY:
-                    observation = f"⏭️ 跳过: {gate_reason or '权限不足，操作已被系统拒绝'}"
-                elif level == ASK:
-                    observation = "⏭️ 跳过: 工作区外操作需在交互模式下确认"
-                else:
-                    yield f"🛠️  {TAG_ACTION}: {tool_name}\n"
+                self._emit_event("text_reset", reason="tool_calls")
+                # Keep streaming compatible while executing every structured
+                # call in this turn.  The former implementation silently
+                # ignored actions[1:], causing tool loops to stall.
+                results = []
+                for order, action in enumerate(actions):
+                    tool_name = action["name"]
+                    input_str = action.get("input", "{}")
                     try:
-                        observation = self._execute_tool(tool_name, input_str)
-                    except Exception as e:
-                        logger.error(f"工具执行失败: {e}", exc_info=True)
-                        observation = f"工具执行失败: {e}"
-                yield f"📊 {observation[:500]}\n"
-                self.messages.append({"role": "assistant", "content": response})
+                        params = json.loads(input_str)
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        observation = f"❌ 协议错误：工具参数不是合法 JSON 对象: {exc}"
+                        results.append((tool_name, input_str, observation, True))
+                        yield f"📊 {observation}\n"
+                        continue
+                    if not isinstance(params, dict):
+                        observation = "❌ 协议错误：工具参数必须是 JSON 对象"
+                        results.append((tool_name, input_str, observation, True))
+                        yield f"📊 {observation}\n"
+                        continue
+                    errors = self.tool_registry.validate_arguments(tool_name, params)
+                    if errors:
+                        observation = "❌ 参数校验失败: " + "; ".join(errors)
+                        results.append((tool_name, input_str, observation, True))
+                        yield f"📊 {observation}\n"
+                        continue
+                    level, gate_reason = self._gate_check(tool_name, params)
+                    if level == DENY:
+                        observation = f"⏭️ 跳过: {gate_reason or '权限不足，操作已被系统拒绝'}"
+                    elif level == ASK:
+                        observation = "⏭️ 跳过: 工作区外操作需在交互模式下确认"
+                    else:
+                        yield f"🛠️  {TAG_ACTION}[{order + 1}/{len(actions)}]: {tool_name}\n"
+                        try:
+                            observation = self._execute_tool(tool_name, input_str)
+                        except Exception as e:
+                            logger.error(f"工具执行失败: {e}", exc_info=True)
+                            observation = f"❌ 工具执行失败: {type(e).__name__}: {e}"
+                    is_error = observation.startswith(("❌", "⏭️", "⛔"))
+                    results.append((tool_name, input_str, observation, is_error))
+                    yield f"📊 {observation[:500]}\n"
+                for _tname, _input_str, _obs, _is_err in results:
+                    self._emit_event("tool_result", tool=_tname,
+                                     result=_obs, is_error=_is_err)
+                self.messages.append({"role": "assistant", "content": response,
+                                      "kind": "tool_calls"})
                 self.messages.append({
                     "role": "user",
                     "name": "tool_result",
-                    "content": self._format_tool_result(tool_name, input_str, observation),
+                    "content": _build_tool_result_content(self._combine_results(results)),
                 })
                 self._light_compress()
                 self._check_context(verbose=False)

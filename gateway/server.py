@@ -54,6 +54,14 @@ class GatewayServer:
         """启动所有服务"""
         logger.info("🚀 Gateway 启动中 → %s:%d", self.host, self.port)
 
+        webui_cfg = {**self.config.get("channels", {}).get("webui", {}),
+                     **self.config.get("webui", {})}
+        is_loopback = self.host in {"127.0.0.1", "::1", "localhost"}
+        if (webui_cfg.get("enabled", True)
+                and (webui_cfg.get("allow_non_loopback") or not is_loopback)
+                and not webui_cfg.get("auth_token")):
+            raise ValueError("非环回 WebUI 必须配置 gateway.webui.auth_token")
+
         # 启动会话管理
         await self.session_mgr.start()
 

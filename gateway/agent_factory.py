@@ -11,6 +11,7 @@ sessions_map v2 结构（兼容旧版扁平字符串值）：
 import json
 import logging
 import os
+import tempfile
 import threading
 from pathlib import Path
 from typing import Optional
@@ -36,8 +37,16 @@ def _load_map() -> dict:
 def _save_map(mapping: dict):
     """保存 session 映射表"""
     try:
-        with open(_MAP_FILE, "w", encoding="utf-8") as f:
-            json.dump(mapping, f, ensure_ascii=False, indent=2)
+        fd, temp_name = tempfile.mkstemp(prefix=".sessions_map.", suffix=".tmp", dir=_MAP_FILE.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(mapping, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_name, _MAP_FILE)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
     except OSError as e:
         logger.error("保存 sessions_map.json 失败: %s", e)
 

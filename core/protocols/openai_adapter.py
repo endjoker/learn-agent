@@ -6,12 +6,13 @@ OpenAI 协议适配器
 消息格式不变，直接透传（内部格式即 OpenAI 格式）。
 """
 
+import json
 import logging
 from typing import Dict, Iterator, List, Optional
 
 from openai import OpenAI
 
-from .base import ChatResponse, ProtocolAdapter
+from .base import ChatResponse, ProtocolAdapter, ProviderToolCall
 
 logger = logging.getLogger('hello_agent')
 
@@ -71,7 +72,34 @@ class OpenAIAdapter(ProtocolAdapter):
         text = response.choices[0].message.content or ""
         usage = self._extract_usage(response.usage)
         self.last_usage = usage
-        return ChatResponse(text=text, usage=usage)
+        return ChatResponse(text=text, usage=usage,
+                            finish_reason=str(response.choices[0].finish_reason or "unknown"))
+
+    def generate_with_tools(self, model: str, messages: List[Dict], tools: List[Dict],
+                            temperature: float = 0, timeout: int = 60) -> ChatResponse:
+        """Non-streaming native tool calls (stream deltas are intentionally deferred)."""
+        response = self.client.chat.completions.create(
+            model=model, messages=self._prepare_messages(messages), tools=tools,
+            tool_choice="auto", temperature=temperature, stream=False, timeout=timeout)
+        message = response.choices[0].message
+        calls = []
+        for order, call in enumerate(message.tool_calls or []):
+            raw_arguments = call.function.arguments or "{}"
+            try:
+                arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError:
+                arguments = None
+            # Preserve malformed arguments for the Runtime to reject; do not
+            # silently turn them into an empty object.
+            if not isinstance(arguments, dict):
+                arguments = {"__invalid_raw_arguments__": raw_arguments}
+            calls.append(ProviderToolCall(call.id, call.function.name, arguments,
+                                          raw_arguments, order))
+        usage = self._extract_usage(response.usage)
+        self.last_usage = usage
+        return ChatResponse(text=message.content or "", tool_calls=calls,
+                            finish_reason=str(response.choices[0].finish_reason or "unknown"),
+                            usage=usage)
 
     def generate_stream(self, model: str, messages: List[Dict],
                         temperature: float = 0, timeout: int = 60) -> Iterator[str]:

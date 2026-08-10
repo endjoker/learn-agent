@@ -17,6 +17,9 @@ window.PageChat = class {
     this.commands = [];
     this._commandsLoaded = false;
     this._busy = false;
+    this._streamBubble = null;
+    this._streamText = "";
+    this._closedStreamIds = new Set();
   }
 
   get sessionKey() { return this._state.sessionKey; }
@@ -275,6 +278,12 @@ window.PageChat = class {
     let i = 0;
     while (i < messages.length) {
       const m = messages[i];
+      // Internal recovery traffic must never be rendered as conversation.
+      // Older sessions may still contain the raw failed envelope, so this
+      // filters both the correction instruction and its paired assistant turn.
+      if (m.kind === "protocol_error" || m.name === "protocol_correction") {
+        i++; continue;
+      }
       // 内部格式纠正提示（format_hint）不在 UI 展示（name 标记 + 内容兜底兼容旧数据）
       const c0 = typeof m.content === "string" ? m.content : "";
       if (m.name === "format_hint" ||
@@ -282,7 +291,13 @@ window.PageChat = class {
         i++; continue;
       }
       const content = m.content_text ?? (typeof m.content === "string" ? m.content : "");
-      const isAssistantAction = m.role === "assistant" && /ACTION[：:]/.test(content);
+      const isStructuredToolCall = m.role === "assistant" && (
+        m.kind === "tool_calls" ||
+        (content.includes("agent.turn.v1") &&
+         /"type"\s*:\s*"tool_calls"/.test(content))
+      );
+      const isAssistantAction = m.role === "assistant" &&
+        (/ACTION[：:]/.test(content) || isStructuredToolCall);
       const next = messages[i + 1];
       const nextIsTool = next && next.role === "user" && next.name === "tool_result";
       if (isAssistantAction && nextIsTool) {
@@ -389,7 +404,7 @@ window.PageChat = class {
     try {
       const r = await HA.api("POST", "/api/chat",
         { session_key: this.sessionKey, text, images: images || undefined, timeout: 120 });
-      if (r && r.ok) this._appendAssistant(r.reply);
+      if (r && r.ok) this._finishStream(r.reply || "", r.message_id);
       else if (r && r.error) this._appendSystem(`⏳ ${r.error}（回复将稍后经事件到达）`);
     } catch (e) { /* toast 已弹 */ }
     this._setBusy(false);
@@ -456,6 +471,49 @@ window.PageChat = class {
   }
   _appendAssistant(text) { this._msgArea.appendChild(this._bubble({ role: "assistant", content: text })); this._scrollBottom(); }
   _appendSystem(text) { this._msgArea.appendChild(this._bubble({ role: "system", content: text })); this._scrollBottom(); }
+
+  _startStream() {
+    if (this._streamBubble) return;
+    this._streamText = "";
+    this._streamBubble = this._bubble({ role: "assistant", content: "" });
+    this._msgArea.appendChild(this._streamBubble);
+  }
+
+  _appendStreamDelta(text, messageId) {
+    if (messageId && this._closedStreamIds.has(messageId)) return;
+    if (!text) return;
+    this._startStream();
+    this._streamText += text;
+    const body = this._streamBubble.querySelector(".bubble-text");
+    body.innerHTML = HA.renderMd(this._streamText);
+    this._scrollBottom();
+  }
+
+  _resetStream(messageId) {
+    if (messageId && this._closedStreamIds.has(messageId)) return;
+    if (this._streamBubble) this._streamBubble.remove();
+    this._streamBubble = null;
+    this._streamText = "";
+  }
+
+  _finishStream(answer, messageId) {
+    if (messageId) {
+      this._closedStreamIds.add(messageId);
+      if (this._closedStreamIds.size > 64) {
+        this._closedStreamIds.delete(this._closedStreamIds.values().next().value);
+      }
+    }
+    if (this._streamBubble) {
+      this._streamText = answer;
+      const body = this._streamBubble.querySelector(".bubble-text");
+      body.innerHTML = HA.renderMd(answer);
+      this._streamBubble = null;
+      this._streamText = "";
+      this._scrollBottom();
+    } else if (answer) {
+      this._appendAssistant(answer);
+    }
+  }
 
   // ---------- 运行期操作 ----------
   async _switchModel() {
@@ -530,10 +588,16 @@ window.PageChat = class {
   _bindSSE() {
     const sk = () => this.sessionKey;
     this._offs.push(HA.onSSE("chat.started", d => {
-      if (d.session_key === sk()) this._setBusy(true);
+      if (d.session_key === sk()) {
+        this._resetStream(d.message_id);
+        this._setBusy(true);
+      }
     }));
-    this._offs.push(HA.onSSE("chat.done", d => {
-      if (d.session_key === sk()) { this._setBusy(false); this._appendAssistant(d.full_text || ""); }
+    this._offs.push(HA.onSSE("chat.text_delta", d => {
+      if (d.session_key === sk()) this._appendStreamDelta(d.text || "", d.message_id);
+    }));
+    this._offs.push(HA.onSSE("chat.text_reset", d => {
+      if (d.session_key === sk()) this._resetStream(d.message_id);
     }));
     this._offs.push(HA.onSSE("chat.error", d => {
       if (d.session_key === sk()) this._setBusy(false);
@@ -564,7 +628,8 @@ window.PageChat = class {
     }));
     this._offs.push(HA.onSSE("chat.done", d => {
       if (d.session_key !== sk()) return;
-      this._appendAssistant(d.full_text || "");
+      this._finishStream(d.full_text || "", d.message_id);
+      this._setBusy(false);
     }));
     this._offs.push(HA.onSSE("chat.progress", d => {
       if (d.session_key !== sk()) return;

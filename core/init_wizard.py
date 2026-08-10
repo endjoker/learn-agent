@@ -527,6 +527,27 @@ def _load_example_filters() -> Optional[dict]:
 # 高级选项：permission / sandbox
 # ============================================================
 
+def _step_agent_runtime(existing: dict) -> Optional[dict]:
+    """Collect safe response-protocol settings for config.json."""
+    print("\n  🔄 Agent 响应协议")
+    runtime = existing.get("agent_runtime", {})
+    protocol = _ask_choice("响应协议:", [
+        ("auto", "auto — 结构化工具调用（推荐）"),
+        ("json_envelope", "json_envelope — 完整 JSON 信封"),
+        ("legacy", "legacy — 仅兼容旧格式"),
+    ], default=1)
+    changes: dict[str, Any] = {}
+    if protocol != runtime.get("response_protocol", "auto"):
+        changes["response_protocol"] = protocol
+    legacy = _ask_yes_no("允许旧 ACTION/INPUT 执行工具？（不推荐）",
+                         default=is_enabled(runtime.get("legacy_execute"), False))
+    if legacy != is_enabled(runtime.get("legacy_execute"), False):
+        changes["legacy_execute"] = legacy
+    retries = _ask_int("协议纠正重试次数", runtime.get("protocol_retry_limit", 1))
+    if retries != runtime.get("protocol_retry_limit", 1):
+        changes["protocol_retry_limit"] = retries
+    return {"agent_runtime": changes} if changes else None
+
 def _step_advanced(existing: dict) -> Optional[dict]:
     """高级配置步骤。返回 {"permission": ..., "sandbox": ...} 或 None"""
     print("\n" + "═" * 18 + " 高级选项 · Permission / Sandbox " + "═" * 8)
@@ -673,8 +694,11 @@ def run_init_wizard() -> int:
                 fragments.append(frag)
 
         # ---- 可选：高级选项 ----
-        if _ask_yes_no("\n⚙️  是否配置高级选项（permission / sandbox）？", default=False):
+        if _ask_yes_no("\n⚙️  是否配置高级选项（permission / sandbox / runtime）？", default=False):
             frag = _step_advanced(existing)
+            if frag:
+                fragments.append(frag)
+            frag = _step_agent_runtime(existing)
             if frag:
                 fragments.append(frag)
 

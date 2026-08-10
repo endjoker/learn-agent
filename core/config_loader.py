@@ -27,6 +27,14 @@ logger = logging.getLogger("hello_agent")
 # ============================================================
 
 _DEFAULT_CONFIG: dict[str, Any] = {
+    "agent_runtime": {
+        "response_protocol": "auto",
+        "legacy_execute": False,
+        "protocol_retry_limit": 1,
+        "raw_response_audit": "errors",
+        "raw_response_max_chars": 20000,
+        "native_tool_streaming": False,
+    },
     "llm": {
         "model_id": "",
         "timeout": 60,
@@ -174,6 +182,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         },
         "webui": {
             "allow_non_loopback": False,
+            "auth_token": "",
         },
     },
 }

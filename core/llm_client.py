@@ -15,7 +15,7 @@ import re
 import time
 import logging
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Callable
 
 from .protocols import create_adapter
 
@@ -385,6 +385,7 @@ class HelloAgentsLLM:
         stream: bool = True,
         silent: bool = False,
         timeout: Optional[int] = None,
+        on_chunk: Optional[Callable[[str], None]] = None,
     ) -> Optional[str]:
         """
         让 LLM 思考并返回响应（带重试逻辑）
@@ -424,6 +425,8 @@ class HelloAgentsLLM:
                     ):
                         if not silent:
                             print(chunk, end="", flush=True)
+                        if on_chunk:
+                            on_chunk(chunk)
                         collected.append(chunk)
                     adapter_usage = self._adapter.last_usage
                     if adapter_usage is not None:
@@ -467,6 +470,18 @@ class HelloAgentsLLM:
                 time.sleep(delay)
 
         return None
+
+    def complete(self, messages: List[Dict], *, tools: Optional[List[Dict]] = None,
+                 temperature: float = 0, timeout: Optional[int] = None):
+        """Return a structured non-streaming response when the adapter supports it."""
+        req_timeout = timeout or self._config_timeout
+        if tools and hasattr(self._adapter, "generate_with_tools"):
+            response = self._adapter.generate_with_tools(
+                self.model, messages, tools, temperature, req_timeout)
+        else:
+            response = self._adapter.generate(self.model, messages, temperature, req_timeout)
+        self.last_usage = response.usage
+        return response
 
     # ============================================================
     # 辅助方法

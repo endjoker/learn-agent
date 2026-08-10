@@ -56,3 +56,6 @@ gateway/scheduler_state.json
 
 # Agent 工作目录（运行时生成）
 workspace/
+
+#测试目录
+tests/

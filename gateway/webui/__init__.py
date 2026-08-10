@@ -7,6 +7,7 @@ WebUIModule —— 六模块控制台装配入口（P3a 基建）
 """
 
 import asyncio
+import hmac
 import logging
 from pathlib import Path
 from urllib.parse import urlparse
@@ -45,6 +46,7 @@ class WebUIModule:
         self.dispatcher = dispatcher
         self.session_mgr = session_mgr
         self.config = config or {}
+        self._auth_token = str(self.config.get("auth_token") or "")
         self.bus = EventBus()
         self.channel = WebuiChannel(self.bus)
         self._sse = SSEHandler(self.bus)
@@ -200,8 +202,14 @@ class WebUIModule:
                     "allow_non_loopback", False):
                 return web.json_response(
                     {"error": "WebUI 仅监听环回地址；如需远程访问请设置 "
-                              "gateway.webui.allow_non_loopback（并知悉风险）"},
+                               "gateway.webui.allow_non_loopback（并知悉风险）"},
                     status=403)
+            if not _is_loopback(remote):
+                supplied = request.headers.get("Authorization", "")
+                if (not supplied.startswith("Bearer ") or not self._auth_token
+                        or not hmac.compare_digest(supplied[7:], self._auth_token)):
+                    return web.json_response(
+                        {"error": "authentication required"}, status=401)
             # Origin：仅当存在且与 host 不匹配时拒绝（防跨站发起环回请求；
             # 缺失放行，不误杀同源 SSE/curl）
             origin = request.headers.get("Origin")

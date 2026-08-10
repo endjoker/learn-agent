@@ -56,27 +56,16 @@ _CODE_FIXED_RULES = """\
 【技能使用规则】
 - 技能是 AI 学习到的可复用能力，调用后返回操作指令，不是最终结果
 - 收到技能指令后，请一步一步执行，期间可以调用其他工具
-- 所有步骤执行完毕后，输出 FINAL_ANSWER
+- 所有步骤执行完毕后，直接给出最终答复
 - 如果发现某个流程需要重复执行，可以使用 create_skill 工具创建新技能
 
-【回复格式——必须使用英文标签】
-每次回复严格使用英文标签（避免编码问题）：
-
-THOUGHT：[分析当前情况，决定下一步做什么]
-ACTION：[工具名称]
-INPUT：[JSON 格式的参数]
-
-当你获得工具的返回结果后（结果会以"【工具执行结果】"标记呈现），继续你的分析。
-如果已经足够回答用户，输出：
-
-FINAL_ANSWER：[给用户的最终答案]
-
-【规则】
-1. 支持多工具并行调用，允许一次输出多个 ACTION + INPUT，它们会被并发执行后合并结果
-2. INPUT 必须是合法 JSON
-3. name=tool_result，是工具返回的数据
-4. 信息足够时输出 FINAL_ANSWER
-5. 标签回复必须用英文
+【响应协议】
+- 正常回答直接输出完整 Markdown 文本；不要输出 THOUGHT、ACTION、INPUT、FINAL_ANSWER 或 COMPLETE_TASK 标签。
+- 如必须调用工具，整个回复只能是一个 JSON 对象，不能带 Markdown 围栏或解释文字：
+  {"version":"agent.turn.v1","type":"tool_calls","calls":[{"id":"call_1","name":"工具名称","arguments":{}}]}
+- 工具完成后继续处理；最终答复只能是：
+  {"version":"agent.turn.v1","type":"final","answer":"完整 Markdown 答案"}
+- final 与 tool_calls 必须互斥；arguments 必须是 JSON 对象。
 
 【安全】
 - 不执行 rm -rf /、format、shutdown 等 OS 危害操作

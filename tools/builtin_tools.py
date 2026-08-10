@@ -40,6 +40,7 @@ import shutil
 import subprocess
 import logging
 import requests
+from core.safe_http import UnsafeUrl, request as safe_http_request
 from pathlib import Path
 from typing import List
 from .base_tool import BaseTool
@@ -1412,10 +1413,7 @@ class HttpTool(BaseTool):
             if method == "POST" and data:
                 kwargs["json"] = json.loads(data) if isinstance(data, str) else data
 
-            if method == "POST":
-                resp = requests.post(url, **kwargs)
-            else:
-                resp = requests.get(url, **kwargs)
+            resp = safe_http_request(method, url, **kwargs)
 
             resp.raise_for_status()
 
@@ -1440,6 +1438,8 @@ class HttpTool(BaseTool):
             return f"❌ HTTP {e.response.status_code}: {url}"
         except requests.ConnectionError:
             return f"❌ 无法连接: {url}"
+        except UnsafeUrl as e:
+            return f"⛔ 安全拦截: {e}"
         except json.JSONDecodeError:
             return f"❌ JSON 解析失败: {url}"
         except Exception as e:

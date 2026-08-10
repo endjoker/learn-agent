@@ -16,17 +16,6 @@ from gateway.textutil import split_text, sanitize_error
 
 logger = logging.getLogger("hello_agent.gateway")
 
-# 安全剥离残留的 ReAct 标签（模型偶尔不遵循格式时兜底）
-_REACT_TAG_RE = __import__("re").compile(
-    r"^\s*(?:FINAL_ANSWER|最终回答|THOUGHT|思考)[：:]\s*",
-    __import__("re").IGNORECASE,
-)
-
-
-def _strip_react_tags(text: str) -> str:
-    """剥掉回复中残留的 ReAct 标签前缀"""
-    return _REACT_TAG_RE.sub("", text).strip()
-
 
 class _LRUDedup:
     """基于 message_id 的 LRU 去重"""
@@ -213,7 +202,6 @@ class Dispatcher:
                 reply = await self._execute_agent(entry, msg, channel)
                 elapsed = time.time() - t0
                 if reply:
-                    reply = _strip_react_tags(reply)
                     # 附加 meta 信息供 channel 格式化使用
                     a = entry.agent
                     model = a.llm.model if a and a.llm else ""
@@ -272,9 +260,16 @@ class Dispatcher:
         # 注意：必须保存 afuture 引用，软超时后继续等同一个 future
         # 而不能起第二次 agent.run()——线程池里的旧调用不会因 asyncio 取消而停止
         _images = getattr(msg, 'images', None) or None
+        event_sink = None
+        publisher = getattr(channel, "publish_agent_event", None)
+        if callable(publisher):
+            # The sink runs in the Agent executor thread.  WebuiChannel's
+            # event bus is explicitly cross-thread safe.
+            event_sink = lambda event: publisher(msg, event)
         afuture = loop.run_in_executor(
             executor,
-            lambda: agent.run(msg.text, False, images=_images),
+            lambda: agent.run(msg.text, False, images=_images,
+                              event_sink=event_sink),
         )
         try:
             result = await asyncio.wait_for(
