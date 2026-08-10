@@ -101,16 +101,23 @@ class SSEHandler:
             await resp.write(b": connected\n\n")
             while True:
                 try:
-                    evt = await asyncio.wait_for(q.get(), timeout=_SSE_PING_INTERVAL)
-                    if evt is None:  # 停机哨兵：立即退出，解除 aiohttp cleanup 阻塞
-                        break
-                    payload = json.dumps(
-                        {"type": evt["type"], "data": evt["data"]},
-                        ensure_ascii=False)
-                    await resp.write(
-                        f"data: {payload}\n\n".encode("utf-8"))
-                except asyncio.TimeoutError:
-                    await resp.write(b": ping\n\n")
+                    try:
+                        evt = await asyncio.wait_for(
+                            q.get(), timeout=_SSE_PING_INTERVAL)
+                    except asyncio.TimeoutError:
+                        message = b": ping\n\n"
+                    else:
+                        if evt is None:  # 停机哨兵：立即退出，解除 aiohttp cleanup 阻塞
+                            break
+                        payload = json.dumps(
+                            {"type": evt["type"], "data": evt["data"]},
+                            ensure_ascii=False)
+                        message = f"data: {payload}\n\n".encode("utf-8")
+                    # The client can close while wait_for() times out.  Keep
+                    # this write inside the same guarded block so aiohttp's
+                    # ClientConnectionResetError is treated as a normal SSE
+                    # disconnect rather than logged as a request failure.
+                    await resp.write(message)
                 except (ConnectionResetError, ConnectionError):
                     break
         except asyncio.CancelledError:
