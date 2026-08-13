@@ -131,7 +131,8 @@ def _compile_words_re(words: list) -> re.Pattern:
 
 _DANGEROUS_WORDS_RE = _compile_words_re(DANGEROUS_WORDS)
 
-# 子串型危险命令：足够特异，子串匹配（mkfs 含 mkfs.ext4）
+# 危险命令显示名称（保留供配置和提示文本使用）。不能再以子串方式对它们做安全判断：
+# ``rm -rf /tmp/file`` 含有 ``rm -rf /``，但并不是删除根目录。
 DANGEROUS_SUBSTRINGS = [
     "rm -rf /", "rm -rf ~", "rm -rf .",
     "del /f /s", "rd /s /q",
@@ -146,11 +147,37 @@ DANGEROUS_SUBSTRINGS = [
 ]
 
 
+_DANGEROUS_COMMAND_PATTERNS: list[tuple[str, re.Pattern]] = [
+    # Require the destructive target to be its own shell token.  ``/*`` is
+    # included because it is equivalent to deleting the root's contents.
+    ("rm -rf /", re.compile(
+        r"(?:^|[;&|]\s*)rm(?:\s+(?:-[A-Za-z]*|--(?:force|recursive)))+"
+        r"\s+(?:--\s+)?/(?:\*|(?=\s|$|[;&|]))", re.IGNORECASE)),
+    ("rm -rf ~", re.compile(
+        r"(?:^|[;&|]\s*)rm(?:\s+(?:-[A-Za-z]*|--(?:force|recursive)))+"
+        r"\s+(?:--\s+)?~(?=\s|$|[;&|])", re.IGNORECASE)),
+    ("rm -rf .", re.compile(
+        r"(?:^|[;&|]\s*)rm(?:\s+(?:-[A-Za-z]*|--(?:force|recursive)))+"
+        r"\s+(?:--\s+)?\.(?=\s|$|[;&|])", re.IGNORECASE)),
+    ("del /f /s", re.compile(r"(?:^|[;&|]\s*)del\s+(?=[^\r\n]*\s/f\b)(?=[^\r\n]*\s/s\b)", re.IGNORECASE)),
+    ("rd /s /q", re.compile(r"(?:^|[;&|]\s*)(?:rd|rmdir)\s+(?=[^\r\n]*\s/s\b)(?=[^\r\n]*\s/q\b)", re.IGNORECASE)),
+    ("diskpart", re.compile(r"(?:^|[;&|]\s*)diskpart(?:\s|$)", re.IGNORECASE)),
+    ("taskkill /f", re.compile(r"(?:^|[;&|]\s*)taskkill\s+[^\r\n]*\s/f\b", re.IGNORECASE)),
+    # 0 / 00 / 000 are mode values; do not mistake chmod 0644 for chmod 0.
+    ("chmod 0", re.compile(r"(?:^|[;&|]\s*)chmod\s+0{1,4}(?=\s|$)", re.IGNORECASE)),
+    ("chown -r", re.compile(r"(?:^|[;&|]\s*)chown\s+(?:-[A-Za-z]*r[A-Za-z]*|--recursive)\s+[^\r\n]*\s/(?:\*|(?=\s|$|[;&|]))", re.IGNORECASE)),
+    ("mkfs", re.compile(r"(?:^|[;&|]\s*)mkfs(?:\.[A-Za-z0-9_+-]+)?(?:\s|$)", re.IGNORECASE)),
+    ("dd if=", re.compile(r"(?:^|[;&|]\s*)dd\s+[^\r\n]*\bif=", re.IGNORECASE)),
+    (":(){ :|:& };:", re.compile(re.escape(":(){ :|:& };:"))),
+    ("> /dev/sda", re.compile(r">\s*/dev/(?:sda|mmcblk\d+)(?:\d+)?(?=\s|$|[;&|])", re.IGNORECASE)),
+]
+
+
 def _match_dangerous(command_lower: str) -> str | None:
     """返回命中的危险模式（None 表示安全）。供 L2 硬拦使用。"""
-    for pat in DANGEROUS_SUBSTRINGS:
-        if pat in command_lower:
-            return pat
+    for label, pattern in _DANGEROUS_COMMAND_PATTERNS:
+        if pattern.search(command_lower):
+            return label
     m = _DANGEROUS_WORDS_RE.search(command_lower)
     if m:
         return m.group(1)

@@ -28,20 +28,41 @@ logger = logging.getLogger("hello_agent")
 
 _DEFAULT_CONFIG: dict[str, Any] = {
     "agent_runtime": {
-        "response_protocol": "native",
-        "legacy_execute": False,
-        "protocol_retry_limit": 0,
-        "raw_response_audit": "errors",
-        "raw_response_max_chars": 20000,
         "native_tool_streaming": True,
+        "max_tool_result_chars": 10000,
+    },
+    "runtime_store": {
+        "backend": "sqlite",
+        "path": "./workspace/.agent/state/runtime.db",
+        "wal": True,
+        "busy_timeout_ms": 5000,
+    },
+    # Feature flag: dispatcher integration is introduced incrementally.
+    "task_runtime": {
+        "enabled": True,
+        "max_global_concurrency": 4,
+        "default_timeout_seconds": 1200,
+        "cancel_grace_seconds": 10,
+        "zombie_max_seconds": 300,
+        "max_attempts": 2,
+    },
+    "artifacts": {
+        "root": "./workspace/.agent/artifacts",
+        "max_file_bytes": 52428800,
+        "retention_days": 30,
     },
     "llm": {
         "model_id": "",
         "timeout": 60,
+        # provider_default means the field is omitted from API requests.
+        "reasoning": {"level": "provider_default"},
         "models": {},
     },
     "permission": {
         "workspace": "./workspace",
+        # Project root: enables source/config edits while paths outside this
+        # repository remain outside the permission boundary.
+        "extra_workspaces": ["."],
         "default_mode": "ask",
         "tool_rules": {
             # 注：只列出有固定权限的工具。bash/read/write/edit/glob/file_mgr
@@ -126,6 +147,15 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             ],
             "blocked_ips": ["10.0.0.0/8", "172.16.0.0/12"],
         },
+        "python": {
+            "forbidden_imports": ["ctypes", "socket"],
+            "forbidden_calls": ["eval", "exec", "__import__"],
+            "forbidden_qualified_calls": [
+                "os.system", "os.popen", "os.execv", "os.execve",
+                "os.execvp", "os.execvpe", "os.remove", "os.unlink",
+                "os.rmdir", "os.kill", "os.killpg", "shutil.rmtree",
+            ],
+        },
     },
     "gateway": {
         "enabled": True,
@@ -134,7 +164,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "worker_pool_size": 4,
         "agent": {
             "model": "",
-            "max_steps": 30,
+            "max_steps": 100,
             "permission_mode": "allow",
             "auto_approve_plan": True,
             "quiet": True,
@@ -144,7 +174,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "idle_timeout_minutes": 60,
             "persist": True,
             "soft_timeout_seconds": 90,
-            "hard_timeout_seconds": 600,
+            "hard_timeout_seconds": 1200,
         },
         "scheduler": {
             "enabled": True,
@@ -185,6 +215,15 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "auth_token": "",
             "allowed_ips": [],
         },
+    },
+    "prompt": {
+        "bootstrap_max_chars_per_file": 8000,
+        "bootstrap_max_chars_total": 32000,
+        "truncation_warning": "once",
+    },
+    "workspace": {
+        "path": "./workspace",
+        "dirs": ["ref", "scripts", "downloads", "tmp", "output"],
     },
 }
 
@@ -305,6 +344,12 @@ def _apply_env_overrides(config: dict) -> dict:
         current_model = config.get("llm", {}).get("model_id", "")
         if current_model:
             config["llm"].setdefault("models", {}).setdefault(current_model, {})["protocol"] = env_protocol
+
+    # Optional operational override.  It intentionally applies globally so
+    # deployments can tune latency/cost without rewriting model credentials.
+    env_reasoning = os.getenv("LLM_REASONING_EFFORT", "")
+    if env_reasoning:
+        config.setdefault("llm", {}).setdefault("reasoning", {})["level"] = env_reasoning
 
     return config
 

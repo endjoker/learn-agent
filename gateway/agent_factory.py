@@ -10,11 +10,11 @@ sessions_map v2 结构（兼容旧版扁平字符串值）：
 
 import json
 import logging
-import os
-import tempfile
 import threading
 from pathlib import Path
 from typing import Optional
+
+from core.atomic_io import atomic_write_json
 
 logger = logging.getLogger("hello_agent.gateway")
 
@@ -37,16 +37,7 @@ def _load_map() -> dict:
 def _save_map(mapping: dict):
     """保存 session 映射表"""
     try:
-        fd, temp_name = tempfile.mkstemp(prefix=".sessions_map.", suffix=".tmp", dir=_MAP_FILE.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(mapping, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp_name, _MAP_FILE)
-        finally:
-            if os.path.exists(temp_name):
-                os.unlink(temp_name)
+        atomic_write_json(_MAP_FILE, mapping, prefix=".sessions_map.")
     except OSError as e:
         logger.error("保存 sessions_map.json 失败: %s", e)
 
@@ -76,7 +67,7 @@ def update_map_meta(session_key: str, **fields):
 def create_gateway_agent(
     session_key: str,
     model: str = "",
-    max_steps: int = 30,
+    max_steps: int = 100,
     permission_mode: str = "allow",
     quiet: bool = True,
     auto_approve_plan: bool = True,
@@ -94,7 +85,7 @@ def create_gateway_agent(
         max_steps=max_steps,
         permission=True,
         memory=True,
-        skills=False,
+        skills=True,
         sandbox=True,
         hooks=True,
         non_interactive=True,
@@ -114,6 +105,7 @@ def create_gateway_agent(
     resumed = False
     saved_model = ""
     saved_perm_mode = ""
+    saved_reasoning_level = None
     with _map_lock:
         mapping = _load_map()
         raw = mapping.get(session_key)
@@ -137,6 +129,11 @@ def create_gateway_agent(
                     # 其次 session_data.model_id（save_session 时落盘）
                     saved_model = meta.get("model") or session_data.get("model_id") or ""
                     saved_perm_mode = meta.get("permission_mode") or ""
+                    candidate = meta.get("reasoning_level")
+                    if isinstance(candidate, str):
+                        from core.reasoning import REASONING_LEVELS
+                        if candidate in REASONING_LEVELS:
+                            saved_reasoning_level = candidate
                     logger.info("恢复会话: %s → session=%s (%d 条消息)",
                                session_key, old_session_id, len(agent.messages))
                 except Exception as e:
@@ -161,20 +158,25 @@ def create_gateway_agent(
             _save_map(mapping)
 
     # ---- 模型回填（修"运行期 /model 切换重启后丢失"缺口）----
-    if resumed and saved_model and saved_model != agent.llm.model:
+    if resumed and (saved_model or saved_reasoning_level is not None):
         try:
-            agent.switch_llm(model=saved_model)
-            logger.info("恢复会话回填模型: %s → %s", session_key, saved_model)
+            agent.switch_llm(model=saved_model or agent.llm.model,
+                             reasoning_level=saved_reasoning_level)
+            logger.info("恢复会话模型/推理等级: %s → %s / %s", session_key,
+                        agent.llm.model, agent.llm.reasoning_level)
         except Exception as e:
             logger.warning("恢复会话回填模型 %s 失败，回落默认模型: %s",
                            saved_model, e)
 
+    # None intentionally represents "inherit selected model configuration".
+    agent._session_reasoning_override = saved_reasoning_level
+
     # ---- 权限档位重放（无 WebUI 审批桥时仅 unreviewed 可安全重放）----
-    if resumed and saved_perm_mode == "unreviewed":
-        from core.permission import ALLOW
-        for tool in agent.tool_registry.list_tool_names():
-            agent.permission.set_rule(tool, ALLOW)
-        logger.info("恢复会话重放权限档位: %s → unreviewed", session_key)
+    # Preserve the per-session mode for the WebUI initializer. The
+    # initializer installs the approval bridge and reapplies the complete
+    # mode (not just ``unreviewed``) before the first tool call.
+    effective_permission_mode = saved_perm_mode or permission_mode
+    agent._gateway_permission_mode = effective_permission_mode
 
     return agent
 

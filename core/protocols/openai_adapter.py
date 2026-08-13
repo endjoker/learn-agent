@@ -26,8 +26,9 @@ class OpenAIAdapter(ProtocolAdapter):
     """
 
     def __init__(self, api_key: str, base_url: Optional[str] = None,
-                 timeout: int = 60):
+                 timeout: int = 60, reasoning_effort: str = "provider_default"):
         super().__init__(api_key, base_url, timeout)
+        self.reasoning_effort = reasoning_effort
         self.client = OpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -36,6 +37,27 @@ class OpenAIAdapter(ProtocolAdapter):
             # 返回 403 "Your request was blocked."；改用自定义 UA 规避。
             default_headers={"User-Agent": "hello-agent"},
         )
+
+    def _build_request_kwargs(self, model: str, messages: List[Dict], *,
+                              temperature: float, timeout: int, stream: bool,
+                              tools: Optional[List[Dict]] = None) -> dict:
+        """Build every Chat Completions request from one compatibility policy."""
+        kwargs = {
+            "model": model,
+            "messages": self._prepare_messages(messages),
+            "stream": stream,
+            "timeout": timeout,
+        }
+        if tools is not None:
+            kwargs.update({"tools": tools, "tool_choice": "auto"})
+        # Reasoning models commonly reject temperature.  Omit it only when a
+        # caller explicitly opted into reasoning; legacy calls stay byte-for-byte
+        # compatible with their previous sampling parameter.
+        if self.reasoning_effort != "provider_default":
+            kwargs["reasoning_effort"] = self.reasoning_effort
+        else:
+            kwargs["temperature"] = temperature
+        return kwargs
 
     # ============================================================
     # 消息翻译（OpenAI 格式无需翻译，直接透传）
@@ -67,12 +89,8 @@ class OpenAIAdapter(ProtocolAdapter):
                  temperature: float = 0, timeout: int = 60) -> ChatResponse:
         """非流式调用"""
         response = self.client.chat.completions.create(
-            model=model,
-            messages=self._prepare_messages(messages),
-            temperature=temperature,
-            stream=False,
-            timeout=timeout,
-        )
+            **self._build_request_kwargs(model, messages, temperature=temperature,
+                                         timeout=timeout, stream=False))
         text = response.choices[0].message.content or ""
         usage = self._extract_usage(response.usage)
         self.last_usage = usage
@@ -83,8 +101,8 @@ class OpenAIAdapter(ProtocolAdapter):
                             temperature: float = 0, timeout: int = 60) -> ChatResponse:
         """Non-streaming native tool calls (stream deltas are intentionally deferred)."""
         response = self.client.chat.completions.create(
-            model=model, messages=self._prepare_messages(messages), tools=tools,
-            tool_choice="auto", temperature=temperature, stream=False, timeout=timeout)
+            **self._build_request_kwargs(model, messages, tools=tools,
+                                         temperature=temperature, timeout=timeout, stream=False))
         message = response.choices[0].message
         calls = []
         for order, call in enumerate(message.tool_calls or []):
@@ -109,12 +127,8 @@ class OpenAIAdapter(ProtocolAdapter):
                         temperature: float = 0, timeout: int = 60) -> Iterator[str]:
         """流式调用，yield 增量文本"""
         response = self.client.chat.completions.create(
-            model=model,
-            messages=self._prepare_messages(messages),
-            temperature=temperature,
-            stream=True,
-            timeout=timeout,
-        )
+            **self._build_request_kwargs(model, messages, temperature=temperature,
+                                         timeout=timeout, stream=True))
 
         collected = []
         for chunk in response:
@@ -131,9 +145,8 @@ class OpenAIAdapter(ProtocolAdapter):
                                    timeout: int = 60) -> Iterator[ProviderStreamEvent]:
         """Normalize OpenAI-compatible text and tool-call deltas."""
         response = self.client.chat.completions.create(
-            model=model, messages=self._prepare_messages(messages), tools=tools,
-            tool_choice="auto", temperature=temperature, stream=True, timeout=timeout,
-        )
+            **self._build_request_kwargs(model, messages, tools=tools,
+                                         temperature=temperature, timeout=timeout, stream=True))
         calls: dict[int, dict] = {}
         for chunk in response:
             if getattr(chunk, "usage", None):

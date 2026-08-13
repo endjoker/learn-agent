@@ -13,9 +13,12 @@ ToolRegistry 负责：
     发现和使用工具。新增工具时只需注册，无需修改 Agent 代码。
 """
 
+import logging
 from typing import Dict, List, Optional
 from .base_tool import BaseTool
 from core.tool_schema import ToolNameCodec, validate_arguments
+
+logger = logging.getLogger("hello_agent")
 
 
 class ToolRegistry:
@@ -48,6 +51,27 @@ class ToolRegistry:
         self.register_tool(tool)
         self._skill_tool_names.add(tool.name)
         return self
+
+    def sync_skill_tools(self, tools: List[BaseTool]) -> set[str]:
+        """Replace the dynamic skill-tool catalog without touching built-ins.
+
+        Skill files can be edited outside the running Agent (for example from
+        the WebUI).  Re-registration must therefore replace old skill tools,
+        including removed skills, instead of treating their names as a
+        permanent duplicate-registration error.
+        """
+        for name in self._skill_tool_names:
+            self._tools.pop(name, None)
+        self._skill_tool_names.clear()
+
+        registered: set[str] = set()
+        for tool in tools:
+            if tool.name in self._tools:
+                logger.warning("技能工具名与现有工具冲突，已跳过: %s", tool.name)
+                continue
+            self.register_skill_tool(tool)
+            registered.add(tool.name)
+        return registered
 
     def register_mcp_tool(self, tool: BaseTool) -> "ToolRegistry":
         """注册 MCP 工具（单独追踪，与普通工具分开展示）"""

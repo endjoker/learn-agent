@@ -19,6 +19,8 @@ from gateway.webui.events import EventBus, SSEHandler
 from gateway.webui.channel import WebuiChannel
 from gateway.webui.glue import Glue
 from gateway.webui.config_service import ConfigService
+from gateway.plan_runtime import PlanRuntime
+from core.runtime import ArtifactStore
 
 logger = logging.getLogger("hello_agent.gateway")
 
@@ -63,16 +65,23 @@ def _parse_allowed_networks(values) -> tuple[ipaddress._BaseNetwork, ...]:
 class WebUIModule:
     """WebUI 装配类"""
 
-    def __init__(self, dispatcher, session_mgr, config: dict = None):
+    def __init__(self, dispatcher, session_mgr, config: dict = None, runtime_store=None):
         self.dispatcher = dispatcher
         self.session_mgr = session_mgr
         self.config = config or {}
+        self.runtime_store = runtime_store
+        artifact_cfg = self.config.get("artifacts", {})
+        self.artifact_store = ArtifactStore(
+            runtime_store, artifact_cfg.get("root") or None,
+            max_file_bytes=int(artifact_cfg.get("max_file_bytes", 50 * 1024 * 1024)),
+        )
         self._auth_token = str(self.config.get("auth_token") or "")
         self._allowed_networks = _parse_allowed_networks(
             self.config.get("allowed_ips", []))
         self.bus = EventBus()
         self.channel = WebuiChannel(self.bus)
         self._sse = SSEHandler(self.bus)
+        self.plan_runtime = PlanRuntime(dispatcher, runtime_store, self.bus, artifact_store=self.artifact_store)
         self.glue = Glue(self)
         self.config_service = ConfigService()
         self.scheduler = None   # 由 server 装配后注入（/api/scheduler 用）
@@ -86,6 +95,9 @@ class WebUIModule:
     async def start(self):
         self.bus.bind_loop(asyncio.get_event_loop())
         self.dispatcher.register_channel(self.channel)
+        # Agent instances are created lazily by Dispatcher in the executor
+        # thread. Keep WebUI-specific session/approval wiring on that
+        # creation path so resumed sessions behave exactly like new ones.
         self.dispatcher.add_agent_initializer(self._init_agent)
         self._register_commands()
         self.session_mgr.on_created.append(self._on_session_created)
@@ -93,6 +105,17 @@ class WebUIModule:
         self._probe_task = asyncio.create_task(self._probe_loop())
         self._mcp_warm_task = asyncio.create_task(self._mcp_warm())
         logger.info("🖥️ WebUI 已启动（static: %s）", STATIC_DIR)
+
+    async def recover_persisted_plans(self) -> None:
+        """Restart approved/active Plans after Gateway and TaskRuntime recovery."""
+        if not self.dispatcher.task_runtime_enabled:
+            return
+        for plan in self.plan_runtime.manager.list_recoverable():
+            try:
+                self.plan_runtime.start(plan.plan_id)
+                logger.info("recovered persisted Plan: %s (%s)", plan.plan_id, plan.status.value)
+            except Exception:
+                logger.exception("failed to recover persisted Plan: %s", plan.plan_id)
 
     async def _mcp_warm(self):
         """启动后预热常驻 MCP 连接（#2：启动即连上，不再等打开页面）"""
@@ -120,7 +143,6 @@ class WebUIModule:
                       "[ask|allow|unreviewed]")
         d.add_command("/plan-preview", g.handle_plan_preview_command,
                       "", "", client_hint="plan-flow")
-        d.add_command("/plan-apply", g.handle_plan_apply_command, "")
         d.add_command("/reload-prompt", g.handle_reload_prompt_command,
                       "/reload-prompt — 重载提示词文件")
         d.add_command("/mcp", g.handle_mcp_command,
@@ -151,14 +173,12 @@ class WebUIModule:
             pass
         logger.info("🖥️ WebUI 已停止")
 
-    # ---------- 回调 ----------
-
-    def _init_agent(self, agent, entry):
-        """agent 创建后回调：委托 glue（BridgeHook 等）"""
-        self.glue.init_agent(agent, entry)
-
     def _on_session_created(self, session_key, reason=""):
         self.bus.publish("session.created", {"session_key": session_key})
+
+    def _init_agent(self, agent, entry):
+        """Apply WebUI session identity and the configured approval mode."""
+        self.glue.init_agent(agent, entry)
 
     def _on_session_evicted(self, session_key, reason=""):
         self.bus.publish("session.evicted",
@@ -193,6 +213,8 @@ class WebUIModule:
         # 会话页端点（P3b）
         from gateway.webui import api_chat
         api_chat.register_routes(app, self)
+        from gateway.webui import api_artifacts
+        api_artifacts.register_routes(app, self)
         # MCP / Skills / Prompt 端点（P3c/P3d）
         from gateway.webui import api_system
         api_system.register_routes(app, self)

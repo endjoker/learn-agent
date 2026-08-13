@@ -2,6 +2,17 @@
 // 大模型（列表 + 厂商向导 + 默认模型）/ 工作区 / Prompt 截断 / Gateway 会话
 "use strict";
 
+const REASONING_LEVEL_LABELS = {
+  provider_default: "服务商默认",
+  none: "关闭推理",
+  minimal: "极低",
+  low: "低",
+  medium: "中",
+  high: "高",
+  xhigh: "极高",
+  max: "最大",
+};
+
 window.PageSettings = class {
   constructor() { this._offs = []; this._rev = 0; }
 
@@ -73,10 +84,19 @@ window.PageSettings = class {
         HA.el("option", { value: n, text: n,
           ...(n === llm.model_id ? { selected: "selected" } : {}) })));
     defaultSel.addEventListener("change", () => this._setDefaultModel(defaultSel.value));
+    const globalReasoning = HA.el("select", {},
+      ...["provider_default", "none", "minimal", "low", "medium", "high", "xhigh", "max"].map(level =>
+        HA.el("option", { value: level, text: REASONING_LEVEL_LABELS[level],
+          ...(((llm.reasoning || {}).level || "provider_default") === level
+            ? { selected: "selected" } : {}) })));
+    globalReasoning.addEventListener("change", () =>
+      this._setLLMReasoning(globalReasoning.value));
 
     return this._card("大模型",
       HA.el("div", { class: "form-row" },
         HA.el("label", { class: "dim" }, "默认模型"), defaultSel),
+      HA.el("div", { class: "form-row" },
+        HA.el("label", { class: "dim" }, "全局推理等级"), globalReasoning),
       table,
       HA.el("div", { class: "form-row", style: "margin-top:10px" },
         HA.el("button", { class: "btn primary", text: "＋ 按厂商添加模型",
@@ -87,6 +107,14 @@ window.PageSettings = class {
     try {
       await HA.api("PUT", "/api/config/llm", { model_id: name });
       HA.toast(`默认模型: ${name}`, "ok");
+      this._loadConfig();
+    } catch (e) { }
+  }
+
+  async _setLLMReasoning(level) {
+    try {
+      await HA.api("PUT", "/api/config/llm", { reasoning: { level } });
+      HA.toast(`全局推理等级：${REASONING_LEVEL_LABELS[level] || level}`, "ok");
       this._loadConfig();
     } catch (e) { }
   }
@@ -104,10 +132,19 @@ window.PageSettings = class {
   _editModel(name, cfg) {
     const baseIn = HA.el("input", { value: cfg.base_url || "" });
     const ctxIn = HA.el("input", { type: "number", value: cfg.context_length || "" });
+    const reasoningIn = HA.el("select", {},
+      ...["provider_default", "none", "minimal", "low", "medium", "high", "xhigh", "max"].map(level =>
+        HA.el("option", { value: level, text: REASONING_LEVEL_LABELS[level],
+          ...((cfg.reasoning || {}).level === level ||
+              (!(cfg.reasoning || {}).level && level === "provider_default")
+            ? { selected: "selected" } : {}) })));
+    const supportsReasoning = (cfg.protocol || "openai") === "openai";
+    reasoningIn.disabled = !supportsReasoning;
     const keyIn = HA.el("input", { type: "password", value: "",
       placeholder: `当前 ${cfg.api_key || "（无）"} — 留空保持不变` });
     const save = async () => {
-      const body = { base_url: baseIn.value.trim() };
+      const body = { base_url: baseIn.value.trim(),
+        reasoning: { level: reasoningIn.value } };
       if (ctxIn.value) body.context_length = parseInt(ctxIn.value, 10);
       if (keyIn.value) body.api_key = keyIn.value;  // 空→后端保留原值
       try {
@@ -122,6 +159,8 @@ window.PageSettings = class {
         HA.el("h2", { text: `编辑模型 ${name}` }),
         HA.el("label", { class: "form-label" }, "base_url", baseIn),
         HA.el("label", { class: "form-label" }, "context_length", ctxIn),
+        HA.el("label", { class: "form-label" },
+          supportsReasoning ? "推理等级" : "推理等级（该协议仅支持 provider_default）", reasoningIn),
         HA.el("label", { class: "form-label" }, "api_key（不明文显示）", keyIn),
         HA.el("div", { class: "modal-actions" },
           HA.el("button", { class: "btn primary", text: "保存", onclick: save }),
@@ -169,6 +208,12 @@ window.PageSettings = class {
       placeholder: hint ? `留空 = 使用环境变量 ${hint}` : "api_key" });
     const ctxIn = HA.el("input", { type: "number",
       value: spec.type === "local" ? 131072 : 128000 });
+    const reasoningIn = HA.el("select", {},
+      ...["provider_default", "none", "minimal", "low", "medium", "high", "xhigh", "max"].map(level =>
+        HA.el("option", { value: level, text: REASONING_LEVEL_LABELS[level],
+          ...(level === "provider_default" ? { selected: "selected" } : {}) })));
+    const supportsReasoning = (spec.protocol || "openai") === "openai";
+    reasoningIn.disabled = !supportsReasoning;
 
     const save = async () => {
       const body = {
@@ -177,6 +222,7 @@ window.PageSettings = class {
         base_url: urlIn.value.trim(),
         api_key: keyIn.value,
         context_length: parseInt(ctxIn.value || "0", 10),
+        reasoning: { level: reasoningIn.value },
       };
       if (spec.type === "local") body.provider = spec.provider;
       else body.protocol = spec.protocol;
@@ -196,6 +242,8 @@ window.PageSettings = class {
         HA.el("label", { class: "form-label" }, "base_url", urlIn),
         HA.el("label", { class: "form-label" }, "api_key", keyIn),
         HA.el("label", { class: "form-label" }, "context_length", ctxIn),
+        HA.el("label", { class: "form-label" },
+          supportsReasoning ? "推理等级" : "推理等级（该协议仅支持 provider_default）", reasoningIn),
         HA.el("div", { class: "modal-actions" },
           HA.el("button", { class: "btn primary", text: "保存", onclick: save }),
           HA.el("button", { class: "btn", text: "取消",
@@ -250,7 +298,7 @@ window.PageSettings = class {
       mk("max_sessions", "最大会话数", 50),
       mk("idle_timeout_minutes", "空闲超时（分钟）", 60),
       mk("soft_timeout_seconds", "软超时（秒）", 90),
-      mk("hard_timeout_seconds", "硬超时（秒）", 600),
+      mk("hard_timeout_seconds", "硬超时（秒）", 1200),
     ];
     const saveBtn = HA.el("button", { class: "btn primary", text: "保存",
       onclick: () => {

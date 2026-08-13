@@ -1,15 +1,33 @@
 {
   "agent_runtime": {
-    "response_protocol": "native",
-    "legacy_execute": false,
-    "protocol_retry_limit": 0,
-    "raw_response_audit": "errors",
-    "raw_response_max_chars": 20000,
-    "native_tool_streaming": true
+    "native_tool_streaming": true,
+    "max_tool_result_chars": 10000
+  },
+  "runtime_store": {
+    "backend": "sqlite",
+    "path": "./workspace/.agent/state/runtime.db",
+    "wal": true,
+    "busy_timeout_ms": 5000
+  },
+  "task_runtime": {
+    "enabled": true,
+    "max_global_concurrency": 4,
+    "default_timeout_seconds": 1200,
+    "cancel_grace_seconds": 10,
+    "zombie_max_seconds": 300,
+    "max_attempts": 2
+  },
+  "artifacts": {
+    "root": "./workspace/.agent/artifacts",
+    "max_file_bytes": 52428800,
+    "retention_days": 30
   },
   "llm": {
     "model_id": "ornith",
     "timeout": 60,
+    "reasoning": {
+      "level": "provider_default"
+    },
     "models": {
       "deepseek-v4-flash": {
         "api_key": "YOUR_API_KEY_HERE",
@@ -171,6 +189,13 @@
   "gateway": {
     "host": "127.0.0.1",
     "port": 9120,
+    "agent": {
+      "model": "",
+      "max_steps": 100,
+      "permission_mode": "allow",
+      "auto_approve_plan": true,
+      "quiet": true
+    },
     "channels": {
       "webui": {
         "enabled": true
@@ -254,6 +279,46 @@
         "10.0.0.0/8",
         "172.16.0.0/12"
       ]
+    },
+    "python": {
+      "forbidden_imports": [
+        "ctypes",
+        "socket"
+      ],
+      "forbidden_calls": [
+        "eval",
+        "exec",
+        "__import__"
+      ],
+      "forbidden_qualified_calls": [
+        "os.system",
+        "os.popen",
+        "os.execv",
+        "os.execve",
+        "os.execvp",
+        "os.execvpe",
+        "os.remove",
+        "os.unlink",
+        "os.rmdir",
+        "os.kill",
+        "os.killpg",
+        "shutil.rmtree"
+      ]
     }
+  },
+  "prompt": {
+    "bootstrap_max_chars_per_file": 8000,
+    "bootstrap_max_chars_total": 32000,
+    "truncation_warning": "once"
+  },
+  "workspace": {
+    "path": "./workspace",
+    "dirs": [
+      "ref",
+      "scripts",
+      "downloads",
+      "tmp",
+      "output"
+    ]
   }
 }

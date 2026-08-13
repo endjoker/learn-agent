@@ -10,4 +10,4 @@ When asked to review code, follow these steps:
 3. Provide structured review with severity labels
 4. Always include concrete fix suggestions
 
-完成后只输出 agent.turn.v1/final JSON 信封。
+完成后直接输出用户可读的审查结论和修复建议。需要工具时使用运行时提供的原生 function calling，不要输出 JSON 信封或文本控制协议。

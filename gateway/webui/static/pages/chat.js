@@ -2,6 +2,18 @@
 // 会话选择 / 模型切换 / 权限三档 / 模式切换 / 工具调用卡片 / plan 两阶段 / ask 审批
 "use strict";
 
+const CHAT_REASONING_LEVEL_LABELS = {
+  inherit: "继承模型配置",
+  provider_default: "服务商默认",
+  none: "关闭推理",
+  minimal: "极低",
+  low: "低",
+  medium: "中",
+  high: "高",
+  xhigh: "极高",
+  max: "最大",
+};
+
 window.PageChat = class {
   constructor() {
     this._offs = [];
@@ -21,6 +33,12 @@ window.PageChat = class {
     this._streamText = "";
     this._streamMessageId = "";
     this._closedStreamIds = new Set();
+    // SSE tool events and the HTTP final reply travel independently.  Keep
+    // the completed answer node by inbound message ID so late tool events
+    // can still be inserted before their answer instead of at the bottom.
+    this._finalBubbles = new Map();
+    this._modeAvailability = { chat: true, plan: true };
+    this._planCards = new Map();
   }
 
   get sessionKey() { return this._state.sessionKey; }
@@ -34,8 +52,11 @@ window.PageChat = class {
     root.appendChild(this._buildInputbar());
     root.appendChild(this._buildApprovalHost());
 
-    await Promise.all([this._loadModels(), this._loadCommands()]);
+    await Promise.all([
+      this._loadModels(), this._loadCommands(), this._loadModes(),
+    ]);
     await this._loadSessions();
+    await this._refreshWorkMode();
     this._bindSSE();
     this._applyToolFilter();
   }
@@ -45,12 +66,24 @@ window.PageChat = class {
     const bar = HA.el("div", { class: "chat-topbar" });
 
     this._sessionSel = HA.el("select", {
-      onchange: () => { this.sessionKey = this._sessionSel.value; this.loadHistory(); },
+      onchange: async () => { this.sessionKey = this._sessionSel.value; await this.loadHistory(); await this._refreshWorkMode(); },
     });
     this._newSessionBtn = HA.el("button", { class: "btn", text: "＋ 新会话",
       onclick: () => this._newSession() });
 
     this._modelSel = HA.el("select", { onchange: () => this._switchModel() });
+    this._reasoningSel = HA.el("select", { onchange: () => this._switchReasoning() },
+      ...[
+        ["inherit", "推理：继承模型"],
+        ["provider_default", "推理：服务商默认"],
+        ["none", "推理：关闭"],
+        ["minimal", "推理：极低"],
+        ["low", "推理：低"],
+        ["medium", "推理：中"],
+        ["high", "推理：高"],
+        ["xhigh", "推理：极高"],
+        ["max", "推理：最大"],
+      ].map(([value, text]) => HA.el("option", { value, text })));
     this._permSeg = this._segmented([
       { value: "ask", label: "询问" },
       { value: "allow", label: "允许" },
@@ -59,14 +92,14 @@ window.PageChat = class {
     this._modeSeg = this._segmented([
       { value: "chat", label: "会话" },
       { value: "plan", label: "方案" },
-    ], m => { this.mode = m; this._renderModeHint(); });
+    ], m => this._setMode(m));
 
     this._toolToggle = HA.el("label", { class: "chk" },
       HA.el("input", { type: "checkbox", checked: "checked",
         onchange: e => { this.showTools = e.target.checked; this._applyToolFilter(); } }),
       " 工具");
 
-    const clearBtn = HA.el("button", { class: "btn", text: "清空",
+    this._clearBtn = HA.el("button", { class: "btn", text: "清空聊天",
       onclick: () => this._clear() });
     const delBtn = HA.el("button", { class: "btn danger", text: "删除",
       onclick: () => this._deleteSession() });
@@ -78,9 +111,10 @@ window.PageChat = class {
         HA.el("span", { class: "tb-label", text: "会话" }),
         this._sessionSel, this._newSessionBtn,
         HA.el("span", { class: "tb-label", text: "模型" }), this._modelSel,
+        this._reasoningSel,
         HA.el("span", { class: "tb-label", text: "权限" }), this._permSeg,
         HA.el("span", { class: "tb-label", text: "模式" }), this._modeSeg,
-        this._toolToggle, clearBtn, delBtn),
+        this._toolToggle, this._clearBtn, delBtn),
       this._modeHint,
     );
     return bar;
@@ -95,6 +129,7 @@ window.PageChat = class {
       const b = HA.el("button", {
         class: "seg-btn", text: o.label,
         title: o.value,
+        disabled: o.disabled ? "disabled" : undefined,
         onclick: () => {
           Object.values(btns).forEach(x => x.classList.remove("on"));
           b.classList.add("on");
@@ -108,13 +143,53 @@ window.PageChat = class {
       Object.entries(btns).forEach(([k, b]) =>
         b.classList.toggle("on", k === v));
     };
+    wrap._setAvailable = values => {
+      Object.entries(btns).forEach(([k, b]) => { b.disabled = values[k] === false; });
+    };
     return wrap;
   }
 
   _renderModeHint() {
-    this._modeHint.textContent = this.mode === "plan"
-      ? "plan 模式：发送将先生成方案，确认后执行（两阶段）"
-      : "";
+    const hints = {
+      plan: "方案模式：发送将先生成方案，确认后执行（两阶段）",
+    };
+    this._modeHint.textContent = hints[this.mode] || "";
+    if (this._clearBtn) {
+      const labels = {
+        plan: ["清空 Plan", "仅清除已结束的 Plan 卡片；运行中的 Plan 不受影响"],
+      };
+      const [text, title] = labels[this.mode] || ["清空聊天", "清除当前会话的聊天记录"];
+      this._clearBtn.textContent = text;
+      this._clearBtn.title = title;
+    }
+    if (this._input) {
+      this._input.placeholder = "输入消息…（/ 触发命令补全；Ctrl+V 粘贴图片）";
+    }
+  }
+
+  async _loadModes() {
+    try {
+      const d = await HA.api("GET", "/api/modes", undefined, { silent: true });
+      for (const mode of d.modes || []) this._modeAvailability[mode.id] = !!mode.available;
+    } catch (e) { }
+    if (!this._modeAvailability[this.mode]) this.mode = this._state.mode = "chat";
+    if (this._modeSeg) this._modeSeg._setAvailable(this._modeAvailability);
+  }
+
+  async _setMode(mode) {
+    if (!this._modeAvailability[mode]) return;
+    this.mode = this._state.mode = mode;
+    this._modeSeg._set(mode);
+    this._renderModeHint();
+    await this._refreshWorkMode();
+  }
+
+  async _refreshWorkMode() {
+    this._renderModeHint();
+    if (this._msgArea) {
+      this._msgArea.style.display = "";
+      if (!this._msgArea.children.length) await this.loadHistory();
+    }
   }
 
   // ---------- 输入栏 ----------
@@ -253,6 +328,7 @@ window.PageChat = class {
 
   async loadHistory() {
     this._msgArea.innerHTML = "";
+    this._planCards.clear();
     try {
       const d = await HA.api("GET",
         `/api/sessions/${encodeURIComponent(this.sessionKey)}/history`,
@@ -262,7 +338,24 @@ window.PageChat = class {
       this._msgArea.appendChild(HA.el("div",
         { class: "empty-hint", text: "（无历史消息，发送第一条开始对话）" }));
     }
+    await this._loadPlans();
     this._loadPermission();
+    this._loadReasoning();
+  }
+
+  async _loadReasoning() {
+    try {
+      const d = await HA.api("GET",
+        `/api/sessions/${encodeURIComponent(this.sessionKey)}/reasoning`,
+        undefined, { silent: true });
+      if (d && this._reasoningSel) {
+        this._reasoningSel.value = d.selected || "inherit";
+        this._reasoningSel.disabled = !!d.loaded && d.protocol !== "openai";
+        this._reasoningSel.title = d.loaded
+          ? `当前生效：${CHAT_REASONING_LEVEL_LABELS[d.effective] || d.effective || "继承模型配置"}`
+          : "将在会话加载后生效";
+      }
+    } catch (e) { }
   }
 
   async _loadPermission() {
@@ -282,16 +375,17 @@ window.PageChat = class {
       // Internal recovery traffic must never be rendered as conversation.
       // Older sessions may still contain the raw failed envelope, so this
       // filters both the correction instruction and its paired assistant turn.
-      if (m.kind === "protocol_error" || m.name === "protocol_correction") {
+      if (m.kind === "protocol_error" || m.name === "protocol_correction" ||
+          m.kind === "history_summary" || m.internal === true) {
         i++; continue;
       }
       // 内部格式纠正提示（format_hint）不在 UI 展示（name 标记 + 内容兜底兼容旧数据）
       const c0 = typeof m.content === "string" ? m.content : "";
       if (m.name === "format_hint" ||
-          (m.role === "user" && c0.startsWith("你的回复中包含代码但没有使用工具调用"))) {
+          (m.role === "user" && (c0.startsWith("你的回复中包含代码但没有使用工具调用") ||
+                                 c0.startsWith("【历史对话摘要】")))) {
         i++; continue;
       }
-      const content = m.content_text ?? (typeof m.content === "string" ? m.content : "");
       if (m.role === "assistant" && m.kind === "tool_calls") {
         const group = HA.el("div", { class: "tool-group" });
         let j = i + 1;
@@ -311,21 +405,6 @@ window.PageChat = class {
           continue;
         }
       }
-      const isStructuredToolCall = m.role === "assistant" && (
-        m.kind === "tool_calls" ||
-        (content.includes("agent.turn.v1") &&
-         /"type"\s*:\s*"tool_calls"/.test(content))
-      );
-      const isAssistantAction = m.role === "assistant" &&
-        (/ACTION[：:]/.test(content) || isStructuredToolCall);
-      const next = messages[i + 1];
-      const nextIsTool = next && next.role === "user" && next.name === "tool_result";
-      if (isAssistantAction && nextIsTool) {
-        const nextContent = next.content_text ?? (typeof next.content === "string" ? next.content : "");
-        this._msgArea.appendChild(this._toolCardGroup(content, nextContent));
-        i += 2;
-        continue;
-      }
       this._msgArea.appendChild(this._bubble(m));
       i++;
     }
@@ -343,27 +422,6 @@ window.PageChat = class {
       HA.el("div", { class: "bubble-role",
         text: role === "user" ? "👤 我" : (role === "assistant" ? "🤖 助手" : "ℹ️") }),
       body);
-  }
-
-  _toolCardGroup(assistantText, toolResultText) {
-    const cards = this._parseToolResults(toolResultText);
-    const group = HA.el("div", { class: "tool-group" });
-    for (const c of cards) group.appendChild(this._toolCard(c, false));
-    return group;
-  }
-
-  _parseToolResults(text) {
-    const out = [];
-    const blocks = String(text).split("【工具执行结果】").slice(1);
-    for (const b of blocks) {
-      const name = (b.match(/工具[:：]\s*([^\n]+)/) || [])[1] || "";
-      const input = (b.match(/输入摘要[:：]\s*([\s\S]*?)(?=\n\s*返回结果[:：])/) || [])[1] || "";
-      const result = (b.match(/返回结果[:：]\s*([\s\S]*?)(?=【工具执行完毕】|$)/) || [])[1] || "";
-      const ok = !/❌/.test(b.split("【工具执行完毕】")[0]);
-      out.push({ tool: name.trim(), input: input.trim(), result: result.trim(), ok });
-    }
-    if (!out.length) out.push({ tool: "tool", input: "", result: String(text).slice(0, 300), ok: true });
-    return out;
   }
 
   _toolCard(c, pending) {
@@ -452,29 +510,86 @@ window.PageChat = class {
     } catch (e) { /* toast 已弹 */ }
   }
 
-  _appendPlanCard(p) {
-    const list = HA.el("ol", { class: "plan-list" },
-      ...(p.tasks || []).map(t => HA.el("li", { text: t.description })));
-    const approve = HA.el("button", { class: "btn primary", text: "✅ 批准执行",
-      onclick: async () => {
-        try {
-          await HA.api("POST", `/api/plan/${p.plan_id}/approve`);
-          card.remove();
-          this._appendSystem("▶ 方案已提交执行，进度见工具事件与最终回复");
-        } catch (e) { }
-      } });
-    const reject = HA.el("button", { class: "btn", text: "❌ 拒绝",
-      onclick: async () => {
-        try { await HA.api("POST", `/api/plan/${p.plan_id}/reject`); } catch (e) { }
-        card.remove();
-      } });
-    const card = HA.el("div", { class: "plan-card" },
-      HA.el("div", { class: "plan-title", text: "📋 方案预览" }), list,
-      HA.el("div", { class: "plan-actions" }, approve, reject));
-    this._msgArea.appendChild(card);
+  async _loadPlans() {
+    try {
+      const d = await HA.api("GET", `/api/plans?session_key=${encodeURIComponent(this.sessionKey)}`,
+        undefined, { silent: true });
+      (d.plans || []).reverse().forEach(plan => this._appendPlanCard(plan));
+    } catch (e) { /* plan persistence is optional for an empty/new session */ }
+  }
+
+  _appendPlanCard(payload) {
+    const plan = payload && (payload.plan || payload);
+    if (!plan || !plan.plan_id) return;
+    let card = this._planCards.get(plan.plan_id);
+    if (!card) {
+      card = HA.el("div", { class: "plan-card", "data-plan-id": plan.plan_id });
+      this._planCards.set(plan.plan_id, card);
+      this._msgArea.appendChild(card);
+    }
+    this._renderPlanCard(card, plan);
     this._scrollBottom();
   }
 
+  _renderPlanCard(card, plan) {
+    card.dataset.planStatus = plan.status || "";
+    const statusText = {
+      awaiting_approval: "待确认", approved: "已批准", active: "执行中", paused: "已暂停",
+      completed: "已完成", failed: "失败", cancelled: "已取消", superseded: "已替代",
+    }[plan.status] || plan.status || "未知";
+    const taskStatus = {
+      pending: "○", ready: "◌", assigned: "◌", in_progress: "▶", waiting: "…",
+      completed: "✅", failed: "❌", blocked: "⛔", cancelled: "⊘",
+    };
+    const list = HA.el("ol", { class: "plan-list" },
+      ...(plan.tasks || []).map(task => HA.el("li", {
+        text: `${taskStatus[task.status] || "•"} ${task.description}`,
+        title: task.result_summary || task.blocked_reason?.message || task.status || "",
+      })));
+    const call = path => async () => {
+      try {
+        const response = await HA.api("POST", path);
+        this._renderPlanCard(card, response.plan || plan);
+      } catch (e) { /* toast is emitted by HA.api */ }
+    };
+    const archive = async () => {
+      try {
+        await HA.api("POST", `/api/plans/${encodeURIComponent(plan.plan_id)}/archive`);
+        this._removePlanCard(plan.plan_id);
+      } catch (e) { /* toast is emitted by HA.api */ }
+    };
+    const actions = [];
+    if (plan.status === "awaiting_approval") {
+      actions.push(HA.el("button", { class: "btn primary", text: "✅ 批准执行",
+        onclick: call(`/api/plan/${encodeURIComponent(plan.plan_id)}/approve`) }));
+      actions.push(HA.el("button", { class: "btn", text: "❌ 拒绝",
+        onclick: call(`/api/plan/${encodeURIComponent(plan.plan_id)}/reject`) }));
+    } else if (plan.status === "active") {
+      actions.push(HA.el("button", { class: "btn", text: "⏸ 暂停",
+        onclick: call(`/api/plans/${encodeURIComponent(plan.plan_id)}/pause`) }));
+      actions.push(HA.el("button", { class: "btn danger", text: "⊘ 取消",
+        onclick: call(`/api/plans/${encodeURIComponent(plan.plan_id)}/cancel`) }));
+    } else if (plan.status === "paused") {
+      actions.push(HA.el("button", { class: "btn primary", text: "▶ 继续",
+        onclick: call(`/api/plans/${encodeURIComponent(plan.plan_id)}/resume`) }));
+      actions.push(HA.el("button", { class: "btn danger", text: "⊘ 取消",
+        onclick: call(`/api/plans/${encodeURIComponent(plan.plan_id)}/cancel`) }));
+    } else if (plan.status === "approved") {
+      actions.push(HA.el("button", { class: "btn danger", text: "⊘ 取消",
+        onclick: call(`/api/plans/${encodeURIComponent(plan.plan_id)}/cancel`) }));
+    }
+    if (["completed", "failed", "cancelled", "superseded"].includes(plan.status)) {
+      actions.push(HA.el("button", { class: "btn", text: "清除此 Plan",
+        title: "仅隐藏已结束的 Plan 卡片，审计记录仍会保留",
+        onclick: archive }));
+    }
+    const progress = Math.round((Number(plan.progress) || 0) * 100);
+    card.replaceChildren(
+      HA.el("div", { class: "plan-title", text: `📋 ${plan.title || "执行方案"} · ${statusText} · ${progress}%` }),
+      list,
+      HA.el("div", { class: "plan-actions" }, ...actions),
+    );
+  }
   _appendUser(text, images) {
     let content = text;
     if (images && images.length) {
@@ -525,17 +640,37 @@ window.PageChat = class {
         this._closedStreamIds.delete(this._closedStreamIds.values().next().value);
       }
     }
+    let answerBubble = null;
     if (this._streamBubble) {
       this._streamText = answer;
       const body = this._streamBubble.querySelector(".bubble-text");
       body.innerHTML = HA.renderMd(answer);
+      answerBubble = this._streamBubble;
       this._streamBubble = null;
       this._streamText = "";
       this._streamMessageId = "";
       this._scrollBottom();
     } else if (answer) {
-      this._appendAssistant(answer);
+      answerBubble = this._bubble({ role: "assistant", content: answer });
+      this._msgArea.appendChild(answerBubble);
+      this._scrollBottom();
     }
+    if (messageId && answerBubble) {
+      this._finalBubbles.set(messageId, answerBubble);
+      if (this._finalBubbles.size > 64) {
+        this._finalBubbles.delete(this._finalBubbles.keys().next().value);
+      }
+    }
+  }
+
+  _insertToolCard(card, messageId) {
+    const answerBubble = this._finalBubbles.get(messageId) || this._streamBubble;
+    if (answerBubble && answerBubble.parentNode === this._msgArea) {
+      this._msgArea.insertBefore(card, answerBubble);
+    } else {
+      this._msgArea.appendChild(card);
+    }
+    this._scrollBottom();
   }
 
   // ---------- 运行期操作 ----------
@@ -546,7 +681,21 @@ window.PageChat = class {
       await HA.api("POST",
         `/api/sessions/${encodeURIComponent(this.sessionKey)}/model`, { model });
       HA.toast(`已切换模型: ${model}`, "ok");
+      await this._loadReasoning();
     } catch (e) { }
+  }
+
+  async _switchReasoning() {
+    const level = this._reasoningSel.value;
+    try {
+      const d = await HA.api("POST",
+        `/api/sessions/${encodeURIComponent(this.sessionKey)}/reasoning`, { level });
+      this._reasoningSel.value = d.selected || level;
+      const effective = d.effective || level;
+      const label = CHAT_REASONING_LEVEL_LABELS[effective] || effective;
+      this._reasoningSel.title = `当前生效：${label}`;
+      HA.toast(`本会话推理等级：${label}`, "ok");
+    } catch (e) { await this._loadReasoning(); }
   }
 
   async _setPermission(mode) {
@@ -559,10 +708,30 @@ window.PageChat = class {
 
   async _clear() {
     try {
+      if (this.mode === "plan") {
+        const result = await HA.api("POST", "/api/plans/clear", { session_key: this.sessionKey });
+        this._removeTerminalPlanCards();
+        HA.toast(`已清除 ${result.archived || 0} 个已结束的 Plan`, "ok");
+        return;
+      }
       await HA.api("POST",
         `/api/sessions/${encodeURIComponent(this.sessionKey)}/clear`);
-      this.loadHistory();
+      await this.loadHistory();
+      await this._refreshWorkMode();
     } catch (e) { }
+  }
+
+  _removePlanCard(planId) {
+    const card = this._planCards.get(planId);
+    if (card) card.remove();
+    this._planCards.delete(planId);
+  }
+
+  _removeTerminalPlanCards() {
+    const terminal = new Set(["completed", "failed", "cancelled", "superseded"]);
+    for (const [planId, card] of this._planCards) {
+      if (terminal.has(card.dataset.planStatus)) this._removePlanCard(planId);
+    }
   }
 
   async _deleteSession() {
@@ -632,8 +801,7 @@ window.PageChat = class {
       if (d.session_key !== sk()) return;
       const card = this._toolCard({ tool: d.tool, input: "", result: "" }, true);
       card.dataset.toolCallId = d.tool_call_id;
-      this._msgArea.appendChild(card);
-      this._scrollBottom();
+      this._insertToolCard(card, d.message_id);
     }));
     this._offs.push(HA.onSSE("chat.tool_call_end", d => {
       if (d.session_key !== sk()) return;
@@ -655,6 +823,20 @@ window.PageChat = class {
     this._offs.push(HA.onSSE("chat.tool.denied", d => {
       if (d.session_key !== sk()) return;
       this._appendSystem(`🚫 工具被拒绝: ${d.tool}（${d.reason}）`);
+    }));
+    this._offs.push(HA.onSSE("plan.changed", d => {
+      if (d.action === "terminal_cards_cleared") {
+        if (d.session_key === sk()) this._removeTerminalPlanCards();
+        return;
+      }
+      const plan = d.plan;
+      if (!plan || !plan.plan_id) return;
+      const card = this._planCards.get(plan.plan_id);
+      if (d.action === "archived") {
+        if (card) this._removePlanCard(plan.plan_id);
+        return;
+      }
+      if (card) this._renderPlanCard(card, plan);
     }));
     this._offs.push(HA.onSSE("chat.done", d => {
       if (d.session_key !== sk()) return;

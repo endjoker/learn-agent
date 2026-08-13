@@ -3,7 +3,6 @@
 WebUI 胶水层（P3b 完整版）
 
 - send_and_wait：合成消息走漏斗 + future 取回（一切运行期 agent 操作的统一范式）
-- Glue.init_agent：agent 初始化器（BridgeHook 工具事件桥）
 - Glue.apply_permission_mode：权限三档（ask / allow / unreviewed）
 - ApprovalBridge：ask 档审批桥（executor 线程等待，fail-closed 300s）
 - plan 两阶段：/plan-preview（只读预览）+ 暂存 + /plan-apply（漏斗内执行）
@@ -16,14 +15,12 @@ import threading
 import time
 import uuid
 
-from core.hook.events import HookEvent, Decision, HookResult
-from core.hook.hooks import BaseHook
+from core.plan import PlanManager, PlanStatus
+from gateway.dispatcher import Dispatcher
 from gateway.channels.base import InboundMessage
 
 _PREVIEW_CHARS = 300          # 工具参数/结果预览截断
 _APPROVAL_TIMEOUT = 300       # 审批等待上限（< 硬超时 600，fail-closed）
-_PLAN_TTL = 600               # plan 暂存 TTL（秒）
-_PLAN_MAX = 32                # plan 暂存上限
 _WRITE_TOOLS = ("bash", "write", "edit", "python", "http", "file_mgr")
 
 
@@ -55,43 +52,6 @@ async def send_and_wait(module, session_key: str, text: str,
         module.channel.discard_future(session_key, message_id)
         return {"ok": False, "error": f"timeout({timeout}s)",
                 "session_key": session_key, "message_id": message_id}
-
-
-# ============================================================
-# BridgeHook —— hook 事件 → SSE（executor 线程 → 主循环，publish 线程安全）
-# ============================================================
-
-class BridgeHook(BaseHook):
-    """把 PRE_TOOL / POST_TOOL / DENIED 转发为 SSE chat.tool.* 事件"""
-
-    name = "webui-bridge"
-
-    def __init__(self, bus, session_key: str):
-        self.bus = bus
-        self.session_key = session_key
-
-    def run(self, ctx):
-        p = ctx.payload or {}
-        if ctx.event == HookEvent.PRE_TOOL:
-            self.bus.publish("chat.tool.start", {
-                "session_key": self.session_key,
-                "tool": p.get("tool_name", ""),
-                "params_preview": str(p.get("params", ""))[:_PREVIEW_CHARS],
-            })
-        elif ctx.event == HookEvent.POST_TOOL:
-            self.bus.publish("chat.tool.done", {
-                "session_key": self.session_key,
-                "tool": p.get("tool_name", ""),
-                "ok": not p.get("is_error", False),
-                "preview": str(p.get("result", ""))[:_PREVIEW_CHARS],
-            })
-        elif ctx.event == HookEvent.DENIED:
-            self.bus.publish("chat.tool.denied", {
-                "session_key": self.session_key,
-                "tool": p.get("tool_name", ""),
-                "reason": p.get("reason", ""),
-            })
-        return HookResult(Decision.CONTINUE)
 
 
 # ============================================================
@@ -175,16 +135,27 @@ class Glue:
     def __init__(self, module):
         self.module = module
         self.bridge = ApprovalBridge(module)
-        self._plans: dict = {}     # plan_id -> {session_key,text,plan_text,created_at}
-        self._plans_lock = threading.Lock()
-
-    # ---------- agent 初始化器 ----------
-
+        self.plan_manager = PlanManager(module.runtime_store)
     def init_agent(self, agent, entry):
-        """agent 创建后（executor 线程）：挂 BridgeHook 工具事件桥"""
-        # Runtime tool events carry call IDs and are forwarded by Dispatcher.
-        # Do not duplicate them through a hook side channel.
-        return None
+        """Attach WebUI approval/session state to a lazily-created Agent.
+
+        Dispatcher invokes initializers inside the same executor thread that
+        creates the Agent. Installing the callback here avoids a race where
+        the first tool call is evaluated before the WebUI approval bridge is
+        available. Runtime-native tool events remain the sole event path;
+        this method intentionally does not install the removed BridgeHook.
+        """
+        session_key = getattr(entry, "session_key", "")
+        agent._webui_session_key = session_key
+        configured = self.module.dispatcher.agent_config.get("permission_mode", "allow")
+        mode = getattr(agent, "_gateway_permission_mode", None) or configured
+        try:
+            self.apply_permission_mode(agent, mode)
+        except ValueError:
+            import logging
+            logging.getLogger("hello_agent.gateway").warning(
+                "invalid WebUI permission mode %r; falling back to ask", mode)
+            self.apply_permission_mode(agent, "ask")
 
     # ---------- 权限三档 ----------
 
@@ -240,115 +211,46 @@ class Glue:
                 warn = "\n⚠️ 沙箱未启用：unreviewed 已退化为完全放开"
         return f"✅ 权限档位已切换: {mode}{warn}"
 
-    # ---------- plan 两阶段 ----------
+    # ---------- Plan preview / persistence ----------
 
     def plan_preview_sync(self, agent, text: str) -> dict:
-        """阶段一只读预览：镜像 CLI /plan 守卫与规划 prompt，不改 agent.messages"""
-        from agent import PLAN_PROMPT_TEXT, extract_plan_text
-        from core.task_list import TaskList
-
-        msgs = list(agent.messages)
-        if not msgs or msgs[0].get("role") != "system":
-            msgs.insert(0, {"role": "system", "content": agent.system_prompt})
-        msgs = msgs + [
-            {"role": "user", "content": text},
-            {"role": "user", "content": PLAN_PROMPT_TEXT},
-        ]
-        resp = agent.llm.think(msgs, temperature=0.3, stream=False, silent=True)
-        plan_text = extract_plan_text(resp) if resp else None
-        if not plan_text:
-            raise ValueError("未能识别出方案内容（LLM 未遵循 PLAN 格式）")
-        tasks = TaskList.from_plan_text(plan_text).tasks
-        if not tasks:
-            raise ValueError("方案解析失败：未识别出有效任务")
+        """Generate typed Plan data without mutating conversation or runtime state."""
+        plan = agent.generate_plan(text)
+        steps = plan.get("steps") if isinstance(plan, dict) else None
+        if not isinstance(steps, list) or not steps:
+            raise ValueError("方案生成失败：未识别出有效任务")
         return {
-            "plan_text": plan_text,
-            "tasks": [{"id": t.id, "description": t.description} for t in tasks],
+            "plan": plan,
+            "tasks": [{"id": item.get("id", index), "description": item.get("description", "")}
+                      for index, item in enumerate(steps, start=1) if isinstance(item, dict)],
         }
 
-    def create_plan(self, session_key: str, text: str, plan_text: str) -> str:
-        plan_id = uuid.uuid4().hex[:12]
-        with self._plans_lock:
-            # TTL 清理 + 上限
-            now = time.time()
-            self._plans = {
-                k: v for k, v in self._plans.items()
-                if now - v["created_at"] < _PLAN_TTL
-            }
-            while len(self._plans) >= _PLAN_MAX:
-                oldest = min(self._plans, key=lambda k: self._plans[k]["created_at"])
-                del self._plans[oldest]
-            self._plans[plan_id] = {
-                "session_key": session_key,
-                "text": text,
-                "plan_text": plan_text,
-                "created_at": now,
-            }
-        return plan_id
-
-    def take_plan(self, plan_id: str):
-        """批准时取出（一次性）；过期返回 None"""
-        with self._plans_lock:
-            p = self._plans.pop(plan_id, None)
-        if p is None:
-            return None
-        if time.time() - p["created_at"] > _PLAN_TTL:
-            return None
-        return p
+    def create_plan(self, session_key: str, text: str, plan: dict):
+        """Persist a typed preview instead of retaining a process-local TTL object."""
+        session_id = Dispatcher._runtime_session_id(session_key)
+        self.module.runtime_store.upsert_session(session_id, session_key, channel="webui", status="active")
+        return self.plan_manager.create_preview(
+            session_id, plan, source_prompt=text, title=(text[:120] or "执行方案"),
+        )
 
     def reject_plan(self, plan_id: str) -> bool:
-        with self._plans_lock:
-            return self._plans.pop(plan_id, None) is not None
+        plan = self.plan_manager.get(plan_id)
+        if plan is None or plan.status is not PlanStatus.AWAITING_APPROVAL:
+            return False
+        self.plan_manager.cancel(plan_id)
+        return True
 
     async def handle_plan_preview_command(self, arg: str, ctx: dict) -> str:
-        """/plan-preview {text} —— executor 内只读预览，返回 JSON"""
-        agent = ctx["agent"]
-        loop = ctx["loop"]
-        executor = ctx["executor"]
+        """/plan-preview {text}: generate a typed Plan in the session executor."""
         text = arg.strip()
         if not text:
-            return json.dumps({"ok": False, "error": "缺少任务描述"},
-                              ensure_ascii=False)
+            return json.dumps({"ok": False, "error": "缺少任务描述"}, ensure_ascii=False)
         try:
-            preview = await loop.run_in_executor(
-                executor, self.plan_preview_sync, agent, text)
-        except Exception as e:
-            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+            preview = await ctx["loop"].run_in_executor(
+                ctx["executor"], self.plan_preview_sync, ctx["agent"], text)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
         return json.dumps({"ok": True, **preview}, ensure_ascii=False)
-
-    async def handle_plan_apply_command(self, arg: str, ctx: dict) -> str:
-        """/plan-apply —— adopt_plan + _run_task_list（独立超时保护）"""
-        agent = ctx["agent"]
-        entry = ctx["entry"]
-        loop = ctx["loop"]
-        executor = ctx["executor"]
-
-        plan_info = getattr(entry, "pending_plan", None)
-        if not plan_info:
-            return "❌ 无待执行方案（请先 POST /api/plan 并批准）"
-
-        from core.config_loader import load_config
-        plan_timeout = load_config().get("gateway", {}).get(
-            "sessions", {}).get("plan_timeout_seconds", 3600)
-
-        def _run():
-            steps = agent.adopt_plan(plan_info["plan_text"],
-                                     plan_info.get("text", ""))
-            return agent._run_task_list(
-                user_input=plan_info.get("text") or "plan execution",
-                max_steps=agent.max_steps,
-                verbose=False,
-            ), steps
-
-        try:
-            result, steps = await asyncio.wait_for(
-                loop.run_in_executor(executor, _run), timeout=plan_timeout)
-            return f"✅ 方案执行完成（{steps} 步）\n{result}"
-        except asyncio.TimeoutError:
-            return f"⏰ 方案执行超时（>{plan_timeout}s），已放弃等待"
-        except ValueError as e:
-            return f"❌ {e}"
-
     # ---------- /reload-prompt 与 /mcp ----------
 
     async def handle_reload_prompt_command(self, arg: str, ctx: dict) -> str:

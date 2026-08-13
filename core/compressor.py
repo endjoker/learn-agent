@@ -337,6 +337,8 @@ class Compressor:
         # 摘要作为一条 user 消息插入（清晰标明是历史摘要）
         new_messages.append({
             "role": "user",
+            "kind": "history_summary",
+            "internal": True,
             "content": (
                 f"【历史对话摘要】以下是之前的完整对话记录，已压缩为摘要：\n\n"
                 f"{summary}\n\n"

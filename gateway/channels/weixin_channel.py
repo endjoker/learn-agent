@@ -85,12 +85,25 @@ class WeixinChannel(Channel):
             self._bot = WeixinBot(credentials_file=self.credentials_file)
             self._bot.on_message(self._on_message)
             logger.info("微信 Bot 启动中（凭据: %s）", self.credentials_file)
-            self._bot.run()  # 阻塞：35s 长轮询循环
+            # WeixinBot.run() installs SIGINT/SIGTERM handlers. This channel
+            # deliberately runs in a gateway worker thread, where CPython
+            # forbids signal.signal(). Use the SDK's public blocking iterator
+            # instead; stop() still terminates the iterator through bot.stop().
+            self._run_poll_loop()
         except ImportError:
             logger.error("缺少 weixin-ilink 依赖: pip install weixin-ilink[qr]")
         except Exception as e:
             logger.error("微信 Bot 异常: %s", e, exc_info=True)
             self._running = False
+
+    def _run_poll_loop(self):
+        """Run iLink long polling without process-global signal registration."""
+        if not self._bot:
+            return
+        for message in self._bot.messages():
+            if not self._running:
+                break
+            self._on_message(message)
 
     def _on_message(self, msg) -> None:
         """微信消息回调（在 weixin daemon 线程中执行）"""

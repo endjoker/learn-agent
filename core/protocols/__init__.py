@@ -100,6 +100,7 @@ def create_adapter(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
+            reasoning_effort=kwargs.get("reasoning_effort", "provider_default"),
         )
     else:
         raise ValueError(

@@ -217,7 +217,8 @@ class Heartbeat:
             user_id="heartbeat",
             user_name="heartbeat",
             text=text,
-            message_id=f"hb-{uuid.uuid4().hex[:12]}",
+            # One durable key per heartbeat period enables RuntimeStore replay/idempotency.
+            message_id=f"hb-{self.session_key}-{now.strftime('%Y%m%d%H%M')}",
         )
         logger.info("❤️ 心跳触发 (#%d, session=%s)",
                     self._beats, self.session_key)

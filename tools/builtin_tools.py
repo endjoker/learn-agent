@@ -782,12 +782,6 @@ class BashTool(BaseTool):
 
     # ============ 危险命令黑名单（从 guard.py 获取，唯一来源） ============
 
-    @property
-    def _dangerous_commands(self) -> list:
-        """返回危险命令列表（从 guard.py 获取，消除重复定义）"""
-        from core.sandbox.guard import DANGEROUS_SUBSTRINGS
-        return list(DANGEROUS_SUBSTRINGS)
-
     # ============ 执行命令 ============
 
     def execute(self, command: str, timeout: int = 30) -> str:
@@ -802,13 +796,14 @@ class BashTool(BaseTool):
             命令的标准输出和标准错误
         """
         # --- 安全检查 ---
-        for dangerous in self._dangerous_commands:
-            if dangerous in command.lower():
-                return (
-                    f"⛔ 安全限制：命令包含危险操作，已阻止执行\n"
-                    f"   命令: {command}\n"
-                    f"   匹配到危险模式: {dangerous}"
-                )
+        from core.sandbox.guard import _match_dangerous
+        dangerous = _match_dangerous(command.lower())
+        if dangerous:
+            return (
+                f"⛔ 安全限制：命令包含危险操作，已阻止执行\n"
+                f"   命令: {command}\n"
+                f"   匹配到危险模式: {dangerous}"
+            )
 
         # --- 提取命令名（用于后续的智能提示） ---
         cmd_name = command.strip().split()[0].lower() if command.strip() else ""

@@ -11,7 +11,7 @@
     L2 检查按工具声明的 capability 选；L1 策略按工具名查 PermissionChecker，
     未知工具名默认 ASK（修复原 trusted 时未知工具自动 ALLOW 的缺口）。
 
-调用方：agent 的 run / stream_run / _run_task_list 在执行每个 action 前调用
+调用方：agent 的 run / stream_run 在执行每个 action 前调用
     level, reason = gate.check(tool, params, tool_name)
     level ∈ {ALLOW, ASK, DENY}
 """

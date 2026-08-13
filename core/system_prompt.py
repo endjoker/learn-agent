@@ -53,49 +53,12 @@ _DEFAULT_TOOLS = """\
 
 # 代码固定规则（不文件化——这些是框架级的，不由用户编辑）
 _NATIVE_TOOL_RULES = """\
-【工具调用协议】
-- 工具由运行时通过原生 function calling 提供；需要工具时直接选择工具并填写参数。
-- 不要输出 ACTION、INPUT、FINAL_ANSWER、agent.turn.v1 或任何 JSON 工具调用协议。
-- 只输出给用户阅读的自然语言或 Markdown；工具结果会自动进入下一轮上下文。
+【原生工具调用】
+- 工具由运行时通过原生 function calling 提供。需要工具时直接选择工具并填写参数，不要把调用内容写进回复文本。
+- 工具调用和最终可见回复是两种互斥状态：调用工具时无需解释性占位文本；完成后直接给出用户可读的自然语言或 Markdown。
+- 不要输出 JSON 信封、XML 标签或任何文本控制协议；工具执行结果会自动进入下一轮上下文。
 【安全】
 - 高风险操作前说明风险并请求确认；不得泄露密钥或执行破坏性系统操作。"""
-
-_CODE_FIXED_RULES = """\
-【技能使用规则】
-- 技能是 AI 学习到的可复用能力，调用后返回操作指令，不是最终结果
-- 收到技能指令后，请一步一步执行，期间可以调用其他工具
-- 所有步骤执行完毕后，直接给出最终答复
-- 如果发现某个流程需要重复执行，可以使用 create_skill 工具创建新技能
-
-【响应协议】
-- 每一次回复都只能是一个完整 JSON 对象，不能带 Markdown 围栏、解释文字、思考过程或任何前后缀。
-- 需要调用工具时，回复必须是：
-  {"version":"agent.turn.v1","type":"tool_calls","calls":[{"id":"call_1","name":"工具名称","arguments":{}}]}
-- 不需要调用工具或工具完成后，回复必须是：
-  {"version":"agent.turn.v1","type":"final","answer":"完整 Markdown 答案"}
-- final 与 tool_calls 必须互斥；arguments 必须是 JSON 对象。不要输出 THOUGHT、ACTION、INPUT、FINAL_ANSWER 或 COMPLETE_TASK 标签。
-- 即使要说明执行思路，也只在 final.answer 中写给用户；调用工具前不要输出任何说明。
-
-【安全】
-- 不执行 rm -rf /、format、shutdown 等 OS 危害操作
-- 不读取 .env 中的密钥明文
-- 高危操作前提示风险并请求确认
-
-【交互命令（你无法直接执行，仅在合适时机建议用户发送）】
-- /compact — 对话较长、上下文紧张时建议
-- /clear — 用户想重新开始对话时建议
-- /model <名称> — 用户想切换模型时建议
-- /stats — 用户询问上下文占用时建议
-- /session — 用户想管理历史会话时建议
-- /hook — 查看已注册 hook
-- /help — 查看全部命令
-
-【配置管理】
-所有配置集中在项目根目录的 config.json，含六个 section: llm / permission / hooks / mcp / sandbox / gateway
-- 用户要求添加 MCP 服务器: 编辑 config.json 的 mcp.servers 数组
-- 用户要求配置 hook: 编辑 config.json 的 hooks 段
-- 不确定格式时，先用 read 工具查看 config.example.json 获取完整示例
-- 修改后需重启或发送 /hook reload 生效"""
 
 # 引导文件说明（注入在动态区，引导文件内容之前）
 _BOOTSTRAP_NOTICE = """\

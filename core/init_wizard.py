@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from core.config_loader import _deep_merge, _find_project_root, _DEFAULT_CONFIG, is_enabled
+from core.reasoning import REASONING_LEVELS
 
 # ============================================================
 # 常量（数值与 llm_client.LOCAL_PROVIDERS / protocols 保持一致）
@@ -284,6 +285,23 @@ def _collect_one_model(existing_models: dict) -> Optional[tuple[str, dict]]:
         if ctx:
             model_cfg["context_length"] = ctx
 
+    reasoning_options = [
+        ("provider_default", "跟随服务商默认（推荐）"),
+        ("none", "关闭推理"),
+        ("minimal", "极低"),
+        ("low", "低"),
+        ("medium", "中"),
+        ("high", "高"),
+        ("xhigh", "极高"),
+        ("max", "最大"),
+    ]
+    # Keep this assertion next to the UI options so new public values are not
+    # accidentally omitted from the initializer.
+    assert tuple(key for key, _ in reasoning_options) == REASONING_LEVELS
+    level = _ask_choice("推理等级:", reasoning_options, default=1)
+    if level != "provider_default":
+        model_cfg["reasoning"] = {"level": level}
+
     return name, model_cfg
 
 
@@ -531,29 +549,85 @@ def _load_example_filters() -> Optional[dict]:
 # ============================================================
 
 def _step_agent_runtime(existing: dict) -> Optional[dict]:
-    """Configure the Pi-style native tool/event runtime.
-
-    Textual ACTION/JSON envelopes were removed from the execution path.  The
-    wizard therefore writes the fixed native mode instead of offering unsafe
-    legacy protocol choices.
-    """
-    print("\n  Agent 原生工具调用与流式事件")
+    """Configure the native tool-call event stream and retire text settings."""
+    print("\n  Agent native tool calls and streaming events")
     runtime = existing.get("agent_runtime", {})
-    changes: dict[str, Any] = {}
     native_stream = _ask_yes_no(
-        "启用原生工具调用流式事件？",
+        "Enable native tool-call streaming events?",
         default=is_enabled(runtime.get("native_tool_streaming"), True),
     )
-    if runtime.get("response_protocol") != "native":
-        changes["response_protocol"] = "native"
-    if runtime.get("legacy_execute") is not False:
-        changes["legacy_execute"] = False
-    if runtime.get("protocol_retry_limit") != 0:
-        changes["protocol_retry_limit"] = 0
-    if runtime.get("native_tool_streaming") is not native_stream:
-        changes["native_tool_streaming"] = native_stream
-    return {"agent_runtime": changes} if changes else None
+    max_result_chars = max(0, _ask_int(
+        "Maximum characters retained from one tool result (0 disables truncation)",
+        int(runtime.get("max_tool_result_chars", 10000)),
+    ))
+    retired_keys = {
+        "response_protocol", "legacy_execute", "protocol_retry_limit",
+        "raw_response_audit", "raw_response_max_chars",
+    }
+    needs_migration = any(key in runtime for key in retired_keys)
+    if (runtime.get("native_tool_streaming") is native_stream
+            and int(runtime.get("max_tool_result_chars", 10000)) == max_result_chars
+            and not needs_migration):
+        return None
+    return {"agent_runtime": {
+        "native_tool_streaming": native_stream,
+        "max_tool_result_chars": max_result_chars,
+    }}
 
+def _step_task_runtime(existing: dict) -> Optional[dict]:
+    """Configure the durable TaskRuntime feature flag and SQLite state store."""
+    print("\n  持久任务运行时（TaskRuntime）")
+    runtime = existing.get("task_runtime", {})
+    store = existing.get("runtime_store", {})
+    runtime_changes: dict[str, Any] = {}
+    store_changes: dict[str, Any] = {}
+
+    enabled = _ask_yes_no(
+        "启用统一 TaskRuntime（消息先持久化，再由运行时执行）？",
+        default=is_enabled(runtime.get("enabled"), True),
+    )
+    if enabled != is_enabled(runtime.get("enabled"), True):
+        runtime_changes["enabled"] = enabled
+
+    store_path = _ask("运行时 SQLite 路径", store.get("path", "./workspace/.agent/state/runtime.db"))
+    if store_path != store.get("path", "./workspace/.agent/state/runtime.db"):
+        store_changes["path"] = store_path
+    if store.get("backend", "sqlite") != "sqlite":
+        store_changes["backend"] = "sqlite"
+
+    max_workers = _ask_int("TaskRuntime 最大并发会话数", int(runtime.get("max_global_concurrency", 4)))
+    if max_workers != runtime.get("max_global_concurrency", 4):
+        runtime_changes["max_global_concurrency"] = max_workers
+    timeout = _ask_int("TaskRuntime 默认超时（秒）", int(runtime.get("default_timeout_seconds", 1200)))
+    if timeout != runtime.get("default_timeout_seconds", 1200):
+        runtime_changes["default_timeout_seconds"] = timeout
+    grace = _ask_int("超时后取消等待时间（秒）", int(runtime.get("cancel_grace_seconds", 10)))
+    if grace != runtime.get("cancel_grace_seconds", 10):
+        runtime_changes["cancel_grace_seconds"] = grace
+
+    changes: dict[str, Any] = {}
+    if runtime_changes:
+        changes["task_runtime"] = runtime_changes
+    if store_changes:
+        changes["runtime_store"] = store_changes
+    return changes or None
+
+
+def _step_artifacts(existing: dict) -> Optional[dict]:
+    """Configure the durable ArtifactStore root and retention limits."""
+    print("\n  产物存储（ArtifactStore）")
+    artifacts = existing.get("artifacts", {})
+    changes: dict[str, Any] = {}
+    root = _ask("Artifact 根目录", artifacts.get("root", "./workspace/.agent/artifacts"))
+    if root != artifacts.get("root", "./workspace/.agent/artifacts"):
+        changes["root"] = root
+    max_bytes = _ask_int("单个 Artifact 最大字节数", int(artifacts.get("max_file_bytes", 52428800)))
+    if max_bytes > 0 and max_bytes != artifacts.get("max_file_bytes", 52428800):
+        changes["max_file_bytes"] = max_bytes
+    retention = _ask_int("Artifact 保留天数", int(artifacts.get("retention_days", 30)))
+    if retention >= 1 and retention != artifacts.get("retention_days", 30):
+        changes["retention_days"] = retention
+    return {"artifacts": changes} if changes else None
 
 def _step_gateway_runtime(existing: dict) -> Optional[dict]:
     """Configure gateway/session defaults that affect every channel."""
@@ -577,8 +651,8 @@ def _step_gateway_runtime(existing: dict) -> Optional[dict]:
         changes["worker_pool_size"] = workers
 
     agent_changes: dict[str, Any] = {}
-    max_steps = _ask_int("单轮最大工具步骤", int(agent.get("max_steps", 30)))
-    if max_steps != agent.get("max_steps", 30):
+    max_steps = _ask_int("单轮最大工具步骤", int(agent.get("max_steps", 100)))
+    if max_steps != agent.get("max_steps", 100):
         agent_changes["max_steps"] = max_steps
     permission_mode = _ask_choice("Gateway 默认权限:", [
         ("ask", "ask — 需要确认"), ("allow", "allow — 允许"),
@@ -597,7 +671,7 @@ def _step_gateway_runtime(existing: dict) -> Optional[dict]:
         ("max_sessions", "最大并发会话数", 32),
         ("idle_timeout_minutes", "会话空闲回收分钟数", 60),
         ("soft_timeout_seconds", "软超时秒数", 90),
-        ("hard_timeout_seconds", "硬超时秒数", 300),
+        ("hard_timeout_seconds", "硬超时秒数", 1200),
     ):
         value = _ask_int(label, int(sessions.get(key, default)))
         if value != sessions.get(key, default):
@@ -634,7 +708,10 @@ def _step_workspace_and_prompt(existing: dict) -> Optional[dict]:
     path = _ask("工作区路径", current_path)
     if path != workspace.get("path", "./workspace"):
         workspace_changes["path"] = path
-    dirs = workspace.get("dirs", []) or []
+    # Older configs stored descriptions as an object; use its directory names
+    # as the editable list without silently replacing it unless the user edits.
+    stored_dirs = workspace.get("dirs", []) or []
+    dirs = list(stored_dirs) if isinstance(stored_dirs, dict) else stored_dirs
     raw_dirs = _ask("工作区子目录（逗号分隔）", ",".join(dirs))
     new_dirs = [item.strip() for item in raw_dirs.split(",") if item.strip()]
     if new_dirs != dirs:
@@ -742,11 +819,6 @@ def _step_advanced(existing: dict) -> Optional[dict]:
     perm_changes: dict[str, Any] = {}
     if mode != current_mode:
         perm_changes["default_mode"] = mode
-
-    current_ws = perm_cfg.get("workspace", ".")
-    ws = _ask("工作区路径", current_ws)
-    if ws != current_ws:
-        perm_changes["workspace"] = ws
 
     # The project root is an explicit extra root by default.  It lets the
     # agent edit project source/config files while keeping unrelated paths
@@ -892,6 +964,12 @@ def run_init_wizard() -> int:
             frag = _step_agent_runtime(existing)
             if frag:
                 fragments.append(frag)
+            frag = _step_task_runtime(existing)
+            if frag:
+                fragments.append(frag)
+            frag = _step_artifacts(existing)
+            if frag:
+                fragments.append(frag)
             frag = _step_gateway_runtime(existing)
             if frag:
                 fragments.append(frag)
@@ -939,6 +1017,13 @@ def run_init_wizard() -> int:
         _deep_merge(final, existing)
         for frag in fragments:
             _deep_merge(final, frag)
+
+        runtime = final.get("agent_runtime", {})
+        final["agent_runtime"] = {
+            "native_tool_streaming": is_enabled(
+                runtime.get("native_tool_streaming"), True),
+            "max_tool_result_chars": max(0, int(runtime.get("max_tool_result_chars", 10000))),
+        }
 
         try:
             _write_config(cfg_path, final)

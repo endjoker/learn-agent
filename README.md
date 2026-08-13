@@ -308,7 +308,7 @@ agent = create_agent(debug=True)
 # 自定义模型
 agent = create_agent(
     name="代码助手",
-    max_steps=30,
+    max_steps=100,
     debug=True,
 )
 

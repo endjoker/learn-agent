@@ -432,12 +432,13 @@ class Scheduler:
 
     async def _fire(self, job: dict, trigger: str):
         name = job.get("name", "?")
+        fired_at = time.time()
         if job.get("session", "isolated") == "persist":
             session_key = f"sched:{name}"
         else:
-            session_key = f"sched:{name}:{time.strftime('%Y%m%d-%H%M%S')}"
+            session_key = f"sched:{name}:{time.strftime('%Y%m%d-%H%M%S', time.localtime(fired_at))}"
         self._pending[session_key] = {
-            "job": job, "trigger": trigger, "fired_at": time.time(),
+            "job": job, "trigger": trigger, "fired_at": fired_at,
         }
         self._running_jobs.add(name)
         msg = InboundMessage(
@@ -446,11 +447,43 @@ class Scheduler:
             user_id="scheduler",
             user_name="scheduler",
             text=job.get("prompt", ""),
-            message_id=f"sched-{name}-{uuid.uuid4().hex[:12]}",
+            # Persisted runtime tasks use this scheduled instant as their idempotency key.
+            message_id=f"sched-{name}-{trigger}-{time.strftime('%Y%m%d%H%M%S', time.localtime(fired_at))}",
+            raw={"job": job, "trigger": trigger, "fired_at": fired_at},
         )
         logger.info("⏰ 定时任务触发: %s (trigger=%s, session=%s)",
                     name, trigger, session_key)
         await self._dispatcher.on_inbound(msg)
+
+    def restore_runtime_context(self, msg: InboundMessage, envelope=None) -> None:
+        """Restore the in-memory completion/delivery state after a restart."""
+        context = {}
+        if envelope is not None:
+            context = (getattr(envelope, "metadata", {}) or {}).get("channel_context") or {}
+        job_data = context.get("job") if isinstance(context, dict) else None
+        job_name = job_data.get("name") if isinstance(job_data, dict) else None
+        if not job_name:
+            parts = msg.session_key.split(":", 2)
+            job_name = parts[1] if len(parts) >= 2 else ""
+        job = self.job_by_name(job_name) if job_name else None
+        if job is None and isinstance(job_data, dict):
+            job = job_data
+        if job is None:
+            raise RuntimeError(f"scheduled job is unavailable: {job_name or msg.session_key}")
+
+        trigger = context.get("trigger") if isinstance(context, dict) else None
+        if not trigger:
+            trigger = "recovered"
+        fired_at = context.get("fired_at") if isinstance(context, dict) else None
+        try:
+            fired_at = float(fired_at)
+        except (TypeError, ValueError):
+            fired_at = time.time()
+        self._pending[msg.session_key] = {
+            "job": job, "trigger": trigger, "fired_at": fired_at,
+        }
+        self._running_jobs.add(job.get("name", job_name))
+        logger.info("Restored scheduler context: %s", msg.session_key)
 
     # ---------- 回复处理（SchedulerChannel 调用） ----------
 
@@ -614,6 +647,9 @@ class SchedulerChannel(Channel):
 
     async def send_reply(self, msg: InboundMessage, text: str) -> None:
         await self.scheduler.on_reply(msg, text)
+
+    def restore_runtime_context(self, msg: InboundMessage, envelope=None) -> None:
+        self.scheduler.restore_runtime_context(msg, envelope)
 
     async def send_progress(self, msg: InboundMessage, text: str) -> None:
         # 软超时等进度提示不是最终回复，仅记日志

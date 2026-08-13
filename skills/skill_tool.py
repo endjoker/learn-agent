@@ -60,7 +60,7 @@ class SkillTool(BaseTool):
             "【技能指令】",
             self._skill.instruction,
             "",
-            "请严格遵循上述指令逐步执行。完成后只输出 agent.turn.v1/final JSON 信封。",
+            "请严格遵循上述指令逐步执行。需要工具时使用运行时提供的原生 function calling；完成后直接给出用户可读的自然语言或 Markdown 结果。",
         ])
 
         return "\n".join(parts)

@@ -181,6 +181,7 @@ class HelloAgentsLLM:
         llm_type: Optional[str] = None,
         provider: Optional[str] = None,
         context_length: Optional[int] = None,
+        reasoning_level: Optional[str] = None,
     ):
         """
         初始化 LLM 客户端
@@ -206,6 +207,10 @@ class HelloAgentsLLM:
         # ---- 获取模型名称 ----
         self.model = model or _llm_cfg.get("model_id") or os.getenv("LLM_MODEL_ID")
         _model_cfg = _models_cfg.get(self.model, {}) if self.model else {}
+
+        from .reasoning import reasoning_level_from_config
+        self.reasoning_level = reasoning_level_from_config(
+            _llm_cfg, _model_cfg, reasoning_level)
 
         # ---- 当前模型配置（优先从 config.json，fallback 到环境变量） ----
         def _get_from_cfg(key: str, default=None):
@@ -285,6 +290,11 @@ class HelloAgentsLLM:
             protocol = "openai"
         self._protocol = protocol
 
+        if self.reasoning_level != "provider_default" and protocol != "openai":
+            raise ValueError(
+                f"推理等级 '{self.reasoning_level}' 当前仅支持 OpenAI / OpenAI-compatible 协议；"
+                f"当前协议为 '{protocol}'。请设为 provider_default，或切换到 OpenAI 协议。")
+
         # ---- 协议专用 API Key fallback ----
         if not api_key_value and protocol == "anthropic":
             api_key_value = os.getenv("ANTHROPIC_API_KEY", "")
@@ -325,6 +335,7 @@ class HelloAgentsLLM:
             api_key=api_key_value,
             base_url=self.base_url,
             timeout=timeout_value,
+            reasoning_effort=self.reasoning_level,
         )
 
         # ---- 最后一次 API 调用的 token 用量（锚点） ----
@@ -477,8 +488,14 @@ class HelloAgentsLLM:
                  temperature: float = 0, timeout: Optional[int] = None):
         """Return a structured non-streaming response when the adapter supports it."""
         req_timeout = timeout or self._config_timeout
-        if tools and hasattr(self._adapter, "generate_with_tools"):
-            response = self._adapter.generate_with_tools(
+        if tools:
+            generate_with_tools = getattr(self._adapter, "generate_with_tools", None)
+            if not callable(generate_with_tools):
+                raise NotImplementedError(
+                    f"协议适配器 '{self._protocol}' 不支持原生工具调用；"
+                    "请使用支持 function calling 的模型/适配器，或切换到 OpenAI 兼容协议。"
+                )
+            response = generate_with_tools(
                 self.model, messages, tools, temperature, req_timeout)
         else:
             response = self._adapter.generate(self.model, messages, temperature, req_timeout)
@@ -497,36 +514,34 @@ class HelloAgentsLLM:
         try:
             events = self._adapter.generate_stream_with_tools(
                 self.model, messages, tools, temperature, req_timeout)
-        except (AttributeError, NotImplementedError):
-            response = self.complete(messages, tools=tools,
-                                     temperature=temperature, timeout=req_timeout)
-            for call in response.tool_calls:
+            text_parts: List[str] = []
+            calls: List[ProviderToolCall] = []
+            for event in events:
+                payload = {
+                    "type": event.type, "text": event.text, "call_id": event.call_id,
+                    "name": event.name, "arguments_delta": event.arguments_delta,
+                    "arguments": event.arguments, "order": event.order,
+                }
                 if on_event:
-                    on_event({"type": "tool_call_start", "call_id": call.call_id,
-                              "name": call.name, "order": call.order})
-                    on_event({"type": "tool_call_end", "call_id": call.call_id,
-                              "name": call.name, "arguments": call.arguments,
-                              "order": call.order})
+                    on_event(payload)
+                if event.type == "text_delta":
+                    text_parts.append(event.text)
+                elif event.type == "tool_call_end":
+                    raw = json.dumps(event.arguments or {}, ensure_ascii=False)
+                    calls.append(ProviderToolCall(event.call_id, event.name,
+                                                  event.arguments or {}, raw, event.order))
+        except (AttributeError, NotImplementedError):
+            # The base adapter exposes a generator-shaped method that raises
+            # only when iterated, so the fallback must cover the whole loop.
+            # Keep ordinary chat usable for adapters without function calling;
+            # explicit structured callers such as plan generation still use
+            # complete(..., tools=...) and receive the intentional fail-fast
+            # NotImplementedError above.
+            response = self._adapter.generate(
+                self.model, messages, temperature, req_timeout)
             if response.text and on_event:
                 on_event({"type": "text_delta", "text": response.text})
             return response
-
-        text_parts: List[str] = []
-        calls: List[ProviderToolCall] = []
-        for event in events:
-            payload = {
-                "type": event.type, "text": event.text, "call_id": event.call_id,
-                "name": event.name, "arguments_delta": event.arguments_delta,
-                "arguments": event.arguments, "order": event.order,
-            }
-            if on_event:
-                on_event(payload)
-            if event.type == "text_delta":
-                text_parts.append(event.text)
-            elif event.type == "tool_call_end":
-                raw = json.dumps(event.arguments or {}, ensure_ascii=False)
-                calls.append(ProviderToolCall(event.call_id, event.name,
-                                              event.arguments or {}, raw, event.order))
         response = ChatResponse(text="".join(text_parts), tool_calls=calls,
                                 finish_reason="tool_calls" if calls else "stop",
                                 usage=self._adapter.last_usage)
@@ -541,7 +556,8 @@ class HelloAgentsLLM:
         mode = "本地" if self.llm_type == "local" else "云端"
         prov = f" [{self.provider}]" if self.provider else ""
         proto = f" [{self._protocol}]"
-        return f"HelloAgentsLLM({mode}{prov}{proto}, model={self.model}, ctx={self.context_length})"
+        reasoning = f", reasoning={self.reasoning_level}"
+        return f"HelloAgentsLLM({mode}{prov}{proto}, model={self.model}, ctx={self.context_length}{reasoning})"
 
     def __repr__(self) -> str:
         return f"<HelloAgentsLLM type={self.llm_type} model='{self.model}'>"

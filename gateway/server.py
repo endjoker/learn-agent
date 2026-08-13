@@ -6,6 +6,7 @@ Gateway 服务器 —— aiohttp 装配、启动编排、优雅停机
 import asyncio
 import logging
 import signal
+from pathlib import Path
 from typing import Optional
 
 from aiohttp import web
@@ -13,6 +14,8 @@ from aiohttp import web
 from gateway.config import get_gateway_config
 from gateway.dispatcher import Dispatcher
 from gateway.session import SessionManager
+from core.config_loader import _find_project_root, load_config
+from core.runtime import RuntimeStore
 
 logger = logging.getLogger("hello_agent.gateway")
 
@@ -21,7 +24,27 @@ class GatewayServer:
     """Gateway 主服务器：aiohttp + channels + session 管理"""
 
     def __init__(self, config: dict = None):
-        self.config = config or get_gateway_config()
+        root_config = load_config()
+        self.config = config or root_config.get("gateway", get_gateway_config())
+        runtime_store_cfg = (config or {}).get("runtime_store") or root_config.get("runtime_store", {})
+        task_runtime_cfg = (config or {}).get("task_runtime") or root_config.get("task_runtime", {})
+        artifact_cfg = dict((config or {}).get("artifacts") or root_config.get("artifacts", {}))
+        artifact_root = Path(artifact_cfg.get("root", "./workspace/.agent/artifacts"))
+        if not artifact_root.is_absolute():
+            artifact_root = _find_project_root() / artifact_root
+        artifact_cfg["root"] = str(artifact_root.resolve())
+        # Plan metadata is durable even while TaskRuntime execution is disabled.
+        raw_path = runtime_store_cfg.get("path", "./workspace/.agent/state/runtime.db")
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = _find_project_root() / path
+        self.runtime_store = RuntimeStore(
+            path,
+            wal=runtime_store_cfg.get("wal", True),
+            busy_timeout_ms=runtime_store_cfg.get("busy_timeout_ms", 5000),
+        )
+        self.task_runtime_config = task_runtime_cfg
+        self.artifact_config = artifact_cfg
         self.host = self.config.get("host", "127.0.0.1")
         self.port = self.config.get("port", 9120)
 
@@ -41,8 +64,10 @@ class GatewayServer:
             agent_config={
                 **agent_cfg,
                 "soft_timeout_seconds": sess_cfg.get("soft_timeout_seconds", 90),
-                "hard_timeout_seconds": sess_cfg.get("hard_timeout_seconds", 600),
+                "hard_timeout_seconds": sess_cfg.get("hard_timeout_seconds", 1200),
             },
+            runtime_store=self.runtime_store,
+            task_runtime_config=self.task_runtime_config,
         )
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
@@ -67,6 +92,7 @@ class GatewayServer:
 
         # 启动会话管理
         await self.session_mgr.start()
+        await self.dispatcher.start()
 
         # 启动 channels
         await self._start_channels()
@@ -111,7 +137,9 @@ class GatewayServer:
             from gateway.webui import WebUIModule
             self.webui = WebUIModule(
                 self.dispatcher, self.session_mgr,
-                {**webui_ch_cfg, **self.config.get("webui", {})})
+                {**webui_ch_cfg, **self.config.get("webui", {}),
+                 "artifacts": self.artifact_config},
+                runtime_store=self.runtime_store)
             await self.webui.start()
             self.webui.register_routes(self._app)
 
@@ -125,6 +153,12 @@ class GatewayServer:
             if self.heartbeat:
                 self.webui.add_status_provider(
                     "heartbeat", lambda: self.heartbeat.channel.status())
+
+        # All channels are registered now; only at this point can persisted
+        # task envelopes be safely rebound to their delivery contexts.
+        await self.dispatcher.resume_persisted_tasks()
+        if self.webui:
+            await self.webui.recover_persisted_plans()
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -150,6 +184,8 @@ class GatewayServer:
                 await ch.stop()
             except Exception as e:
                 logger.error("停止 channel %s 失败: %s", ch.name, e)
+        # 停止统一任务运行时（先停止创建新任务）
+        await self.dispatcher.stop()
         # 停止会话管理
         await self.session_mgr.stop()
         # 停止 aiohttp（超时兜底，防常驻连接/慢 handler 卡住停机）

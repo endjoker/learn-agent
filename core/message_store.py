@@ -9,13 +9,13 @@
 """
 
 import json
-import os
 import secrets
-import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Callable
+
+from core.atomic_io import atomic_write_json
 
 
 # 会话文件存放目录
@@ -103,9 +103,6 @@ class MessageStore:
         self.model_base_url = ""
         self.model_llm_type = ""
 
-        # 任务清单数据（Agent 层管理 TaskList 对象，store 只存 raw dict）
-        self.task_list: Optional[Dict] = None
-
         # ---- 锚点：最后一次 API 返回的精确 token 计数 ----
         self._anchor_total: int = 0       # input_tokens + output_tokens
         self._anchor_msg_count: int = 0   # 当时的消息总数
@@ -149,7 +146,6 @@ class MessageStore:
         self._messages.clear()
         self._anchor_total = 0
         self._anchor_msg_count = 0
-        self.task_list = None
         self._notify()
 
     def replace_range(self, start: int, end: int, new_msgs: List[Dict]):
@@ -296,8 +292,6 @@ class MessageStore:
             "message_count": len(messages),
             "messages": messages,
         }
-        if self.task_list:
-            result["task_list"] = self.task_list
         return result
 
     def save_session(self, filepath: Optional[str] = None) -> str:
@@ -321,16 +315,7 @@ class MessageStore:
         # Write + fsync + replace keeps the old session recoverable if a
         # process crashes or is interrupted during persistence.
         with _lock_for(target):
-            fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_name, target)
-            finally:
-                if os.path.exists(tmp_name):
-                    os.unlink(tmp_name)
+            atomic_write_json(target, data, prefix=f".{target.name}.")
         return str(target)
 
     def load_session_data(self, data: Dict):
@@ -369,9 +354,6 @@ class MessageStore:
                 self._created_at = datetime.fromisoformat(created)
             except (ValueError, TypeError):
                 pass
-
-        # 恢复任务清单（Agent 层会用这个 raw dict 重建 TaskList 对象）
-        self.task_list = data.get("task_list")
 
         # 锚点失效——会话加载后需要重新校准
         self._anchor_total = 0

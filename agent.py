@@ -66,6 +66,8 @@ from memory import MemoryManager
 from skills import SkillManager, SkillTool, CreateSkillTool
 from core.sandbox import SandboxExecutor
 from core.hook import HookManager, HookEvent, Decision
+from core.runtime.tool_runtime import ToolRuntime
+from core.runtime.text_normalization import normalize_model_text
 
 
 def _configured_workspace_path(config: Optional[dict] = None) -> Path:
@@ -79,6 +81,20 @@ def _configured_workspace_path(config: Optional[dict] = None) -> Path:
         config = load_config()
     configured = config.get("permission", {}).get("workspace", "./workspace")
     path = Path(configured)
+    if path.is_absolute():
+        return path.resolve()
+    from core.config_loader import _find_project_root
+    return (_find_project_root() / path).resolve()
+
+
+def _configured_runtime_store_path(config: Optional[dict] = None) -> Path:
+    """Resolve the durable runtime database relative to the project root."""
+    if config is None:
+        config = load_config()
+    configured = config.get("runtime_store", {}).get("path")
+    if not configured:
+        return _configured_workspace_path(config) / ".agent" / "state" / "runtime.db"
+    path = Path(str(configured))
     if path.is_absolute():
         return path.resolve()
     from core.config_loader import _find_project_root
@@ -274,7 +290,7 @@ class Agent:
         tool_registry: ToolRegistry,
         system_prompt: str = None,
         system_prompt_builder: SystemPrompt = None,
-        max_steps: int = 50,           # 最大 ReAct 循环步数
+        max_steps: int = 100,          # 最大 ReAct 循环步数
         max_history_tokens: int = 0,   # 上下文预算阈值（0=自动：取 context_length/2）
         debug: bool = False,
         permission_checker: PermissionChecker = None,
@@ -611,9 +627,8 @@ class Agent:
         builder.set_project_root(os.getcwd())
         # 设置工作区路径（从 config 读取，解析为绝对路径）
         try:
-            from core.config_loader import load_config
-            _cfg = load_config()
-            builder.set_workspace(str(_configured_workspace_path(_cfg)))
+            cfg = getattr(self, "_config", None) or load_config()
+            builder.set_workspace(str(_configured_workspace_path(cfg)))
         except Exception:
             builder.set_workspace(os.getcwd())
         return builder.build(tool_descs=tool_descs, skill_descs=skill_descs, mcp_descs=mcp_descs)
@@ -635,6 +650,36 @@ class Agent:
                 self.permission.set_rule(tool.name, ALLOW)
             except (ValueError, TypeError) as e:
                 logger.warning(f"注册技能工具失败 '{tool.name}': {e}")
+
+    def _refresh_skills(self, force: bool = False) -> bool:
+        """Reload skill files and synchronize the live tool catalog/prompt."""
+        manager = getattr(self, "skill_manager", None)
+        if manager is None:
+            return False
+        try:
+            skills = manager.load_all()
+        except Exception as exc:
+            logger.warning("skill refresh failed: %s", exc)
+            return False
+        signature = tuple(
+            (skill.name, getattr(skill, "version", ""), skill.description,
+             skill.instruction, repr(skill.parameters))
+            for skill in sorted(skills, key=lambda item: item.name)
+        )
+        if not force and signature == getattr(self, "_skill_catalog_signature", None):
+            return False
+        # sync_skill_tools removes tools whose files disappeared and updates
+        # descriptions for files changed while a session stays alive.
+        tools = [SkillTool(skill) for skill in skills]
+        if hasattr(self.tool_registry, "sync_skill_tools"):
+            registered = self.tool_registry.sync_skill_tools(tools)
+            for name in registered:
+                self.permission.set_rule(name, ALLOW)
+        else:
+            self._register_skill_tools()
+        self._skill_catalog_signature = signature
+        self._rebuild_system_prompt()
+        return True
 
     def _register_create_skill_tool(self):
         """注册 create_skill 工具（LLM 运行时创建技能）"""
@@ -995,6 +1040,9 @@ class Agent:
         skill/MCP）统一跑 L1+L2，覆盖不再依赖工具自觉接入沙箱。
         返回 (level, reason)，level ∈ {ALLOW, ASK, DENY}。
         """
+        blocked_tools = getattr(self, "_runtime_tool_blocklist", ())
+        if tool_name in blocked_tools:
+            return DENY, "tool is disabled for this task execution mode"
         tool = self.tool_registry.get_tool(tool_name)
         if tool is None:
             # 模糊匹配：LLM 偶尔漏写 MCP 前缀的 /工具名，如只写 web-search 而非 web-search/search
@@ -1077,6 +1125,8 @@ class Agent:
         self._event_sink = event_sink
         self._run_id = uuid.uuid4().hex
         self._event_seq = 0
+        if not hasattr(self, "_tool_runtime"):
+            self._tool_runtime = ToolRuntime(max_result_chars=10000)
         if not hasattr(self, "hooks"):
             self.hooks = HookManager(enabled=False)
         if not hasattr(self, "_task_list"):
@@ -1114,8 +1164,9 @@ class Agent:
             assistant_id = uuid.uuid4().hex
             self._emit_event("message_start", message_id=assistant_id, role="assistant")
             try:
+                cfg = getattr(self, "_config", None) or load_config()
                 native_stream = is_enabled(
-                    load_config().get("agent_runtime", {}).get("native_tool_streaming"), True)
+                    cfg.get("agent_runtime", {}).get("native_tool_streaming"), True)
                 if native_stream:
                     response = self.llm.stream_with_tools(
                         self.messages, provider_tools, temperature=0,
@@ -1143,7 +1194,7 @@ class Agent:
             self.store.set_anchor(self.llm.last_usage)
 
             if not response.tool_calls:
-                answer = response.text.strip()
+                answer = normalize_model_text(response.text)
                 self.messages.append({"role": "assistant", "content": answer, "kind": "final"})
                 self._emit_event("message_end", message_id=assistant_id, role="assistant",
                                  content=answer, finish_reason=response.finish_reason)
@@ -1195,7 +1246,7 @@ class Agent:
         """Project provider-native events into the stable Agent event schema."""
         event_type = event.get("type")
         if event_type == "text_delta":
-            self._emit_event("text_delta", message_id=assistant_id, text=event.get("text", ""))
+            self._emit_event("text_delta", message_id=assistant_id, text=normalize_model_text(event.get("text", "")))
         elif event_type == "tool_call_start":
             self._emit_event("tool_call_start", message_id=assistant_id,
                              tool_call_id=event.get("call_id", ""), tool=event.get("name", ""),
@@ -1210,7 +1261,12 @@ class Agent:
                              arguments=event.get("arguments", {}), order=event.get("order", 0))
 
     def _execute_native_tool_call(self, call_id, provider_name, tool_name, arguments, raw_arguments):
-        """Validate and execute one typed tool call, always producing a result."""
+        """Validate, authorize, hook and execute one native tool call."""
+        return self._tool_runtime.execute_native_call(
+            self, call_id, provider_name, tool_name, arguments, raw_arguments)
+
+    def _legacy_execute_native_tool_call(self, call_id, provider_name, tool_name, arguments, raw_arguments):
+        """Compatibility implementation retained for old callers."""
         display_name = tool_name or provider_name
         self._emit_event("tool_execution_start", tool_call_id=call_id, tool=display_name,
                          arguments=arguments)
@@ -1693,7 +1749,7 @@ class Agent:
         self._save_memory(user_input)
         return (
             f"⚠️ 已达最大步数（{max_steps} 步），任务可能未完成。\n"
-            f"建议拆分子任务，或用 create_agent(max_steps=50) 增加上限。"
+            f"建议拆分子任务，或用 create_agent(max_steps=100) 增加上限。"
         )
 
     # ============================================================
@@ -2007,6 +2063,103 @@ class Agent:
         yield f"\n⚠️ 已达最大步数 {max_steps}\n"
 
 
+    def generate_plan(self, user_input: str) -> dict:
+        """Ask the provider for a typed plan using one native tool call."""
+        from core.plan import PlanStatus
+        plan_tool = {
+            "type": "function",
+            "function": {
+                "name": "submit_plan",
+                "description": "Submit an ordered execution plan without performing work.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "steps": {"type": "array", "minItems": 1,
+                                  "items": {"type": "object", "additionalProperties": False,
+                                            "properties": {"description": {"type": "string"}},
+                                            "required": ["description"]}},
+                    },
+                    "required": ["steps"],
+                },
+            },
+        }
+        messages = [{"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": user_input}]
+        response = self.llm.complete(messages, tools=[plan_tool], temperature=0)
+        calls = getattr(response, "tool_calls", None) or []
+        call = next((item for item in calls if item.name == "submit_plan"), None)
+        if call is None or not isinstance(call.arguments, dict):
+            raise ValueError("plan generation failed: model did not return submit_plan")
+        steps = call.arguments.get("steps")
+        if not isinstance(steps, list) or not steps:
+            raise ValueError("plan generation failed: steps is empty")
+        return {"steps": steps}
+
+    def execute_plan(self, plan: dict, source_prompt: str = "", *, verbose: bool = True) -> str:
+        """Execute a typed plan through the durable local runtime."""
+        import asyncio
+        from core.plan import PlanManager, PlanStatus
+        from core.runtime import RuntimeStore, TaskEnvelope, TaskResult, TaskStatus, TaskRuntime
+        runtime_store = RuntimeStore(_configured_runtime_store_path())
+        manager = PlanManager(runtime_store)
+        session_id = f"cli:{self.store.session_id}"
+        title = source_prompt[:120] or "CLI Plan"
+        persisted = manager.create_preview(session_id, plan, source_prompt=source_prompt, title=title)
+        manager.approve(persisted.plan_id, actor="cli")
+        manager.activate(persisted.plan_id)
+        self.permission.allow_workspace()
+
+        async def execute_task(envelope, token):
+            token.checkpoint()
+            task = manager.get(envelope.metadata["plan_task_id"])
+            prompt = envelope.prompt
+            try:
+                output = self.run(prompt, verbose=False)
+                token.checkpoint()
+                return TaskResult(task_id=envelope.task_id, status=TaskStatus.COMPLETED,
+                                  visible_text=output, summary=output[:1000])
+            except Exception as exc:
+                return TaskResult(task_id=envelope.task_id, status=TaskStatus.FAILED,
+                                  summary=str(exc), error_message=str(exc))
+
+        async def run_all():
+            runtime = TaskRuntime(runtime_store, execute_task, max_global_concurrency=1,
+                                  worker_id="cli", max_attempts=1)
+            await runtime.start()
+            try:
+                while True:
+                    current = manager.get(persisted.plan_id)
+                    ready = manager.ready_tasks(persisted.plan_id)
+                    if not ready:
+                        if current.status in PlanStatus.terminal():
+                            break
+                        await asyncio.sleep(0)
+                        continue
+                    for item in ready:
+                        envelope = TaskEnvelope.create(
+                            session_id=session_id, session_key=session_id, source="plan",
+                            prompt=item.description, priority=50,
+                            timeout_seconds=60, max_steps=self.max_steps,
+                            metadata={"plan_task_id": item.plan_task_id},
+                        )
+                        manager.assign_task(persisted.plan_id, item.plan_task_id, envelope.task_id)
+                        manager.start_task(persisted.plan_id, item.plan_task_id)
+                        await runtime.submit(envelope)
+                        result = await runtime.wait(envelope.task_id)
+                        manager.finish_task(persisted.plan_id, item.plan_task_id,
+                                            success=result.status is TaskStatus.COMPLETED,
+                                            summary=(result.summary or result.visible_text or result.error_message))
+            finally:
+                await runtime.stop()
+            return manager.get(persisted.plan_id)
+
+        final = asyncio.run(run_all())
+        completed = sum(1 for item in final.tasks if item.status.value == "completed")
+        if final.status is PlanStatus.COMPLETED:
+            return f"Plan \u5df2\u5b8c\u6210: {completed}/{len(final.tasks)} (ID: {final.plan_id})"
+        return f"Plan status={final.status.value}, completed={completed}/{len(final.tasks)} (ID: {final.plan_id})"
+
 # ============================================================
 # MCP 配置加载
 
@@ -2054,7 +2207,7 @@ def create_agent(
     api_key: str = None,
     base_url: str = None,
     provider: str = None,
-    max_steps: int = 30,
+    max_steps: int = 100,
     max_history_tokens: int = 0,
     debug: bool = False,
     permission: bool = True,
@@ -2091,7 +2244,10 @@ def create_agent(
         set_debug(True)
     # 工作目录：从配置读取，chdir 到该目录（所有模式统一生效）
     from core.config_loader import load_config as _lc
-    _ws_path = str(_configured_workspace_path(_lc()))
+    # Take one config snapshot before changing CWD.  The snapshot is retained
+    # on the Agent below for runtime feature flags and tool limits.
+    _config = _lc()
+    _ws_path = str(_configured_workspace_path(_config))
     os.makedirs(_ws_path, exist_ok=True)
     os.chdir(_ws_path)
     llm = HelloAgentsLLM(model=model, api_key=api_key, base_url=base_url, provider=provider)
@@ -2132,6 +2288,9 @@ def create_agent(
         quiet=quiet,
     )
     # Hook: 绑定 agent 身份，触发 session_start
+    agent._config = _config
+    agent._tool_runtime = ToolRuntime(
+        max_result_chars=_config.get("agent_runtime", {}).get("max_tool_result_chars", 10000))
     agent.hooks.bind_agent(agent.name, agent.store.session_id)
     agent.hooks.dispatch(HookEvent.SESSION_START, {})
     if skill_manager:

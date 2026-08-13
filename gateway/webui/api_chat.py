@@ -12,17 +12,16 @@ import logging
 from aiohttp import web
 
 from gateway.channels.base import InboundMessage
+from core.plan import PlanStatus
+from gateway.dispatcher import Dispatcher
 from gateway.webui.glue import send_and_wait
 
 logger = logging.getLogger("hello_agent.gateway")
 
-_MODES = [
+_BASE_MODES = [
     {"id": "chat", "label": "会话", "available": True},
-    {"id": "plan", "label": "plan", "available": True},
-    {"id": "code", "label": "编程", "available": False},
-    {"id": "team", "label": "团队", "available": False},
+    {"id": "plan", "label": "方案", "available": True},
 ]
-
 
 def register_routes(app: web.Application, module):
     app.router.add_get("/api/sessions", _make_sessions(module))
@@ -32,12 +31,22 @@ def register_routes(app: web.Application, module):
     app.router.add_post("/api/chat", _make_chat(module))
     app.router.add_post("/api/sessions/{key}/stop", _make_stop(module))
     app.router.add_post("/api/sessions/{key}/model", _make_model(module))
+    app.router.add_get("/api/sessions/{key}/reasoning", _make_reasoning_get(module))
+    app.router.add_post("/api/sessions/{key}/reasoning", _make_reasoning_set(module))
     app.router.add_post("/api/sessions/{key}/permission", _make_perm_set(module))
     app.router.add_get("/api/sessions/{key}/permission", _make_perm_get(module))
     app.router.add_get("/api/modes", _make_modes(module))
     app.router.add_post("/api/plan", _make_plan(module))
     app.router.add_post("/api/plan/{plan_id}/approve", _make_plan_approve(module))
     app.router.add_post("/api/plan/{plan_id}/reject", _make_plan_reject(module))
+    app.router.add_get("/api/plans", _make_plans_list(module))
+    app.router.add_post("/api/plans/clear", _make_plans_clear(module))
+    app.router.add_post("/api/plans/{plan_id}/archive", _make_plan_archive(module))
+    app.router.add_get("/api/plans/{plan_id}", _make_plan_get(module))
+    app.router.add_get("/api/plans/{plan_id}/tasks", _make_plan_tasks(module))
+    app.router.add_post("/api/plans/{plan_id}/pause", _make_plan_pause(module))
+    app.router.add_post("/api/plans/{plan_id}/resume", _make_plan_resume(module))
+    app.router.add_post("/api/plans/{plan_id}/cancel", _make_plan_cancel(module))
     app.router.add_get("/api/approvals", _make_approvals(module))
     app.router.add_post("/api/approvals/{aid}", _make_approval_answer(module))
     app.router.add_get("/api/commands", _make_commands(module))
@@ -266,9 +275,55 @@ def _make_perm_get(module):
 
 def _make_modes(module):
     async def handler(request):
-        return web.json_response({"modes": _MODES})
+        return web.json_response({"modes": list(_BASE_MODES)})
     return handler
 
+
+def _reasoning_payload(module, key: str) -> dict:
+    """Return persisted selection and the effective value of a loaded session."""
+    from gateway.agent_factory import _load_map
+
+    entry = module.session_mgr._sessions.get(key)
+    meta = _load_map().get(key)
+    override = meta.get("reasoning_level") if isinstance(meta, dict) else None
+    if not isinstance(override, str):
+        override = None
+    if entry is not None and entry.agent is not None:
+        agent = entry.agent
+        return {
+            "session_key": key,
+            "selected": override or "inherit",
+            "effective": getattr(agent.llm, "reasoning_level", "provider_default"),
+            "protocol": getattr(agent.llm, "_protocol", "openai"),
+            "loaded": True,
+        }
+    return {
+        "session_key": key,
+        "selected": override or "inherit",
+        "effective": None,
+        "protocol": None,
+        "loaded": False,
+    }
+
+
+def _make_reasoning_get(module):
+    async def handler(request):
+        return web.json_response(_reasoning_payload(module, request.match_info["key"]))
+    return handler
+
+
+def _make_reasoning_set(module):
+    async def handler(request):
+        key = request.match_info["key"]
+        body = await _body(request)
+        level = (body.get("level") or "").strip().lower()
+        if not level:
+            return _err("level 不能为空")
+        result = await send_and_wait(module, key, f"/reasoning {level}", timeout=90)
+        if not result["ok"]:
+            return web.json_response(result, status=504)
+        return web.json_response({**result, **_reasoning_payload(module, key)})
+    return handler
 
 def _make_plan(module):
     async def handler(request):
@@ -289,53 +344,159 @@ def _make_plan(module):
             return _err("预览结果解析失败", 500)
         if not preview.get("ok"):
             return _err(preview.get("error", "预览失败"), 422)
-        plan_id = module.glue.create_plan(
-            session_key, text, preview["plan_text"])
+        plan = module.glue.create_plan(session_key, text, preview["plan"])
         return web.json_response({
-            "plan_id": plan_id,
+            "plan_id": plan.plan_id,
             "session_key": session_key,
-            "plan_text": preview["plan_text"],
+            "plan": plan.to_dict(),
             "tasks": preview["tasks"],
         })
     return handler
 
-
 def _make_plan_approve(module):
     async def handler(request):
         plan_id = request.match_info["plan_id"]
-        plan = module.glue.take_plan(plan_id)
+        plan = module.glue.plan_manager.get(plan_id)
         if plan is None:
-            return _err("方案不存在或已过期", 404)
-        entry = module.session_mgr.get_or_create(plan["session_key"])
-        if entry is None:
-            # 放回暂存，避免丢失
-            module.glue.create_plan(
-                plan["session_key"], plan["text"], plan["plan_text"])
-            return _err("会话池已满", 503)
-        entry.pending_plan = {"text": plan["text"],
-                              "plan_text": plan["plan_text"]}
-        # 合成 /plan-apply 入漏斗，立即 202（结果经 SSE chat.done + history）
-        msg = InboundMessage(
-            channel="webui",
-            session_key=plan["session_key"],
-            user_id="webui", user_name="WebUI",
-            text="/plan-apply",
-            message_id=f"plan-{plan_id}",
-        )
-        await module.dispatcher.on_inbound(msg)
-        return web.json_response(
-            {"started": True, "plan_id": plan_id,
-             "session_key": plan["session_key"]}, status=202)
+            return _err("方案不存在", 404)
+        if not module.dispatcher.task_runtime_enabled:
+            return _err("TaskRuntime 未启用，无法执行已批准方案；请通过初始化向导启用 task_runtime", 409)
+        try:
+            plan = module.glue.plan_manager.approve(plan_id, actor="webui")
+        except ValueError as exc:
+            return _err(str(exc), 409)
+        module.bus.publish("plan.changed", {"action": "approved", "plan": plan.to_dict()})
+        module.plan_runtime.start(plan.plan_id)
+        return web.json_response({"started": True, "plan": plan.to_dict()}, status=202)
     return handler
-
 
 def _make_plan_reject(module):
     async def handler(request):
         plan_id = request.match_info["plan_id"]
-        found = module.glue.reject_plan(plan_id)
-        if not found:
-            return _err("方案不存在或已过期", 404)
-        return web.Response(status=204)
+        plan = module.glue.plan_manager.get(plan_id)
+        if plan is None:
+            return _err("方案不存在", 404)
+        if plan.status is not PlanStatus.AWAITING_APPROVAL:
+            return _err("只有待确认方案可以拒绝", 409)
+        plan = module.glue.plan_manager.cancel(plan_id)
+        module.bus.publish("plan.changed", {"action": "cancelled", "plan": plan.to_dict()})
+        return web.json_response({"plan": plan.to_dict()})
+    return handler
+
+
+
+def _plan_payload(plan):
+    return {"plan": plan.to_dict(), "tasks": [task.to_dict() for task in plan.tasks]}
+
+
+def _make_plans_list(module):
+    async def handler(request):
+        session_key = (request.query.get("session_key") or "").strip()
+        if not session_key:
+            return _err("session_key 为必填项")
+        try:
+            limit = max(1, min(int(request.query.get("limit", 100)), 1000))
+        except ValueError:
+            return _err("limit 必须为整数")
+        session_id = Dispatcher._runtime_session_id(session_key)
+        plans = module.glue.plan_manager.list(session_id, limit=limit)
+        return web.json_response({"plans": [plan.to_dict() for plan in plans]})
+    return handler
+
+
+def _make_plans_clear(module):
+    async def handler(request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        session_key = str((body or {}).get("session_key") or "").strip()
+        if not session_key:
+            return _err("session_key 为必填项")
+        session_id = Dispatcher._runtime_session_id(session_key)
+        archived = module.glue.plan_manager.archive_terminal_for_session(session_id)
+        module.bus.publish("plan.changed", {
+            "action": "terminal_cards_cleared", "session_key": session_key, "count": archived,
+        })
+        return web.json_response({"ok": True, "archived": archived})
+    return handler
+
+
+def _make_plan_archive(module):
+    async def handler(request):
+        plan_id = request.match_info["plan_id"]
+        try:
+            plan = module.glue.plan_manager.archive_terminal(plan_id)
+        except KeyError:
+            return _err("方案不存在", 404)
+        except ValueError as exc:
+            return _err(str(exc), 409)
+        module.bus.publish("plan.changed", {"action": "archived", "plan": plan.to_dict()})
+        return web.json_response(_plan_payload(plan))
+    return handler
+
+
+def _make_plan_get(module):
+    async def handler(request):
+        plan = module.glue.plan_manager.get(request.match_info["plan_id"])
+        if plan is None:
+            return _err("方案不存在", 404)
+        return web.json_response(_plan_payload(plan))
+    return handler
+
+
+def _make_plan_tasks(module):
+    async def handler(request):
+        plan = module.glue.plan_manager.get(request.match_info["plan_id"])
+        if plan is None:
+            return _err("方案不存在", 404)
+        return web.json_response({"tasks": [task.to_dict() for task in plan.tasks]})
+    return handler
+
+
+def _make_plan_pause(module):
+    async def handler(request):
+        plan_id = request.match_info["plan_id"]
+        try:
+            plan = await module.plan_runtime.pause(plan_id)
+        except KeyError:
+            return _err("方案不存在", 404)
+        except ValueError as exc:
+            return _err(str(exc), 409)
+        return web.json_response(_plan_payload(plan))
+    return handler
+
+
+def _make_plan_resume(module):
+    async def handler(request):
+        if not module.dispatcher.task_runtime_enabled:
+            return _err("TaskRuntime 未启用，无法恢复方案", 409)
+        plan_id = request.match_info["plan_id"]
+        try:
+            plan = await module.plan_runtime.resume(plan_id)
+        except KeyError:
+            return _err("方案不存在", 404)
+        except ValueError as exc:
+            return _err(str(exc), 409)
+        return web.json_response(_plan_payload(plan), status=202)
+    return handler
+
+
+def _make_plan_cancel(module):
+    async def handler(request):
+        plan_id = request.match_info["plan_id"]
+        plan = module.glue.plan_manager.get(plan_id)
+        if plan is None:
+            return _err("方案不存在", 404)
+        try:
+            if plan.status in {PlanStatus.ACTIVE, PlanStatus.PAUSED}:
+                plan = await module.plan_runtime.cancel(plan_id)
+            else:
+                plan = module.glue.plan_manager.cancel(plan_id)
+                module.bus.publish("plan.changed", {"action": "cancelled", "plan": plan.to_dict()})
+        except ValueError as exc:
+            return _err(str(exc), 409)
+        return web.json_response(_plan_payload(plan))
     return handler
 
 

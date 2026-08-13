@@ -16,6 +16,7 @@ from aiohttp import web
 
 from core.config_writer import mask_dict
 from gateway.webui.config_service import ConfigService, ConfigConflictError
+from core.reasoning import normalize_reasoning_level
 
 logger = logging.getLogger("hello_agent.gateway")
 
@@ -151,6 +152,28 @@ def _make_model_write(module):
                 if k in body:
                     cfg[k] = body[k]
 
+        if "reasoning" in body:
+            reasoning = body["reasoning"]
+            if not isinstance(reasoning, dict):
+                return _err("reasoning 必须是对象")
+            try:
+                level = normalize_reasoning_level(
+                    reasoning.get("level"), source="reasoning.level")
+            except ValueError as e:
+                return _err(str(e))
+            cfg["reasoning"] = {"level": level}
+
+            # The common level vocabulary maps to Chat Completions only.  Do
+            # not persist a setting that the selected native protocol cannot
+            # honour; callers get an actionable error before restart.
+            effective_protocol = (cfg.get("protocol")
+                                  or existing.get("protocol")
+                                  or "openai").lower()
+            if level != "provider_default" and effective_protocol != "openai":
+                return _err(
+                    "推理等级当前仅支持 OpenAI / OpenAI-compatible 协议；"
+                    "Anthropic 和 Gemini 请使用 provider_default")
+
         # 密钥保留规则：api_key 为空/占位符 → 保留原值
         new_key = cfg.get("api_key", "")
         from core.config_writer import is_masked_placeholder
@@ -207,6 +230,15 @@ def _make_llm_default(module):
             llm["model_id"] = mid
         if "timeout" in body:
             llm["timeout"] = int(body["timeout"])
+        if "reasoning" in body:
+            reasoning = body["reasoning"]
+            if not isinstance(reasoning, dict):
+                return _err("reasoning 必须是对象")
+            try:
+                llm["reasoning"] = {"level": normalize_reasoning_level(
+                    reasoning.get("level"), source="reasoning.level")}
+            except ValueError as e:
+                return _err(str(e))
         backup_and_write(module, data)
         module.bus.publish("config.updated", {"section": "llm"})
         return web.json_response({"ok": True})

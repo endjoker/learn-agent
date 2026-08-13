@@ -3,7 +3,8 @@
 - 优先用专用工具而非 Shell 命令
 - 读文件用 read，搜索用 grep/glob，写文件用 write，修改用 edit
 - 工具能满足需求就不要拼 shell 命令
-- 并行工具调用——在唯一的 agent.turn.v1/tool_calls JSON 信封的 calls 数组中列出多个调用，不能使用 ACTION/INPUT 标签
+- 需要工具时使用运行时提供的原生 function calling；可以在同一轮发起多个彼此独立的工具调用
+- 不要在回复文本中伪造工具调用、JSON 信封、XML 标签或 ACTION/INPUT 等控制协议
 
 本系统还具备学习型技能系统（保存在 SKILLS/ 目录）。
 - 技能是可复用的操作流程，按指令逐步执行
