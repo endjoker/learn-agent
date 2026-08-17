@@ -74,7 +74,7 @@ def md_to_feishu_card(
     text: str,
     model: str = "",
     elapsed: float = 0,
-    agent_name: str = "helloworld agent",
+    agent_name: str = "JKagent",
 ) -> dict:
     """
     Markdown 文本 -> 飞书 Card 2.0 JSON dict。
@@ -127,58 +127,6 @@ def md_to_feishu_card(
         "body": {"elements": elements},
     }
     return card
-
-
-def md_to_telegram_html(text: str) -> str:
-    """
-    Markdown -> Telegram HTML 格式。
-
-    支持: **bold** *italic* `code` ```fence``` [link](url) # heading
-    注意: Telegram HTML 不支持表格，表格原样保留为代码块。
-    """
-    # 先保护代码块，避免内部 markdown 被误转
-    code_blocks = []
-
-    def _save_code(m):
-        code_blocks.append(m.group(0))
-        return f"\x00CODE{len(code_blocks) - 1}\x00"
-
-    # 保护 ```fence``` 代码块
-    text = re.sub(r"```[\s\S]*?```", _save_code, text)
-    # 保护 `inline code`
-    text = re.sub(r"`[^`\n]+`", _save_code, text)
-
-    # 转义 HTML 特殊字符（在 markdown 转换之前）
-    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    # heading: # ~ ### → <b>
-    text = re.sub(r"^#{1,3}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
-    # bold: **text**
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    # italic: *text* (非 **)
-    text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", text)
-    # strikethrough: ~~text~~
-    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
-    # links: [text](url)
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
-    # unordered list: - item → bullet
-    text = re.sub(r"^- ", "• ", text, flags=re.MULTILINE)
-
-    # 恢复代码块
-    for i, block in enumerate(code_blocks):
-        if block.startswith("```"):
-            # fence code block
-            inner = re.sub(r"^```\w*\n?", "", block)
-            inner = re.sub(r"\n?```$", "", inner)
-            inner = inner.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            replacement = f"<pre><code>{inner}</code></pre>"
-        else:
-            # inline code
-            inner = block[1:-1].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            replacement = f"<code>{inner}</code>"
-        text = text.replace(f"\x00CODE{i}\x00", replacement)
-
-    return text
 
 
 def md_to_plain(text: str) -> str:

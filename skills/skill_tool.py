@@ -15,7 +15,7 @@ from core.permission import ALLOW
 from .skill import Skill
 from .manager import SkillManager
 
-logger = logging.getLogger("hello_agent")
+logger = logging.getLogger("jk_agent")
 
 
 class SkillTool(BaseTool):

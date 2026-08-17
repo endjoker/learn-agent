@@ -1,9 +1,27 @@
-# learn-agent 🤖
+# JKagent 🤖
 
 一个基于 Python 的生产级 AI 智能体框架，支持调用多种工具完成复杂任务。
 
 ## ✨ 功能特性
 
+
+### 工作区 / 智能体编辑模块（Phase 0~6）
+
+- **工作区（Workspace）** — 为本地项目创建隔离执行上下文；Windows 安全路径校验
+  （系统路径 / UNC / Junction / 敏感文件）；原子创建「工作区 + 首会话」。
+- **智能体编辑（Agent Profile）** — 可复用配置模板（System Prompt / 工具 / Skill /
+  MCP / 模型 / 权限），支持 Prompt 分区预览、复制、归档、引用检查。
+- **运行链路** — Workspace/Profile/Session 配置解析为不可变 `RuntimeSnapshot`，
+  经单一 Dispatcher 漏斗创建上下文化 Agent；工具/Skill/MCP/Prompt/权限/路径
+  与快照一致；Profile/Workspace 修改只标 stale，当前消息用旧快照。
+- **会话体验** — 消息 / 工具时间线 / 审批卡 / Plan 卡；SSE 断线用 event_id +
+  backlog 补齐；快速切换不串页；busy 时禁止危险配置切换。
+- **多工作区并发** — 每个工作区独立 project_root / working_directory / 权限根 /
+  Sandbox / ProcessManager；进程 CWD 恒定。
+- 工作区会话元数据唯一事实源为 SQLite（schema v9），不写 sessions_map.json。
+
+详见 `code/docs/workspaces.md`、`code/docs/workspace-security.md`、
+`code/docs/workspace-troubleshooting.md`、`code/docs/workspace-migration.md`。
 ### 已实现的 22 个内置工具 + MCP 扩展 + 技能
 
 | 工具 | 功能 | 说明 |
@@ -73,7 +91,7 @@
 ```bash
 # 1. 克隆项目
 git clone <你的仓库地址>
-cd hello-agent
+cd jkagent
 
 # 2. 创建虚拟环境（推荐）
 python -m venv .venv
@@ -180,7 +198,7 @@ python agent.py --debug
 ## 📁 目录结构
 
 ```
-hello-agent/
+jkagent/
 ├── agent.py                 # Agent 主程序入口（ReAct 循环 + 交互式 CLI）
 ├── config.json              # 统一配置文件（从 config.example.json 复制）
 ├── config.example.json      # 配置模板（含全部 section 示例）

@@ -3,19 +3,31 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>hello-agent 控制台</title>
-  <link rel="stylesheet" href="/ui/style.css">
+  <title>JKagent 控制台</title>
+  <script>
+    (function () {
+      try {
+        document.documentElement.dataset.theme =
+          localStorage.getItem("jkagent.theme") === "dark" ? "dark" : "light";
+      } catch (e) { document.documentElement.dataset.theme = "light"; }
+    })();
+  </script>
+  <link rel="stylesheet" href="/ui/style.css?v=3.6">
+  <link rel="stylesheet" href="/ui/workspace.css?v=3.6">
 </head>
 <body>
   <div id="layout">
     <nav id="sidebar">
-      <div class="brand">hello-agent</div>
+      <div class="brand">JKagent</div>
       <a class="nav-item" href="#/chat" data-page="chat">💬 会话</a>
       <a class="nav-item" href="#/mcp" data-page="mcp">🔌 MCP</a>
       <a class="nav-item" href="#/skills" data-page="skills">🧩 Skills</a>
       <a class="nav-item" href="#/prompt" data-page="prompt">📝 Prompt</a>
       <a class="nav-item" href="#/status" data-page="status">📊 状态</a>
       <a class="nav-item" href="#/cron" data-page="cron">⏰ 定时任务</a>
+      <div class="nav-group">工作区</div>
+      <a class="nav-item sub" href="#/workspace" data-page="workspace">▣ 工作区</a>
+      <a class="nav-item sub" href="#/agent-editor" data-page="agent-editor">◇ 智能体编辑</a>
       <a class="nav-item" href="#/settings" data-page="settings">⚙️ 设置</a>
       <div id="sse-state" class="sse-state">SSE: 连接中…</div>
     </nav>
@@ -23,14 +35,17 @@
   </div>
   <div id="toast-root"></div>
   <script src="/ui/vendor/marked.min.js"></script>
-  <script src="/ui/components.js"></script>
-  <script src="/ui/pages/chat.js"></script>
+  <script src="/ui/components.js?v=2.4"></script>
+  <script src="/ui/pages/chat.js?v=3.2"></script>
   <script src="/ui/pages/mcp.js"></script>
   <script src="/ui/pages/skills.js"></script>
-  <script src="/ui/pages/prompt.js"></script>
+  <script src="/ui/pages/prompt.js?v=3.8"></script>
   <script src="/ui/pages/status.js"></script>
   <script src="/ui/pages/cron.js"></script>
-  <script src="/ui/pages/settings.js"></script>
-  <script src="/ui/app.js"></script>
+  <script src="/ui/pages/settings.js?v=3.4"></script>
+  <script src="/ui/components/runtime-components.js?v=2.4"></script>
+  <script src="/ui/pages/agent-editor.js?v=2.9"></script>
+  <script src="/ui/pages/workspace.js?v=3.1"></script>
+  <script src="/ui/app.js?v=2.3"></script>
 </body>
 </html>

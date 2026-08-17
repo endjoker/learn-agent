@@ -20,6 +20,8 @@ class InboundMessage:
     raw: Any = None       # 原始平台消息对象（回复时需要）
     is_group: bool = False  # 是否群聊
     images: list = field(default_factory=list)  # 多模态图片块列表
+    # Phase 4：运行上下文/快照等附加元数据（默认空，不影响现有通道构造）
+    metadata: dict = field(default_factory=dict)
 
 
 class Channel(ABC):

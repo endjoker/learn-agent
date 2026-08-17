@@ -5,16 +5,51 @@
 
 window.HA = window.HA || {};
 
-// markdown 渲染（vendored marked；内容为 agent 自产，内网半可信，未做 XSS 净化）
+// markdown 渲染（vendored marked；Phase 5 增加基础 XSS 净化：
+// 剥掉 script/iframe/事件属性，危险 URL 仅允许 http/https/mailto）
 HA.renderMd = function (text) {
   if (!text) return "";
+  let html;
   try {
-    return marked.parse(String(text));
+    html = marked.parse(String(text));
   } catch (e) {
     const d = document.createElement("div");
     d.textContent = String(text);
     return d.innerHTML;
   }
+  return HA.sanitizeHtml(html);
+};
+
+// 基础 HTML 净化（DOM 白名单过滤）
+HA.sanitizeHtml = function (html) {
+  const doc = new DOMParser().parseFromString(String(html), "text/html");
+  const walker = (root) => {
+    for (const el of Array.from(root.querySelectorAll("*"))) {
+      const tag = el.tagName.toLowerCase();
+      if (["script", "iframe", "object", "embed", "link", "style", "meta", "base", "form"].includes(tag)) {
+        el.remove();
+        continue;
+      }
+      for (const attr of Array.from(el.attributes)) {
+        const name = attr.name.toLowerCase();
+        if (name.startsWith("on")) { el.removeAttribute(attr.name); continue; }
+        if (name === "href" || name === "src") {
+          const v = (attr.value || "").trim().toLowerCase();
+          if (!/^(https?:|mailto:|#|\/|\.\/|\.\.\/)/.test(v)) {
+            el.removeAttribute(attr.name);
+          }
+        }
+        if (name === "style") {
+          const v = (attr.value || "").toLowerCase();
+          if (v.includes("expression") || v.includes("javascript:")) {
+            el.removeAttribute(attr.name);
+          }
+        }
+      }
+    }
+  };
+  walker(doc.body);
+  return doc.body.innerHTML;
 };
 
 // 便捷元素构造：el("div", {class:"x", onclick:fn}, child1, child2)
@@ -22,10 +57,21 @@ HA.el = function (tag, attrs, ...children) {
   const node = document.createElement(tag);
   if (attrs) {
     for (const [k, v] of Object.entries(attrs)) {
-      if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2), v);
-      else if (k === "text") node.textContent = v;
-      else if (k === "html") node.innerHTML = v;
-      else if (v !== undefined && v !== null) node.setAttribute(k, v);
+      if (k.startsWith("on") && typeof v === "function") {
+        node.addEventListener(k.slice(2), v);
+      } else if (k === "text") {
+        node.textContent = v;
+      } else if (k === "html") {
+        node.innerHTML = v;
+      } else if (["checked", "selected", "disabled", "multiple", "readonly", "required"].includes(k)) {
+        // Boolean HTML attributes are true by presence.  Setting
+        // disabled="false" would still disable a control, so assign the DOM
+        // property and only emit the attribute for a true value.
+        node[k] = Boolean(v);
+        if (v) node.setAttribute(k, "");
+      } else if (v !== undefined && v !== null) {
+        node.setAttribute(k, v);
+      }
     }
   }
   for (const c of children.flat()) {

@@ -131,21 +131,6 @@ def _compile_words_re(words: list) -> re.Pattern:
 
 _DANGEROUS_WORDS_RE = _compile_words_re(DANGEROUS_WORDS)
 
-# 危险命令显示名称（保留供配置和提示文本使用）。不能再以子串方式对它们做安全判断：
-# ``rm -rf /tmp/file`` 含有 ``rm -rf /``，但并不是删除根目录。
-DANGEROUS_SUBSTRINGS = [
-    "rm -rf /", "rm -rf ~", "rm -rf .",
-    "del /f /s", "rd /s /q",
-    "diskpart",              # Windows 磁盘分区工具
-    "taskkill /f",           # 强制杀进程
-    "chmod 0",               # Unix 权限清零（与 chmod 777 / 互补覆盖）
-    "chown -r",              # 递归改所有者
-    "mkfs",
-    "dd if=",
-    ":(){ :|:& };:",         # fork 炸弹
-    "> /dev/sda", "> /dev/mmc",
-]
-
 
 _DANGEROUS_COMMAND_PATTERNS: list[tuple[str, re.Pattern]] = [
     # Require the destructive target to be its own shell token.  ``/*`` is
@@ -316,12 +301,6 @@ def _get_python_rules() -> dict:
             "forbidden_qualified": _DEFAULT_FORBIDDEN_QUALIFIED,
         }
     return _python_rules
-
-
-def reload_python_rules():
-    """清除缓存，下次 check 时重新读 config"""
-    global _python_rules
-    _python_rules = None
 
 
 def _top_module(dotted: str | None) -> str:
@@ -654,7 +633,7 @@ def apply_guard_config(config: dict = None):
         config: sandbox section 的 dict。None 时自动从 config_loader 加载。
     """
     global SENSITIVE_FILES, SYSTEM_PATHS_WIN, SYSTEM_PATHS_LINUX, SYSTEM_PATHS_MAC
-    global DANGEROUS_SUBSTRINGS, DANGEROUS_WORDS, _DANGEROUS_WORDS_RE
+    global DANGEROUS_WORDS, _DANGEROUS_WORDS_RE
     global _guard_config_loaded
 
     if config is None:
@@ -681,9 +660,6 @@ def apply_guard_config(config: dict = None):
         if "mac" in sp:
             SYSTEM_PATHS_MAC[:] = sp["mac"]
 
-    # --- dangerous_commands ---
-    if "dangerous_commands" in config:
-        DANGEROUS_SUBSTRINGS[:] = config["dangerous_commands"]
 
     # --- dangerous_words（需要重建正则） ---
     if "dangerous_words" in config:

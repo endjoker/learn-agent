@@ -1,5 +1,35 @@
-/* hello-agent WebUI —— 暗色优先，单文件 */
+/* JKagent WebUI —— 暗色优先，单文件 */
+/* JKagent WebUI -- light by default, with an optional dark theme. */
 :root {
+  color-scheme: light;
+  --bg: #f6f8fb;
+  --bg-panel: #ffffff;
+  --bg-hover: #eef2f7;
+  --border: #d8dee8;
+  --text: #172033;
+  --text-dim: #5d6879;
+  --accent: #2563eb;
+  --ok: #15803d;
+  --warn: #a16207;
+  --err: #dc2626;
+  --code-bg: #f1f5f9;
+  --input-focus-bg: #ffffff;
+  --placeholder: #718096;
+  --text-strong: #111827;
+  --toolbar-bg: rgba(255, 255, 255, .92);
+  --chat-input-bg: #ffffff;
+  --chat-input-border: #cbd5e1;
+  --reasoning-bg: #f8fafc;
+  --reasoning-border: #d6deea;
+  --reasoning-summary-bg: #eef3f9;
+  --reasoning-text: #46566e;
+  --reasoning-marker: #527bb8;
+  --panel-shadow: rgba(15, 23, 42, .08);
+  --radius: 8px;
+  font-size: 14px;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
   --bg: #14161a;
   --bg-panel: #1c1f26;
   --bg-hover: #262a33;
@@ -10,8 +40,19 @@
   --ok: #3fb96f;
   --warn: #d9a441;
   --err: #e5534b;
-  --radius: 8px;
-  font-size: 14px;
+  --code-bg: #13151a;
+  --input-focus-bg: #171a20;
+  --placeholder: #707887;
+  --text-strong: #f1f5ff;
+  --toolbar-bg: rgba(20, 23, 30, .84);
+  --chat-input-bg: #11151c;
+  --chat-input-border: #3b4658;
+  --reasoning-bg: rgba(19, 23, 31, .72);
+  --reasoning-border: #313b4b;
+  --reasoning-summary-bg: rgba(22, 28, 37, .84);
+  --reasoning-text: #aebbd0;
+  --reasoning-marker: #7f9dca;
+  --panel-shadow: rgba(0, 0, 0, .18);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -71,7 +112,7 @@ tr:last-child td { border-bottom: none; }
 .toast {
   background: var(--bg-panel); border: 1px solid var(--border);
   border-left: 3px solid var(--accent); border-radius: var(--radius);
-  padding: 10px 14px; max-width: 380px; box-shadow: 0 4px 16px rgba(0,0,0,.4);
+  padding: 10px 14px; max-width: 380px; box-shadow: 0 4px 16px var(--panel-shadow);
   animation: slidein .18s ease-out;
 }
 .toast.err { border-left-color: var(--err); }
@@ -107,17 +148,37 @@ select, textarea.chat-input {
 .seg-btn { background: var(--bg); color: var(--text-dim); border: none; padding: 5px 10px; cursor: pointer; font-size: 12px; }
 .seg-btn.on { background: var(--accent); color: #fff; }
 
-.msg-area { display: flex; flex-direction: column; gap: 10px; min-height: 300px; max-height: calc(100vh - 320px); overflow: auto; padding: 4px 2px; }
+.msg-area { display: flex; flex-direction: column; gap: 10px; min-width: 0; min-height: 300px; max-height: calc(100vh - 320px); overflow: auto; padding: 4px 2px; }
 .hide-tools .tool-group, .hide-tools .tool-card { display: none !important; }
 .empty-hint { color: var(--text-dim); text-align: center; padding: 40px; }
-.bubble { background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; max-width: 86%; }
-.bubble.user { align-self: flex-end; border-color: #35507e; }
+/* Main-chat reply sizing: Markdown is allowed to be rich, but it must never
+   stretch the message area or escape the reply card. */
+.msg-area > .bubble {
+  /* Do not stretch a message across the entire timeline.  In a column flex
+     container, flex-start lets the card use its natural width, while the cap
+     keeps long rich replies within the visible conversation column. */
+  align-self: flex-start;
+  min-width: 0;
+  max-width: min(86%, 920px);
+  box-sizing: border-box;
+}
+.bubble { background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; }
+.bubble.user { align-self: flex-end; max-width: min(86%, 720px); border-color: #35507e; }
 .bubble.system { align-self: center; color: var(--text-dim); font-size: 12px; background: transparent; border: none; }
 .bubble-role { font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
-.bubble-text { white-space: pre-wrap; word-break: break-word; line-height: 1.55; }
+.bubble-text { min-width: 0; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; line-height: 1.55; }
 .bubble-text.md p { margin: 4px 0; }
-.bubble-text.md pre { background: var(--bg); padding: 8px; border-radius: 6px; overflow: auto; }
+/* The global CSS reset removes browser list padding.  Restore it inside a
+   Markdown reply so list markers remain inside the bubble instead of hanging
+   over its left border. */
+.bubble-text.md :is(ul, ol) { margin: 6px 0; padding-inline-start: 1.5rem; }
+.bubble-text.md li + li { margin-top: 4px; }
+.bubble-text.md :is(pre, code) { max-width: 100%; }
+.bubble-text.md pre { background: var(--bg); padding: 8px; border-radius: 6px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 .bubble-text.md code { background: var(--bg); padding: 1px 4px; border-radius: 4px; }
+.bubble-text.md table { display: block; width: 100%; max-width: 100%; overflow-x: auto; table-layout: fixed; }
+.bubble-text.md :is(th, td) { min-width: 0; overflow-wrap: anywhere; word-break: break-word; vertical-align: top; }
+.bubble-text.md img { display: block; max-width: 100%; height: auto; }
 
 .tool-group { display: flex; flex-direction: column; gap: 4px; padding-left: 26px; }
 .tool-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; max-width: 70%; }
@@ -198,3 +259,42 @@ select, textarea.chat-input {
 /* ===== 图片预览 / 停止按钮（修 #5/#7） ===== */
 .img-preview { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 4px; }
 .img-thumb { width: 48px; height: 48px; border-radius: 6px; border: 1px solid var(--border); background-size: cover; background-position: center; cursor: pointer; }
+/* 左侧导航分组标题（工作区 组） */
+.nav-group {
+  color: var(--text-dim); font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .05em;
+  padding: 10px 10px 2px; margin-top: 4px; white-space: nowrap;
+}
+.nav-item.sub { padding-left: 18px; }
+
+
+/* Form alignment fixes for workspace wizard and settings. */
+.modal input[type="checkbox"] {
+  width: 16px;
+  min-width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  margin: 2px 0 0;
+  padding: 0;
+}
+.modal .ws-check {
+  width: 100%;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 8px;
+  line-height: 1.45;
+}
+.modal .ws-check span { min-width: 0; flex: 1; }
+.settings-card .form-row { align-items: center; }
+.settings-card .form-row > label.dim {
+  flex: 0 0 92px;
+  min-width: 92px;
+  line-height: 1.45;
+}
+.settings-card .form-row > select,
+.settings-card .form-row > input {
+  width: auto;
+  min-width: 0;
+  flex: 1 1 auto;
+  margin-top: 0;
+}

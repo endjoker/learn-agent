@@ -39,17 +39,15 @@ from typing import Optional
 
 import logging
 
-from core import HelloAgentsLLM, SystemPrompt
+from core import JKAgentLLM, SystemPrompt
 from core.llm_client import detect_context_length
 from core.compressor import Compressor
 from core.task_list import TaskList
 from core.debug import (
     logger, setup_logging,
-    set_debug, is_debug,
-    log_messages, log_llm_response,
-    log_tool_call, log_tool_result,
+    set_debug,
+    log_llm_response,
     log_info,
-    enable_with_agent,
 )
 from core.message_store import MessageStore, _content_to_text
 from core.config_loader import is_enabled
@@ -62,7 +60,7 @@ from core.process_manager import ProcessManager
 from tools import BaseTool, ToolRegistry
 from tools.builtin_tools import register_all_tools
 from tools.web_tools import register_web_tools
-from memory import MemoryManager
+from memory import MemoryManager, workspace_memory_dir
 from skills import SkillManager, SkillTool, CreateSkillTool
 from core.sandbox import SandboxExecutor
 from core.hook import HookManager, HookEvent, Decision
@@ -115,17 +113,7 @@ _THOUGHT_RE = re.compile(
     rf"(?=\n*(?:{TAG_ACTION}|行动)[：:]|\n*(?:{TAG_FINAL}|最终回答)[：:]|$)",
     re.DOTALL | re.IGNORECASE
 )
-# 正则匹配 ACTION + INPUT（用 findall 捕获全部，不区分大小写）
-# INPUT 使用前瞻边界匹配，支持嵌套 JSON
-# 工具名支持 - / . 以兼容 MCP 前缀命名（如 "web-search/search"）
-_ACTION_RE = re.compile(
-    rf"(?:{TAG_ACTION}|行动)[：:]\s*\[?([\w\-/.]+)\]?\s*(?:\n|$)"
-    rf"(?:\s*(?:{TAG_INPUT}|输入)[：:]\s*"
-    rf"(.+?)"
-    rf"(?=\s*(?:\n(?:{TAG_ACTION}|行动)[：:]|\n(?:{TAG_FINAL}|最终回答)[：:]|\n(?:{TAG_THOUGHT}|思考)[：:]|$))"
-    rf")?",
-    re.DOTALL | re.IGNORECASE
-)
+
 
 # ============================================================
 # Plan 规划（CLI /plan 与 WebUI plan 预览共用）
@@ -151,14 +139,7 @@ def extract_plan_text(response: str) -> Optional[str]:
     return m.group(1).strip() if m else None
 
 
-def _looks_like_structured_protocol_attempt(response: str) -> bool:
-    """Identify a malformed JSON-envelope attempt without extracting it.
 
-    This is deliberately only used to request one corrected response.  It
-    must never turn embedded JSON in prose into an executable tool call.
-    """
-    lowered = (response or "").lower()
-    return '"version"' in lowered and "agent.turn.v1" in lowered and '"type"' in lowered
 
 
 def _build_tool_result_content(combined: str):
@@ -186,51 +167,6 @@ def _build_tool_result_content(combined: str):
     return content
 
 
-def _normalize_tags(text: str) -> str:
-    """
-
-    将 XML 风格标签标准化为 ReAct 解析器支持的格式
-    处理格式：
-      <THOUGHT>...</THOUGHT>    →  THOUGHT：...
-      <ACTION>...</ACTION>      →  ACTION：...
-      <INPUT>...</INPUT>        →  INPUT：...
-      <FINAL_ANSWER>...</FINAL_ANSWER>  →  FINAL_ANSWER：...
-    同时清理模型生成的特殊 token 标记（如 <|im_end|> 等），
-    防止混入工具参数导致 JSON 解析失败。
-    """
-
-    # 清理特殊 token 标记
-    text = re.sub(r"<\|[\w_]+\|>", "", text)
-    # 标准化 XML 风格标签
-    text = re.sub(
-        r"<\s*THOUGHT\s*>\s*(.*?)\s*<\s*/\s*THOUGHT\s*>",
-        r"THOUGHT：\1",
-        text, flags=re.DOTALL | re.IGNORECASE,
-    )
-    text = re.sub(
-        r"<\s*ACTION\s*>\s*(.*?)\s*<\s*/\s*ACTION\s*>",
-        r"ACTION：\1",
-        text, flags=re.DOTALL | re.IGNORECASE,
-    )
-    text = re.sub(
-        r"<\s*INPUT\s*>\s*(.*?)\s*<\s*/\s*INPUT\s*>",
-        r"INPUT：\1",
-        text, flags=re.DOTALL | re.IGNORECASE,
-    )
-    text = re.sub(
-        r"<\s*FINAL_ANSWER\s*>\s*(.*?)\s*<\s*/\s*FINAL_ANSWER\s*>",
-        r"FINAL_ANSWER：\1",
-        text, flags=re.DOTALL | re.IGNORECASE,
-    )
-    # XML 风格工具调用: <tool-name>json</tool-name> → ACTION + INPUT
-    # 标准标签（THOUGHT/ACTION/INPUT/FINAL_ANSWER）已在上面处理，
-    # 剩余的 XML 标签视为工具名（如 <web-search/search>{...}</web-search/search>）
-    text = re.sub(
-        r"<\s*([\w\-/.]+)\s*>\s*(.*?)\s*<\s*/\s*\1\s*>",
-        r"ACTION：\1\nINPUT：\2",
-        text, flags=re.DOTALL,
-    )
-    return text.strip()
 def parse_react_response(response: str) -> dict:
     """
 
@@ -286,7 +222,7 @@ class Agent:
     def __init__(
         self,
         name: str,
-        llm: HelloAgentsLLM,
+        llm: JKAgentLLM,
         tool_registry: ToolRegistry,
         system_prompt: str = None,
         system_prompt_builder: SystemPrompt = None,
@@ -303,6 +239,13 @@ class Agent:
         quiet: bool = False,              # 静默模式（LLM 不流式打印到 stdout）
     ):
         self.name = name
+        # ---- 运行上下文（Phase 0：显式三目录分离，禁止 os.chdir）----
+        self._framework_root: Optional[str] = None
+        self._agent_data_root: Optional[str] = None
+        self._project_root: Optional[str] = None
+        self._working_directory: Optional[str] = None
+        self._extra_workspace_roots: tuple = ()
+        self._runtime_context: Optional[object] = None
         self.llm = llm
         self.tool_registry = tool_registry
         self.max_steps = max_steps
@@ -420,6 +363,7 @@ class Agent:
         """
 
         # 全量压缩本身
+        before_tokens = self.store.live_tokens()
         ok = self._compressor.full_compress(
             store=self.store,
             messages=self.messages,
@@ -431,8 +375,22 @@ class Agent:
                 f"全量压缩完成: {stats['total_messages']} 条消息, "
                 f"剩余 {stats['remaining_tokens']:,} tokens"
             )
+            self.store.record_event(
+                "compaction",
+                tokens_before=before_tokens,
+                tokens_after=stats.get("remaining_tokens", 0),
+                summary_preview=self._history_summary_preview(),
+            )
             self.store.save_session()
         return ok
+
+    def _history_summary_preview(self) -> str:
+        """提取当前上下文中的 history_summary 内容预览（用于结构化事件）。"""
+        for msg in self.messages:
+            if msg.get("kind") == "history_summary":
+                text = _content_to_text(msg.get("content", ""))
+                return text[:300]
+        return ""
 
     def _check_context(self, verbose: bool = True) -> bool:
         """
@@ -516,29 +474,6 @@ class Agent:
             print(f"  ⏭️  已取消，可继续讨论或输入 /plan 重新规划")
             return False
 
-    def adopt_plan(self, plan_text: str, user_input: str = "") -> int:
-        """激活已批准的方案（WebUI plan 阶段二，漏斗 executor 内调用）。
-
-        等价 _handle_plan 的确认分支，但无交互确认（批准发生在 WebUI 层）。
-        返回任务步数；解析失败抛 ValueError。
-        """
-        task_list = TaskList.from_plan_text(plan_text)
-        if not task_list.tasks:
-            raise ValueError("方案解析失败：未识别出有效任务")
-        self._task_list = task_list
-        self._update_task_list_in_prompt()
-        self.store.save_session()
-        try:
-            self.hooks.dispatch(HookEvent.PLAN_APPROVED, {
-                "plan": plan_text,
-                "task_count": len(task_list.tasks),
-                "user_input": user_input,
-            })
-        except Exception as e:
-            logger.warning(f"PLAN_APPROVED hook 派发失败: {e}")
-        logger.info(f"方案已激活: {len(task_list.tasks)} 步")
-        return len(task_list.tasks)
-
     def _ask_user(self, tool_name: str, params: dict) -> str:
         """
         工具权限确认统一入口。
@@ -592,7 +527,7 @@ class Agent:
             agent.switch_llm(model="gpt-4", base_url="https://api.openai.com", llm_type="cloud")
         """
 
-        self.llm = HelloAgentsLLM(**kwargs)
+        self.llm = JKAgentLLM(**kwargs)
         # 根据新模型的上下文长度重新计算压缩阈值
         self.max_history_tokens = max(self.llm.context_length // 2, 4096)
         # 同步 store 的阈值和模型配置（/stats 显示用的 store.max_tokens）
@@ -601,6 +536,16 @@ class Agent:
         self.store.model_provider = getattr(self.llm, "provider", "") or ""
         self.store.model_base_url = getattr(self.llm, "base_url", "") or ""
         self.store.model_llm_type = getattr(self.llm, "llm_type", "") or ""
+        # 会话进行中切换模型/推理等级才记为结构化事件（首次创建不记）
+        if len(self.messages) > 1:
+            self.store.record_event(
+                "model_change",
+                model=self.store.model_id,
+                provider=self.store.model_provider,
+                base_url=self.store.model_base_url,
+                llm_type=self.store.model_llm_type,
+                reasoning_level=getattr(self.llm, "reasoning_level", None),
+            )
         # 锚点失效——不同模型的 tokenizer 不同
         self.store._anchor_total = 0
         self.store._anchor_msg_count = 0
@@ -617,6 +562,32 @@ class Agent:
 
     # ============================================================
 
+    def _apply_prompt_roots(self, builder: "SystemPrompt") -> None:
+        """向 SystemPrompt 构建器注入显式运行根（Phase 0 无 CWD 依赖）。
+
+        优先使用运行时上下文/显式根；缺失时回退到 config 推导根。
+        """
+        if getattr(self, "_runtime_context", None) is not None:
+            ctx = self._runtime_context
+            builder.set_runtime_context(
+                framework_root=getattr(ctx, "framework_root", None) or None,
+                project_root=getattr(ctx, "project_root", None) or None,
+                working_directory=getattr(ctx, "working_directory", None) or None,
+            )
+            return
+        if self._framework_root:
+            builder.set_framework_prompt_root(self._framework_root)
+        if self._project_root:
+            builder.set_project_prompt_root(self._project_root)
+        if self._working_directory:
+            builder.set_workspace(self._working_directory)
+        elif getattr(builder, "_workspace", None) is None:
+            try:
+                cfg = getattr(self, "_config", None) or load_config()
+                builder.set_workspace(str(_configured_workspace_path(cfg)))
+            except Exception:
+                pass
+
     def _build_system_prompt(self) -> str:
         """使用 SystemPrompt 构建器生成带静态区和动态区的提示词"""
 
@@ -624,18 +595,22 @@ class Agent:
         skill_descs = self.skill_manager.get_skill_descriptions() if self.skill_manager else ""
         mcp_descs = self.tool_registry.get_mcp_tool_descriptions()
         builder = self.system_prompt_builder or SystemPrompt(name=self.name)
-        builder.set_project_root(os.getcwd())
-        # 设置工作区路径（从 config 读取，解析为绝对路径）
-        try:
-            cfg = getattr(self, "_config", None) or load_config()
-            builder.set_workspace(str(_configured_workspace_path(cfg)))
-        except Exception:
-            builder.set_workspace(os.getcwd())
+        self._apply_prompt_roots(builder)
         return builder.build(tool_descs=tool_descs, skill_descs=skill_descs, mcp_descs=mcp_descs)
 
     # ============================================================
     # 技能系统
     # ============================================================
+
+    def _apply_allowed_skills(self, allowed_names: list) -> None:
+        """Phase 4：从注册表中移除未选中的 Skill 工具（保留 create_skill 内部能力）。"""
+        if not allowed_names:
+            allowed_names = []
+        keep = set(allowed_names)
+        for name in list(self.tool_registry._skill_tool_names):
+            if name not in keep:
+                self.tool_registry.remove_tool(name)
+        self._rebuild_system_prompt()
 
     def _register_skill_tools(self):
         """将 SkillManager 中的技能注册为 SkillTool"""
@@ -919,7 +894,7 @@ class Agent:
         # 获取或创建 builder
         builder = self.system_prompt_builder or SystemPrompt(name=self.name)
         builder.add_session_instruction(instruction)
-        builder.set_project_root(os.getcwd())
+        self._apply_prompt_roots(builder)
         tool_descs = self.tool_registry.get_tool_descriptions()
         new_prompt = builder.build(tool_descs=tool_descs)
         # 更新消息列表中的 system prompt（如果已在对话中）
@@ -1264,499 +1239,6 @@ class Agent:
         """Validate, authorize, hook and execute one native tool call."""
         return self._tool_runtime.execute_native_call(
             self, call_id, provider_name, tool_name, arguments, raw_arguments)
-
-    def _legacy_execute_native_tool_call(self, call_id, provider_name, tool_name, arguments, raw_arguments):
-        """Compatibility implementation retained for old callers."""
-        display_name = tool_name or provider_name
-        self._emit_event("tool_execution_start", tool_call_id=call_id, tool=display_name,
-                         arguments=arguments)
-        if not tool_name:
-            observation, is_error = f"❌ 未知工具: {provider_name}", True
-        elif not isinstance(arguments, dict) or "__invalid_raw_arguments__" in arguments:
-            observation, is_error = "❌ 工具参数不是完整 JSON 对象", True
-        else:
-            errors = self.tool_registry.validate_arguments(tool_name, arguments)
-            if errors:
-                observation, is_error = "❌ 参数校验失败: " + "; ".join(errors), True
-            else:
-                level, reason = self._gate_check(tool_name, arguments)
-                if level == DENY:
-                    self.hooks.run_denied(tool_name, reason or "权限不足", level="gate")
-                    observation, is_error = f"⛔ 已拒绝: {reason or '权限不足'}", True
-                elif level == ASK:
-                    answer = self._ask_user(tool_name, arguments)
-                    if answer not in ("", "y", "yes", "a"):
-                        observation, is_error = "⏭️ 用户未批准工具调用", True
-                    else:
-                        observation, is_error = self._execute_native_tool(tool_name, arguments)
-                else:
-                    observation, is_error = self._execute_native_tool(tool_name, arguments)
-        self._emit_event("tool_execution_end", tool_call_id=call_id, tool=display_name,
-                         result=observation, is_error=is_error)
-        return observation, is_error
-
-    def _execute_native_tool(self, tool_name: str, arguments: dict):
-        phr = self.hooks.run_pre_tool(tool_name, arguments, gate_level="allow")
-        if phr.decision == Decision.BLOCK:
-            return f"⛔ hook 拦截: {phr.reason}", True
-        if phr.decision == Decision.MODIFY and phr.data:
-            arguments = phr.data
-        observation = self._execute_tool(tool_name, json.dumps(arguments, ensure_ascii=False))
-        is_error = observation.startswith(("❌", "⛔", "⏭️"))
-        phr = self.hooks.run_post_tool(tool_name, arguments, observation, is_error)
-        if phr.decision == Decision.MODIFY and phr.data:
-            observation = phr.data.get("result", observation)
-        elif phr.decision == Decision.BLOCK:
-            observation, is_error = f"⛔ hook 拦截: {phr.reason}", True
-        return observation, is_error
-
-    def _run_legacy(self, user_input: str, verbose: bool = True,
-            images: list | None = None, event_sink=None) -> str:
-        """
-
-        执行完整的 ReAct 循环
-        对话历史跨 run() 调用保留，每次的新输入会追加到历史中。
-        用 agent.clear_history() 清空历史。
-        消息流:
-          user → assistant(tool_use) → user(tool_result) → assistant → ...
-
-        参数:
-            images: 可选的图片块列表（多模态输入），格式见 core/protocols/vision.py
-        """
-
-        self._event_sink = event_sink
-        if not hasattr(self, "hooks"):
-            self.hooks = HookManager(enabled=False)
-        if not hasattr(self, "_task_list"):
-            self._task_list = None
-        if not hasattr(self, "_stop_block_count"):
-            self._stop_block_count = 0
-        max_steps = self.max_steps
-        # ---- 首次运行时初始化 MCP 连接（如果有配置） ----
-        self._init_mcp_if_needed()
-        # ---- 首次调用时初始化对话历史 ----
-        if not self.messages:
-            self.messages.append({"role": "system", "content": self.system_prompt})
-        # ---- 轻量压缩：先压缩旧的工具结果，减少上下文占用 ----
-        self._light_compress()
-        # ---- 上下文检查：超阈值时自动压缩或提示 ----
-        self._check_context(verbose=verbose)
-        # ---- Hook: user_prompt（用户输入过滤/改写）----
-        hr = self.hooks.run_user_prompt(user_input)
-        if hr.decision == Decision.BLOCK:
-            return f"⛔ 输入被 hook 拦截: {hr.reason}"
-        if hr.decision == Decision.MODIFY and hr.data:
-            user_input = hr.data.get("prompt", user_input)
-        # ---- 追加本次用户输入（支持多模态）----
-        if images:
-            # user_input 为空时不插入空 text block（Anthropic 拒绝空 text block）
-            content = []
-            if user_input:
-                content.append({"type": "text", "text": user_input})
-            content.extend(images)
-            self.messages.append({"role": "user", "content": content})
-        else:
-            self.messages.append({"role": "user", "content": user_input})
-        # ---- 紧急截断（压缩仍超阈值时，丢弃最早的消息兜底） ----
-        self._truncate_history()
-        # 调试：打印当前消息列表
-        log_messages(0, self.messages, f"[对话历史] 共 {len(self.messages)} 条，追加用户输入")
-        if verbose:
-            print(f"\n{'='*55}")
-            print(f"  🤖 {self.name}（最多 {max_steps} 步 | 历史 {len(self.messages)} 条）")
-            print(f"{'='*55}")
-            print(f"  👤 {user_input}")
-
-        format_retry = 0  # 格式纠正重试计数（防无限循环）
-
-        for step in range(1, max_steps + 1):
-            # 协作式停止检查点（WebUI 暂停按钮）
-            if self._consume_stop():
-                self.store.save_session()
-                return "⏹ 已停止"
-
-            if verbose:
-                task_tag = ""
-                if self._task_list:
-                    current = self._task_list.get_current()
-                    if current:
-                        task_tag = f" | 任务 {current.id}/{self._task_list.total}: {current.description[:40]}"
-                print(f"\n  ─── 第 {step}/{max_steps} 步{task_tag} ───")
-            # 调试：打印发送给 LLM 的消息
-            log_messages(step, self.messages, f"第 {step} 步 → 发送给 LLM")
-            # --- 调用 LLM ---
-            try:
-                self._emit_event("llm_start", step=step)
-                stream_chunks = []
-                try:
-                    response = self.llm.think(
-                        self.messages, temperature=0,
-                        silent=getattr(self, "quiet", False),
-                        # Do not send undecoded protocol bytes to the browser.
-                        # A tool envelope is control data, and a model may
-                        # emit it after a friendly preamble.  We publish only
-                        # validated visible content below.
-                        on_chunk=stream_chunks.append,
-                    )
-                except TypeError as exc:
-                    if "silent" not in str(exc) and "on_chunk" not in str(exc):
-                        raise
-                    response = self.llm.think(self.messages, temperature=0)
-            except Exception as e:
-                logger.error(f"LLM 调用失败: {e}", exc_info=True)
-                return f"❌ LLM 调用失败: {e}"
-            # 用 API 返回的 usage 校准上下文计数器（锚点）
-            self.store.set_anchor(self.llm.last_usage)
-            if not response:
-                logger.warning("LLM 返回空响应")
-                return "❌ LLM 调用失败"
-            # 调试：打印 LLM 返回
-            log_llm_response(step, response)
-            if verbose:
-                m = _THOUGHT_RE.search(response)
-                if m:
-                    print(f"  💭 {m.group(1).strip()[:200]}")
-            parsed = parse_react_response(response)
-            actions = parsed.get("actions", [])
-            # Models sometimes add a friendly sentence before an otherwise
-            # valid envelope.  Do not extract or execute that embedded JSON;
-            # ask once for a complete, standalone envelope instead.
-            if (not actions and not parsed.get("final_answer")
-                    and _looks_like_structured_protocol_attempt(response)):
-                retry_limit = load_config().get("agent_runtime", {}).get(
-                    "protocol_retry_limit", 1)
-                if format_retry < max(0, int(retry_limit)):
-                    format_retry += 1
-                    logger.warning("结构化响应混入展示文本，要求模型按完整信封重试 (%s/%s)",
-                                   format_retry, retry_limit)
-                    self.messages.append({"role": "assistant",
-                                          "content": "[invalid agent protocol hidden]",
-                                          "kind": "protocol_error"})
-                    self.messages.append({
-                        "role": "user", "name": "protocol_correction",
-                        "content": (
-                            "协议错误：你的上一条响应混入了解释文字与 JSON，"
-                            "不会执行任何工具。请重发且只能输出一个完整 JSON 对象："
-                            "工具调用用 agent.turn.v1/tool_calls，最终回答用 agent.turn.v1/final；"
-                            "不要输出任何前后说明、Markdown 围栏或标签。"
-                        ),
-                    })
-                    self._emit_event("text_reset", reason="protocol_correction")
-                    continue
-            # ---- PLAN 检测（仅第一轮，无任务清单时） ----
-            if step == 1 and not self._task_list:
-                plan_match = re.search(
-                    r"PLAN[：:]\s*(\S[\s\S]*?)(?=\n*(?:THOUGHT|ACTION|FINAL_ANSWER)|\Z)",
-                    response, re.IGNORECASE,
-                )
-                if plan_match:
-                    plan_text = plan_match.group(1).strip()
-                    if self._handle_plan(plan_text, verbose=verbose):
-                        cleaned = re.sub(
-                            r"PLAN[：:].*", "", response,
-                            flags=re.DOTALL | re.IGNORECASE,
-                        ).strip()
-                        if cleaned:
-                            self.messages.append({"role": "assistant", "content": cleaned})
-                        self.store.save_session()
-                        # 方案已确认，跳出主循环，进入任务执行阶段
-                        if verbose:
-                            print('  🔀 方案已确认，进入任务执行阶段')
-                        break
-                    else:
-                        return "用户取消方案，请继续讨论或输入 /plan 重新规划。"
-            # ---- COMPLETE_TASK 检测 ----
-            complete_match = re.search(
-                r"COMPLETE_TASK[：:]\s*(\d+)\s*(.*)", response, re.IGNORECASE
-            )
-            if complete_match and self._task_list:
-                task_id = int(complete_match.group(1))
-                result = complete_match.group(2).strip()
-                has_next = self._task_list.mark_done(task_id, result)
-                self._update_task_list_in_prompt()
-                self.store.save_session()
-                if verbose:
-                    print(f"  ✅ 任务 {task_id}/{self._task_list.total} 完成 → {result or '已完成'}")
-                if self._task_list.is_all_done():
-                    if verbose:
-                        print(f"  🎉 全部 {self._task_list.total} 个任务完成！")
-                    break
-                continue
-            # 调试：打印解析结果
-            log_info(
-                f"解析结果: actions={len(actions)}, "
-                f"final_answer={'有' if parsed['final_answer'] else '无'}"
-            )
-            if parsed["final_answer"] and not actions:
-                self._emit_event("text_reset", reason="final_answer")
-                self._emit_event("text_delta", text=parsed["final_answer"])
-                log_info("→ 走 FINAL_ANSWER 分支")
-                self.messages.append({"role": "assistant", "content": parsed["final_answer"]})
-                if verbose:
-                    print(f"\n  ✅ 结论（{step} 步）")
-                    print(f"  🤖 {parsed['final_answer']}")
-                self.store.save_session()
-                self._save_memory(user_input)
-                # 任务清单模式：标记当前任务完成，检查是否全部完成
-                if self._task_list:
-                    current = self._task_list.get_current()
-                    if current:
-                        self._task_list.mark_done(current.id, parsed["final_answer"][:200])
-                        self._update_task_list_in_prompt()
-                        self.store.save_session()
-                        if verbose:
-                            print(f"  ✅ 任务 {current.id}/{self._task_list.total} 完成")
-                    if not self._task_list.is_all_done():
-                        # 还有任务未完成，继续下一轮（不 return）
-                        # 下一轮循环开始时，会通过下面的 _execute_next_task 发送新任务
-                        continue
-                    else:
-                        break
-                # ---- Stop hook: agent 即将停止 ----
-                shr = self.hooks.run_stop(parsed["final_answer"], step_count=step)
-                if shr.decision == Decision.BLOCK:
-                    self._stop_block_count += 1
-                    if self._stop_block_count >= 3:
-                        if verbose:
-                            print(f"  ⚠️  stop hook 连续 BLOCK {self._stop_block_count} 次，强制停止")
-                        return parsed["final_answer"]
-                    self.messages.append({"role": "assistant", "content": response})
-                    follow_up = (shr.data or {}).get("prompt") or shr.reason or "请继续"
-                    self.messages.append(
-                        {"role": "user",
-                         "content": f"（hook 提示：{follow_up}）"}
-                    )
-                    if verbose:
-                        print(f"  🔄 hook 阻止停止（{self._stop_block_count}/3）")
-                    continue
-                if shr.decision == Decision.MODIFY and shr.data:
-                    parsed["final_answer"] = shr.data.get("answer", parsed["final_answer"])
-                return parsed["final_answer"]
-            # --- 批量 ACTION（支持多个工具并发执行） ---
-            if actions:
-                # A complete structured tool envelope is internal protocol,
-                # not user-facing text.  Clear deltas from this model turn
-                # before the browser renders the tool events.
-                self._emit_event("text_reset", reason="tool_calls")
-                log_info(f"→ 走 ACTIONS 分支: {len(actions)} 个工具")
-                n = len(actions)
-                if verbose:
-                    names = [a["name"] for a in actions]
-                    print(f"  🛠️  {TAG_ACTION}({n}): {', '.join(names)}")
-                # 调试：打印每个工具调用
-                for a in actions:
-                    log_tool_call(step, a["name"], a["input"])
-
-                # ===== 权限检查：对每个工具做 allow/ask/deny 判断 =====
-                checked_actions = []  # 通过检查的：[(name, input)]
-                denied_actions = []   # 被拒绝的：[(name, input, reason)]
-                for a in actions:
-                    tool_name = a["name"]
-                    input_str = a["input"]
-                    try:
-                        params = json.loads(input_str) if input_str else {}
-                    except json.JSONDecodeError:
-                        params = {}
-                    # 非 dict 的 INPUT（如 JSON 数组）→ LLM 传错格式，走拒绝并给提示
-                    if not isinstance(params, dict):
-                        reason = (
-                            f"INPUT 必须是 JSON 对象（如 {{\"action\": \"delete\", \"path\": \"...\"}}），"
-                            f"但收到了 JSON {type(params).__name__}，长度 {len(params)}。"
-                        )
-                        denied_actions.append((tool_name, input_str, reason))
-                        continue
-                    level, gate_reason = self._gate_check(tool_name, params)
-                    if level == ALLOW:
-                        checked_actions.append(a)
-                    elif level == DENY:
-                        reason = gate_reason or "权限不足，操作已被系统拒绝"
-                        denied_actions.append((tool_name, input_str, reason))
-                        print(f"  ⛔ {tool_name}: {reason}")
-                        # Hook: denied 事件（审计用）
-                        self.hooks.run_denied(tool_name, reason, level="gate")
-                    elif level == ASK:
-                        # Hook: notification（ASK 前拦截——可提前 BLOCK，但不能替用户放行）
-                        nhr = self.hooks.run_notification(tool_name, params,
-                                                          f"tool={tool_name}")
-                        if nhr.decision == Decision.BLOCK:
-                            denied_actions.append(
-                                (tool_name, input_str, f"hook 拒绝: {nhr.reason}")
-                            )
-                            if verbose:
-                                print(f"  ⛔ hook 拦截 {tool_name}: {nhr.reason}")
-                            continue
-                        # 显示要执行的操作，等待用户确认
-                        prompt_text = self._ask_user(tool_name, params)
-                        if prompt_text == "a":
-                            # 工作区全放行
-                            self.permission.allow_workspace()
-                            checked_actions.append(a)
-                            print(f"  ✅ 工作区内操作已全部放行（本会话有效）")
-                        elif prompt_text in ("", "y", "yes", "是"):
-                            print(f"  ✅ 已允许")
-                            checked_actions.append(a)
-                        elif prompt_text == "s":
-                            reason = f"用户选择跳过"
-                            denied_actions.append((tool_name, input_str, reason))
-                            print(f"  ⏭️  已跳过")
-                        else:
-                            # N = 拒绝并结束本轮对话
-                            print(f"  ⛔ 用户已拒绝操作，结束本次会话")
-                            return f"操作已取消：用户拒绝了 {tool_name}，对话已终止。"
-
-                # ===== 并发执行通过权限检查的工具（含 pre_tool hook 拦截）=====
-                results = []
-                hook_blocked = []  # 被 pre_tool hook 拦截的
-                if checked_actions:
-                    # ---- pre_tool hook：逐工具检查 ----
-                    ok_actions = []
-                    for a in checked_actions:
-                        tool_name = a["name"]
-                        try:
-                            params = json.loads(a["input"]) if a["input"] else {}
-                        except json.JSONDecodeError:
-                            params = {}
-                        phr = self.hooks.run_pre_tool(tool_name, params,
-                                                      gate_level="allow")
-                        if phr.decision == Decision.BLOCK:
-                            hook_blocked.append(
-                                (tool_name, a["input"],
-                                 f"hook 拦截: {phr.reason}")
-                            )
-                            if verbose:
-                                print(f"  ⛔ hook 拦截 {tool_name}: {phr.reason}")
-                            continue
-                        if phr.decision == Decision.MODIFY and phr.data:
-                            a["input"] = json.dumps(phr.data, ensure_ascii=False)
-                        ok_actions.append(a)
-                    # ---- 并发执行通过 hook 的工具 ----
-                    if ok_actions:
-                        m = len(ok_actions)
-                        with ThreadPoolExecutor(max_workers=min(m, 5)) as pool:
-                            future_map = {
-                                pool.submit(self._execute_tool, a["name"], a["input"]): a
-                                for a in ok_actions
-                            }
-                            for future in as_completed(future_map):
-                                action = future_map[future]
-                                try:
-                                    obs = future.result()
-                                    is_error = obs.startswith("❌")
-                                except Exception as e:
-                                    obs = f"❌ 工具执行异常: {type(e).__name__}: {e}"
-                                    is_error = True
-                                results.append((action["name"], action["input"], obs, is_error))
-                    # ---- pre_tool hook 拦截的加入 denied ----
-                    for tool_name, input_str, reason in hook_blocked:
-                        denied_actions.append((tool_name, input_str, reason))
-
-                # ===== 被拒绝的也加入结果 =====
-                for tool_name, input_str, reason in denied_actions:
-                    results.append((tool_name, input_str, f"⏭️ 跳过: {reason}", True))
-                # 统计成功/失败
-                ok_count = sum(1 for _, _, _, err in results if not err)
-                fail_count = sum(1 for _, _, _, err in results if err)
-                # 调试：打印每个工具返回
-                for name, _, obs, _ in results:
-                    log_tool_result(step, name, obs)
-                if verbose:
-                    status = f"✅ {ok_count} 成功" if ok_count else ""
-                    if fail_count:
-                        status += f"，❌ {fail_count} 失败" if status else f"❌ {fail_count} 失败"
-                    print(f"  📊 执行完毕: {status}")
-                    for name, _, obs, is_err in results:
-                        short = obs[:200].replace("\n", " ")
-                        prefix = "❌" if is_err else "✅"
-                        print(f"    {prefix} {name} → {short}{'...' if len(obs) > 200 else ''}")
-
-                # ---- post_tool hook：结果聚合后（主线程，可改写结果）----
-                for _i, (_tname, _input_str, _obs, _is_err) in enumerate(results):
-                    _tparams = {}
-                    if _input_str:
-                        try:
-                            _tparams = json.loads(_input_str)
-                        except json.JSONDecodeError:
-                            pass
-                    phr = self.hooks.run_post_tool(_tname, _tparams, _obs, _is_err)
-                    if phr.decision == Decision.MODIFY and phr.data:
-                        _obs = phr.data.get("result", _obs)
-                        results[_i] = (_tname, _input_str, _obs, _is_err)
-                    if phr.decision == Decision.BLOCK:
-                        _obs = f"⛔ hook 告警: {phr.reason}"
-                        results[_i] = (_tname, _input_str, _obs, True)
-
-                # ====== 只添加一条 assistant + 一条合并的 tool_result ======
-                self.messages.append({"role": "assistant", "content": response,
-                                      "kind": "tool_calls"})
-                for _tname, _input_str, _obs, _is_err in results:
-                    self._emit_event("tool_result", tool=_tname,
-                                     result=_obs, is_error=_is_err)
-                combined = self._combine_results(results)
-                # 检测工具结果中的图片标记 → 构造多模态 tool_result
-                self.messages.append({
-                    "role": "user", "name": "tool_result",
-                    "content": _build_tool_result_content(combined),
-                })
-            else:
-                log_info("→ 走 ELSE 分支（无 Action 无 FinalAnswer）")
-
-                if verbose:
-                    print(f"  💬 直接回复（无标签）")
-                # 无标签时仍将 LLM 回复作为最终答案返回
-                answer = response.strip()
-                self._emit_event("text_reset", reason="final_answer")
-                self._emit_event("text_delta", text=answer)
-                self.messages.append({"role": "assistant", "content": answer})
-                if verbose:
-                    print(f"  🤖 {answer}")
-                self.store.save_session()
-                self._save_memory(user_input)
-                # 任务清单模式：标记当前任务完成，推进下一个
-                if self._task_list:
-                    current = self._task_list.get_current()
-                    if current:
-                        self._task_list.mark_done(current.id, answer[:200])
-                        self._update_task_list_in_prompt()
-                        self.store.save_session()
-                        if verbose:
-                            print(f"  ✅ 任务 {current.id}/{self._task_list.total} 完成")
-                # ---- Stop hook: agent 即将停止（ELSE 分支）----
-                shr = self.hooks.run_stop(answer, step_count=step)
-                if shr.decision == Decision.BLOCK:
-                    self._stop_block_count += 1
-                    if self._stop_block_count >= 3:
-                        if verbose:
-                            print(f"  ⚠️  stop hook 连续 BLOCK {self._stop_block_count} 次，强制停止")
-                        return answer
-                    self.messages.append({"role": "assistant", "content": response})
-                    follow_up = (shr.data or {}).get("prompt") or shr.reason or "请继续"
-                    self.messages.append(
-                        {"role": "user",
-                         "content": f"（hook 提示：{follow_up}）"}
-                    )
-                    if verbose:
-                        print(f"  🔄 hook 阻止停止（{self._stop_block_count}/3）")
-                    continue
-                if shr.decision == Decision.MODIFY and shr.data:
-                    answer = shr.data.get("answer", answer)
-                return answer
-
-        # ---- Phase 2: 任务清单执行 ----
-        if self._task_list:
-            return self._run_task_list(user_input, max_steps, verbose)
-
-        self.store.save_session()
-        self._save_memory(user_input)
-        return (
-            f"⚠️ 已达最大步数（{max_steps} 步），任务可能未完成。\n"
-            f"建议拆分子任务，或用 create_agent(max_steps=100) 增加上限。"
-        )
-
-    # ============================================================
-    # 流式运行
-
-    # ============================================================
-
 
     def _run_task_list(self, user_input, max_steps, verbose):
         """Phase 2: 任务清单模式 —— 框架主动推进，逐任务执行"""
@@ -2202,7 +1684,7 @@ def _load_mcp_config(mcp_servers: list = None) -> list:
 
 
 def create_agent(
-    name: str = "helloworld agent",
+    name: str = "JKagent",
     model: str = None,
     api_key: str = None,
     base_url: str = None,
@@ -2218,6 +1700,16 @@ def create_agent(
     mcp_servers: list = None,    # MCP 服务器配置列表（可选）
     non_interactive: bool = False,  # 非交互模式（gateway 等无 TTY 场景）
     quiet: bool = False,            # 静默模式（LLM 不流式打印到 stdout）
+    framework_root: str = None,     # 框架根（默认 prompt/ 兜底）
+    agent_data_root: str = None,    # Agent 数据根（runtime.db / Artifact / 自身状态）
+    project_root: str = None,       # 用户项目访问边界
+    working_directory: str = None,  # 默认执行目录（须在 project_root / extra roots 内）
+    extra_workspace_roots: list = None,  # 显式额外白名单根（None=继承 config）
+    runtime_context: object = None,      # WorkspaceRuntimeContext（最高优先级）
+    profile_prompt: str = None,          # Agent Profile System Prompt（Phase 2/4）
+    allowed_tools: list = None,          # 工具能力子集（None=全部；系统保留工具恒在）
+    allowed_skills: list = None,         # Skill 能力子集（None=全部）
+    reasoning_level: str = None,         # Per-session reasoning selection; None inherits model/provider config.
 ) -> Agent:
     """
     一行创建 Agent（含 read/write/edit/grep/glob/bash + search/web_fetch）
@@ -2242,37 +1734,98 @@ def create_agent(
     setup_logging(debug=debug)
     if debug:
         set_debug(True)
-    # 工作目录：从配置读取，chdir 到该目录（所有模式统一生效）
     from core.config_loader import load_config as _lc
-    # Take one config snapshot before changing CWD.  The snapshot is retained
-    # on the Agent below for runtime feature flags and tool limits.
+    from core.config_loader import _find_project_root
+    # Take one config snapshot before changing anything.  The snapshot is
+    # retained on the Agent below for runtime feature flags and tool limits.
     _config = _lc()
-    _ws_path = str(_configured_workspace_path(_config))
-    os.makedirs(_ws_path, exist_ok=True)
-    os.chdir(_ws_path)
-    llm = HelloAgentsLLM(model=model, api_key=api_key, base_url=base_url, provider=provider)
-    # 记忆系统（跨会话）
-    memory_manager = MemoryManager() if memory else None
-    # 技能系统（学习型，保存在 SKILLS/ 目录）
+
+    # ---- Phase 0：显式三目录分离（不再 os.chdir）----
+    # 优先级：runtime_context > 显式 root 参数 > config.json 默认 > 框架兼容默认
+    if runtime_context is not None:
+        _framework_root = str(getattr(runtime_context, "framework_root", "") or _find_project_root())
+        _agent_data_root = str(getattr(runtime_context, "agent_data_root", "") or _configured_workspace_path(_config))
+        _project_root = str(getattr(runtime_context, "project_root", "") or _find_project_root())
+        _working_directory = str(getattr(runtime_context, "working_directory", "") or _agent_data_root)
+        _extra_workspace_roots = [
+            str(p) for p in (getattr(runtime_context, "extra_workspace_roots", ()) or ())
+        ]
+        _permission_mode = str(getattr(runtime_context, "permission_mode", "") or "ask")
+    else:
+        _framework_root = framework_root or str(_find_project_root())
+        _agent_data_root = agent_data_root or str(_configured_workspace_path(_config))
+        _project_root = project_root or _framework_root
+        _working_directory = working_directory or _agent_data_root
+        _extra_workspace_roots = list(extra_workspace_roots) if extra_workspace_roots is not None else None
+        _permission_mode = ""
+
+    _framework_root = str(Path(_framework_root).expanduser().resolve())
+    _agent_data_root = str(Path(_agent_data_root).expanduser().resolve())
+    _project_root = str(Path(_project_root).expanduser().resolve())
+    _working_directory = str(Path(_working_directory).expanduser().resolve())
+    os.makedirs(_agent_data_root, exist_ok=True)
+
+    llm = JKAgentLLM(model=model, api_key=api_key, base_url=base_url, provider=provider,
+                          reasoning_level=reasoning_level)
+    # 记忆系统（跨会话）——工作区模式数据目录随 agent_data_root，避免多工作区串味；
+    # 普通模式保持框架 memory/ 目录，行为不变。
+    if memory:
+        workspace_id = ""
+        if runtime_context is not None:
+            workspace_id = getattr(runtime_context, "workspace_id", "") or ""
+        if workspace_id:
+            memory_manager = MemoryManager(memory_dir=str(workspace_memory_dir(workspace_id)))
+        elif agent_data_root is not None:
+            memory_manager = MemoryManager(memory_dir=os.path.join(_agent_data_root, "memory"))
+        else:
+            memory_manager = MemoryManager()
+    else:
+        memory_manager = None
+    # 技能系统（学习型，保存在框架 SKILLS/ 目录）
     skill_manager = SkillManager() if skills else None
     if skill_manager:
         skill_manager.load_all()
-    # 沙箱执行器（L2 内容拦截 + 资源隔离）
-    sandbox_executor = SandboxExecutor() if sandbox else None
-    # 权限管理
-    checker = PermissionChecker() if permission else None
+    # 沙箱执行器（L2 内容拦截 + 资源隔离）——显式工作目录
+    sandbox_executor = SandboxExecutor(workspace=_working_directory) if sandbox else None
+    # 权限管理——显式 project_root + 显式 extra roots（工作区模式空列表不回退全局）
+    checker = PermissionChecker(
+        workspace=_project_root,
+        extra_workspaces=_extra_workspace_roots,
+    ) if permission else None
+    if checker and _permission_mode and _permission_mode in ("allow", "unreviewed", "readonly"):
+        if _permission_mode == "allow":
+            checker.allow_workspace()
     # 长驻子进程管理器（依赖沙箱的 max_output/idle 配置）
     process_manager = None
     if sandbox_executor and checker:
-        process_manager = ProcessManager(sandbox_executor, str(checker.workspace))
+        process_manager = ProcessManager(sandbox_executor, _working_directory)
     registry = ToolRegistry()
     register_all_tools(
         registry, memory_manager=memory_manager,
         sandbox=sandbox_executor, process_manager=process_manager,
     )
     register_web_tools(registry)
+    # Phase 4：能力子集过滤（schemas + Prompt 描述 + catalog 三方一致）
+    if allowed_tools is not None and hasattr(registry, "set_active_tools"):
+        registry.set_active_tools(list(allowed_tools))
     # MCP 配置：代码参数 > config.json
     mcp_servers = _load_mcp_config(mcp_servers)
+    # SystemPrompt 构建器：注入显式运行根（Phase 0 无 CWD 依赖）
+    prompt_builder = SystemPrompt(name=name)
+    prompt_builder.set_runtime_context(
+        framework_root=_framework_root,
+        project_root=_project_root,
+        working_directory=_working_directory,
+    )
+    if runtime_context is not None:
+        _ws_id = getattr(runtime_context, "workspace_id", "") or ""
+        if _ws_id:
+            prompt_builder.set_memory_context(
+                memory_path=str(workspace_memory_dir(_ws_id)),
+                instruction="当用户询问与当前项目相关的问题时，优先调用 memory_search 检索本工作区长期记忆，再作答。",
+            )
+    if profile_prompt:
+        prompt_builder.set_agent_profile_prompt(profile_prompt)
     agent = Agent(
         name=name, llm=llm, tool_registry=registry,
         max_steps=max_steps,
@@ -2286,7 +1839,15 @@ def create_agent(
         hooks_enabled=hooks,
         non_interactive=non_interactive,
         quiet=quiet,
+        system_prompt_builder=prompt_builder,
     )
+    # ---- Phase 0：记录运行根到 Agent（重建/恢复时保持上下文）----
+    agent._framework_root = _framework_root
+    agent._agent_data_root = _agent_data_root
+    agent._project_root = _project_root
+    agent._working_directory = _working_directory
+    agent._extra_workspace_roots = tuple(_extra_workspace_roots or ())
+    agent._runtime_context = runtime_context
     # Hook: 绑定 agent 身份，触发 session_start
     agent._config = _config
     agent._tool_runtime = ToolRuntime(
@@ -2297,6 +1858,9 @@ def create_agent(
         agent.skill_manager = skill_manager
         agent._register_skill_tools()
         agent._register_create_skill_tool()
+        # Phase 4：按快照过滤 Skill 工具
+        if allowed_skills is not None:
+            agent._apply_allowed_skills(list(allowed_skills))
         agent._rebuild_system_prompt()
     return agent
 
@@ -2316,7 +1880,7 @@ def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
         pass
 
     print("\n╔═══════════════════════════════════════════════╗")
-    print("║   🚀 HelloAgent 交互式命令行                  ║")
+    print("║   🚀 JKagent 交互式命令行                  ║")
     if debug:
         print("║   🐛 调试模式已开启                           ║")
     print("║                                                 ║")

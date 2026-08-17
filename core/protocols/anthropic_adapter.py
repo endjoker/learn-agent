@@ -18,7 +18,7 @@ from anthropic import Anthropic
 
 from .base import ChatResponse, ProtocolAdapter
 
-logger = logging.getLogger('hello_agent')
+logger = logging.getLogger('jk_agent')
 
 # Anthropic 要求必传 max_tokens，默认值（足够覆盖大多数 ReAct 回复）
 DEFAULT_MAX_TOKENS = 8192

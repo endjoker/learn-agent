@@ -15,7 +15,7 @@ from typing import Optional
 from gateway.channels.base import Channel, InboundMessage
 from gateway.textutil import split_text, md_to_plain
 
-logger = logging.getLogger("hello_agent.gateway.weixin")
+logger = logging.getLogger("jk_agent.gateway.weixin")
 
 
 class WeixinChannel(Channel):
@@ -49,7 +49,7 @@ class WeixinChannel(Channel):
         self._running = True
         self._thread = threading.Thread(
             target=self._run_bot,
-            name="hello-agent-weixin",
+            name="jkagent-weixin",
             daemon=True,
         )
         self._thread.start()

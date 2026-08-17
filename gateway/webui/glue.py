@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 
-from core.plan import PlanManager, PlanStatus
+from core.plan import PlanManager
 from gateway.dispatcher import Dispatcher
 from gateway.channels.base import InboundMessage
 
@@ -27,12 +27,16 @@ _WRITE_TOOLS = ("bash", "write", "edit", "python", "http", "file_mgr")
 async def send_and_wait(module, session_key: str, text: str,
                         timeout: float = 120.0,
                         user_id: str = "webui",
-                        images: list = None) -> dict:
+                        images: list = None,
+                        metadata: dict = None,
+                        message_id: str = None) -> dict:
     """合成 InboundMessage 走漏斗，等 WebuiChannel future 取回回复。
 
     images: 可选多模态图片块列表（{type:image,source:base64,...}），透传给 agent.run。
+    metadata: Phase 4 工作区运行上下文（workspace_id/snapshot_id 等），透传给 Dispatcher。
+    message_id: 可选显式消息 ID（工作区会话去重/审批归属用）。
     """
-    message_id = f"webui-{uuid.uuid4().hex[:12]}"
+    message_id = message_id or f"webui-{uuid.uuid4().hex[:12]}"
     fut = module.channel.register_future(session_key, message_id)
     msg = InboundMessage(
         channel="webui",
@@ -42,6 +46,7 @@ async def send_and_wait(module, session_key: str, text: str,
         text=text,
         message_id=message_id,
         images=images or [],
+        metadata=dict(metadata or {}),
     )
     await module.dispatcher.on_inbound(msg)
     try:
@@ -69,13 +74,19 @@ class ApprovalBridge:
         self._pending: dict = {}   # id -> dict(answer/event/...)
         self._lock = threading.Lock()
 
-    def ask(self, session_key: str, tool_name: str, params: dict) -> str:
+    def ask(self, session_key: str, tool_name: str, params: dict,
+            metadata: dict = None) -> str:
         aid = uuid.uuid4().hex[:8]
         evt = threading.Event()
         params_preview = str(params)[:_PREVIEW_CHARS]
+        meta = dict(metadata or {})
         record = {"answer": "", "event": evt, "created_at": time.time(),
                   "tool": tool_name, "session_key": session_key,
-                  "params_preview": params_preview}
+                  "params_preview": params_preview,
+                  "workspace_id": meta.get("workspace_id", ""),
+                  "workspace_session_id": meta.get("workspace_session_id", ""),
+                  "snapshot_id": meta.get("snapshot_id", ""),
+                  "message_id": meta.get("message_id", "")}
         with self._lock:
             self._pending[aid] = record
         self.module.bus.publish("approval.requested", {
@@ -83,6 +94,10 @@ class ApprovalBridge:
             "session_key": session_key,
             "tool": tool_name,
             "params_preview": params_preview,
+            "workspace_id": record["workspace_id"],
+            "workspace_session_id": record["workspace_session_id"],
+            "snapshot_id": record["snapshot_id"],
+            "message_id": record["message_id"],
         })
         got = evt.wait(timeout=_APPROVAL_TIMEOUT)
         with self._lock:
@@ -96,13 +111,23 @@ class ApprovalBridge:
         })
         return answer
 
-    def resolve(self, aid: str, answer: str) -> bool:
+    def resolve(self, aid: str, answer: str,
+                context: dict = None) -> bool:
+        """答复审批。context 可含 workspace_id/session_id/message_id/snapshot_id，
+        与 pending 记录不匹配时拒绝（防止跨消息/跨页面答复）。
+        """
         if answer not in ("y", "n", "a", "s"):
             return False
         with self._lock:
             record = self._pending.get(aid)
             if record is None:
                 return False
+            if context:
+                for key in ("workspace_id", "workspace_session_id",
+                            "snapshot_id", "message_id"):
+                    want = context.get(key)
+                    if want and record.get(key) and record.get(key) != want:
+                        return False
             record["answer"] = answer
             record["event"].set()
         return True
@@ -153,7 +178,7 @@ class Glue:
             self.apply_permission_mode(agent, mode)
         except ValueError:
             import logging
-            logging.getLogger("hello_agent.gateway").warning(
+            logging.getLogger("jk_agent.gateway").warning(
                 "invalid WebUI permission mode %r; falling back to ask", mode)
             self.apply_permission_mode(agent, "ask")
 
@@ -162,14 +187,15 @@ class Glue:
     def apply_permission_mode(self, agent, mode: str):
         """切换权限档位（运行期即时生效，set_rule 无缓存）"""
         from core.config_loader import load_config
-        from core.permission import ALLOW
+        from core.permission import ALLOW, DENY
 
         cfg_perm = load_config().get("permission", {})
         if mode == "ask":
             agent.permission._init_default_rules(cfg_perm)
             agent.ask_callback = (
-                lambda tool, params, _sk=agent: self.bridge.ask(
-                    self._session_key_of(agent), tool, params))
+                lambda tool, params, _a=agent: self.bridge.ask(
+                    self._session_key_of(_a), tool, params,
+                    metadata=getattr(_a, "_webui_metadata", None) or {}))
         elif mode == "allow":
             agent.permission._init_default_rules(cfg_perm)
             for t in _WRITE_TOOLS:
@@ -179,8 +205,18 @@ class Glue:
             for t in agent.tool_registry.list_tool_names():
                 agent.permission.set_rule(t, ALLOW)
             agent.ask_callback = None
+        elif mode == "readonly":
+            # Read-only is intentionally a strict allowlist: inspecting local
+            # files and using approved search tools are allowed; every write,
+            # execution, scheduling, process, or administration tool is denied.
+            for t in agent.tool_registry.list_tool_names():
+                agent.permission.set_rule(t, DENY)
+            for t in ("read", "grep", "glob", "search", "web_fetch"):
+                if agent.tool_registry.get_tool(t) is not None:
+                    agent.permission.set_rule(t, ALLOW)
+            agent.ask_callback = None
         else:
-            raise ValueError(f"未知权限档位: {mode}（ask/allow/unreviewed）")
+            raise ValueError("invalid permission mode; expected readonly/ask/allow/unreviewed")
 
     @staticmethod
     def _session_key_of(agent) -> str:
@@ -193,7 +229,7 @@ class Glue:
         entry = ctx["entry"]
         mode = arg.strip().lower()
         if not mode:
-            return "用法: /perm ask|allow|unreviewed"
+            return "用法: /perm readonly|ask|allow|unreviewed"
         try:
             self.apply_permission_mode(agent, mode)
         except ValueError as e:
@@ -232,13 +268,6 @@ class Glue:
         return self.plan_manager.create_preview(
             session_id, plan, source_prompt=text, title=(text[:120] or "执行方案"),
         )
-
-    def reject_plan(self, plan_id: str) -> bool:
-        plan = self.plan_manager.get(plan_id)
-        if plan is None or plan.status is not PlanStatus.AWAITING_APPROVAL:
-            return False
-        self.plan_manager.cancel(plan_id)
-        return True
 
     async def handle_plan_preview_command(self, arg: str, ctx: dict) -> str:
         """/plan-preview {text}: generate a typed Plan in the session executor."""

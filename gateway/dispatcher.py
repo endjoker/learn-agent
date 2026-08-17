@@ -17,7 +17,27 @@ from gateway.textutil import split_text, sanitize_error
 from core.runtime import (CancellationToken, RuntimeStore, TaskCancelled,
                           TaskEnvelope, TaskResult, TaskRuntime, TaskStatus)
 
-logger = logging.getLogger("hello_agent.gateway")
+logger = logging.getLogger("jk_agent.gateway")
+
+
+def _resolve_main_session_mcp_servers(names):
+    """把主会话配置里的 MCP 服务器名列表解析为完整 server 配置列表。
+
+    names=None 表示继承 config.json 的全部 MCP 服务器；空列表表示不使用 MCP。
+    """
+    if names is None:
+        return None
+    if not names:
+        return []
+    try:
+        from core.config_loader import load_config
+        cfg = load_config()
+        servers = cfg.get("mcp", {}).get("servers", []) or []
+    except Exception as exc:
+        logger.warning("读取 MCP 配置失败: %s", exc)
+        return []
+    by_name = {s.get("name"): s for s in servers if isinstance(s, dict)}
+    return [by_name[name] for name in names if name in by_name]
 
 
 _SCHEDULER_ADMIN_TOOLS = frozenset({
@@ -608,14 +628,42 @@ class Dispatcher:
             initializers = list(self._agent_initializers)
 
             def _create():
-                agent = create_gateway_agent(
-                    session_key=entry.session_key,
-                    model=cfg.get("model", ""),
-                    max_steps=cfg.get("max_steps", 100),
-                    permission_mode=cfg.get("permission_mode", "allow"),
-                    quiet=cfg.get("quiet", True),
-                    auto_approve_plan=cfg.get("auto_approve_plan", True),
-                )
+                # Phase 4：工作区会话使用快照冻结的运行时上下文/模型/权限/MCP
+                if getattr(entry, "runtime_context", None) is not None:
+                    agent = create_gateway_agent(
+                        session_key=entry.session_key,
+                        model=getattr(entry, "runtime_model", "") or cfg.get("model", ""),
+                        max_steps=getattr(entry, "runtime_max_steps", None)
+                                 or cfg.get("max_steps", 100),
+                        permission_mode=getattr(entry, "runtime_permission_mode", "")
+                                        or cfg.get("permission_mode", "allow"),
+                        quiet=cfg.get("quiet", True),
+                        auto_approve_plan=cfg.get("auto_approve_plan", True),
+                        runtime_context=entry.runtime_context,
+                        mcp_servers=getattr(entry, "runtime_mcp_servers", None),
+                        profile_prompt=getattr(entry, "runtime_profile_prompt", None),
+                        allowed_tools=getattr(entry, "runtime_allowed_tools", None),
+                        allowed_skills=getattr(entry, "runtime_allowed_skills", None),
+                        reasoning_level=(None if getattr(entry, "runtime_reasoning_level", "inherit") == "inherit"
+                                         else getattr(entry, "runtime_reasoning_level", None)),
+                    )
+                else:
+                    # 所有非工作区会话（WebUI 主会话/新建 WebUI 会话/飞书等）
+                    # 使用同一份默认能力子集；空值（缺省/null）继承全部。
+                    main_caps = self.agent_config.get("main_session_caps") or {}
+                    mcp_configs = _resolve_main_session_mcp_servers(
+                        main_caps.get("mcp_servers")) if main_caps else None
+                    agent = create_gateway_agent(
+                        session_key=entry.session_key,
+                        model=cfg.get("model", ""),
+                        max_steps=cfg.get("max_steps", 100),
+                        permission_mode=cfg.get("permission_mode", "allow"),
+                        quiet=cfg.get("quiet", True),
+                        auto_approve_plan=cfg.get("auto_approve_plan", True),
+                        mcp_servers=mcp_configs,
+                        allowed_tools=main_caps.get("tools") if main_caps else None,
+                        allowed_skills=main_caps.get("skills") if main_caps else None,
+                    )
                 for cb in initializers:
                     try:
                         cb(agent, entry)

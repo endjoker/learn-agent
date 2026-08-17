@@ -16,11 +16,10 @@
 
 import logging
 import sys
-from typing import List, Dict
 
 
 # 创建专用 logger
-logger = logging.getLogger('hello_agent')
+logger = logging.getLogger('jk_agent')
 
 
 def setup_logging(debug: bool = False, log_file: str = None):
@@ -86,15 +85,8 @@ def set_debug(enabled: bool):
                 handler.setLevel(logging.INFO)
 
 
-def is_debug() -> bool:
-    """当前是否开启调试模式"""
-    return logger.level == logging.DEBUG
-
-
 # 截断常量（如需完整内容，可临时调大这些值）
-_MAX_MSG_CHARS = 5000    # 单条消息最大显示字符数
 _MAX_LLM_CHARS = 6000    # LLM 响应最大显示字符数
-_MAX_TOOL_CHARS = 4000   # 工具返回结果最大显示字符数
 
 
 def _truncate(text: str, max_chars: int, label: str = "内容") -> str:
@@ -108,33 +100,6 @@ def _truncate(text: str, max_chars: int, label: str = "内容") -> str:
 # 调试日志函数
 # ============================================================
 
-def log_messages(step: int, messages: List[Dict], title: str = 'Agent -> LLM 消息'):
-    """打印发送给 LLM 的完整消息列表"""
-    if not logger.isEnabledFor(logging.DEBUG):
-        return
-
-    total_chars = 0
-    logger.debug(f'=== 第 {step} 步 | {title} ===')
-
-    for i, msg in enumerate(messages):
-        role = msg.get('role', '?')
-        name = msg.get('name', '')
-        content = msg.get('content', '')
-        content_len = len(content)
-        total_chars += content_len
-
-        label = f'  [{i}] {role.upper()}'
-        if name:
-            label += f' (name={name})'
-        logger.debug(f'{label} ({content_len} 字符)')
-
-        display = _truncate(content, _MAX_MSG_CHARS, "消息")
-        for line in display.split('\n'):
-            logger.debug(f'    | {line}')
-
-    logger.debug(f'=== 共 {len(messages)} 条消息，合计 {total_chars} 字符 ===')
-
-
 def log_llm_response(step: int, response: str, title: str = 'LLM -> Agent 响应'):
     """打印 LLM 返回的原始响应"""
     if not logger.isEnabledFor(logging.DEBUG):
@@ -146,39 +111,6 @@ def log_llm_response(step: int, response: str, title: str = 'LLM -> Agent 响应
         logger.debug(f'  {line}')
 
 
-def log_tool_call(step: int, tool_name: str, params: str):
-    """打印工具调用信息"""
-    if not logger.isEnabledFor(logging.DEBUG):
-        return
-
-    logger.debug(f'=== 第 {step} 步 | 工具调用 -> {tool_name} ===')
-    logger.debug(f'  参数: {params}')
-
-
-def log_tool_result(step: int, tool_name: str, result: str):
-    """打印工具返回结果"""
-    if not logger.isEnabledFor(logging.DEBUG):
-        return
-
-    logger.debug(f'=== 第 {step} 步 | 工具返回 <- {tool_name} ({len(result)} 字符) ===')
-    display = _truncate(result, _MAX_TOOL_CHARS, "工具返回")
-    for line in display.split('\n'):
-        logger.debug(f'  {line}')
-
-
-def log_separator():
-    """打印分隔线"""
-    if not logger.isEnabledFor(logging.DEBUG):
-        return
-    logger.debug('=' * 60)
-
-
 def log_info(message: str):
     """打印普通调试信息"""
     logger.debug(message)
-
-
-def enable_with_agent(name: str = 'Agent'):
-    """告知用户调试模式已开启"""
-    if is_debug():
-        logger.debug(f'调试模式已开启 - 将显示 {name} 与 LLM 的完整通信')

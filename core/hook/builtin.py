@@ -16,7 +16,7 @@ import threading
 
 from .events import HookContext, HookEvent, HookResult, Decision
 
-_hook_logger = logging.getLogger("hello_agent.hook.audit")
+_hook_logger = logging.getLogger("jk_agent.hook.audit")
 
 
 # ================================================================
@@ -26,7 +26,7 @@ _hook_logger = logging.getLogger("hello_agent.hook.audit")
 def audit_logger(ctx: HookContext) -> HookResult:
     """POST_TOOL / DENIED 审计日志。
 
-    把工具调用和拦截事件写入 log/hook-audit.log（走 hello_agent.hook.audit logger）。
+    把工具调用和拦截事件写入 log/hook-audit.log（走 jk_agent.hook.audit logger）。
     可注册到 post_tool + denied 事件。
     """
     p = ctx.payload or {}

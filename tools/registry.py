@@ -18,7 +18,32 @@ from typing import Dict, List, Optional
 from .base_tool import BaseTool
 from core.tool_schema import ToolNameCodec, validate_arguments
 
-logger = logging.getLogger("hello_agent")
+logger = logging.getLogger("jk_agent")
+
+# 系统保留工具：不出现在用户可选 Catalog（Phase 2，设计 R3）
+# 这些是 Agent 内部必需能力，用户不应在 Profile 中显式选择。
+SYSTEM_RESERVED_TOOLS = frozenset({
+    "create_skill",
+    "notes",
+    "memory_search",
+    "memory_update",
+    "cron_add_job",
+    "cron_delete_job",
+    "cron_run_job",
+    "proc_start",
+    "proc_send",
+    "proc_read",
+    "proc_list",
+    "proc_stop",
+})
+
+# 工具风险标记（供 Catalog 展示；实际执行仍由 SecurityGate 拦截）
+_TOOL_RISK = {
+    "read": "low", "grep": "low", "glob": "low", "search": "low",
+    "web_fetch": "low", "datetime": "low", "calculate": "low",
+    "write": "medium", "edit": "medium", "file_mgr": "medium",
+    "bash": "high", "python": "high", "http": "medium",
+}
 
 
 class ToolRegistry:
@@ -45,6 +70,7 @@ class ToolRegistry:
         self._tools: Dict[str, BaseTool] = {}
         self._skill_tool_names: set = set()  # 技能工具名称（分开展示）
         self._mcp_tool_names: set = set()    # MCP 工具名称（分开展示）
+        self._active_tools: Optional[set] = None  # Phase 4 能力子集；None=全部
 
     def register_skill_tool(self, tool: BaseTool) -> "ToolRegistry":
         """注册技能工具（单独追踪，与普通工具分开展示）"""
@@ -140,6 +166,8 @@ class ToolRegistry:
         mapping: dict[str, str] = {}
         tools: list[dict] = []
         for tool in self.list_tools():
+            if not self._is_active(tool.name):
+                continue
             provider_name = ToolNameCodec.encode(tool.name)
             mapping[provider_name] = tool.name
             tools.append({"type": "function", "function": {
@@ -160,6 +188,63 @@ class ToolRegistry:
     def list_tool_names(self) -> List[str]:
         """列出所有已注册的工具名（供模糊匹配等场景使用）"""
         return list(self._tools.keys())
+
+    def get_catalog(self) -> List[dict]:
+        """用户可选工具 Catalog（Phase 2）。
+
+        排除系统保留工具（create_skill/memory_*/cron_*/proc_*）与
+        Skill/MCP 工具（它们有单独区域）。
+        """
+        out = []
+        for name, tool in self._tools.items():
+            if name in SYSTEM_RESERVED_TOOLS:
+                continue
+            if name in self._skill_tool_names or name in self._mcp_tool_names:
+                continue
+            if not self._is_active(name):
+                continue
+            out.append({
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+                "source": "builtin",
+                "risk": _TOOL_RISK.get(tool.name, "medium"),
+                "available": True,
+            })
+        return out
+
+    def get_descriptions_for(self, names: List[str]) -> str:
+        """为指定工具子集生成文本描述（Prompt 预览/运行共用）。
+
+        未选/系统保留工具不出现；名称未知时忽略。
+        """
+        selected = [n for n in (names or []) if n in self._tools
+                    and n not in SYSTEM_RESERVED_TOOLS]
+        if not selected:
+            return "（当前没有可用工具）"
+        parts = []
+        for name in selected:
+            tool = self._tools[name]
+            params_desc = []
+            props = tool.parameters.get("properties", {})
+            required = tool.parameters.get("required", [])
+            for pname, pinfo in props.items():
+                req_mark = "（必填）" if pname in required else "（可选）"
+                ptype = pinfo.get("type", "string")
+                pdesc = pinfo.get("description", "")
+                params_desc.append(f"      - {pname} ({ptype}){req_mark}: {pdesc}")
+            param_str = "\n".join(params_desc) if params_desc else "      无参数"
+            parts.append(
+                f"  \u25b6 {tool.name}\n"
+                f"    描述: {tool.description}\n"
+                f"    参数:\n{param_str}\n"
+            )
+        return "\n".join(parts)
+
+    def get_available_names(self, names: List[str]) -> List[str]:
+        """过滤出实际注册且非系统保留的工具名（运行装配用）。"""
+        return [n for n in (names or [])
+                if n in self._tools and n not in SYSTEM_RESERVED_TOOLS]
 
     def remove_tool(self, name: str) -> bool:
         """
@@ -187,6 +272,7 @@ class ToolRegistry:
         tools_to_show = [
             t for n, t in self._tools.items()
             if n not in self._skill_tool_names and n not in self._mcp_tool_names
+            and self._is_active(n)
         ]
 
         if not tools_to_show:
@@ -230,7 +316,8 @@ class ToolRegistry:
         返回:
             OpenAI tools 参数格式的列表
         """
-        return [tool.to_openai_tool_format() for tool in self._tools.values()]
+        return [tool.to_openai_tool_format()
+                for tool in self._tools.values() if self._is_active(tool.name)]
 
     def get_skill_tool_descriptions(self) -> str:
         """仅生成技能工具的文本描述"""
@@ -293,6 +380,21 @@ class ToolRegistry:
     def clear(self):
         """清空所有工具"""
         self._tools.clear()
+
+    def set_active_tools(self, names: Optional[List[str]]) -> None:
+        """Phase 4：设置用户可选工具子集。
+
+        None / 未调用 = 全部工具；设置后 get_provider_tools / get_tool_descriptions
+        / get_catalog 三方一致过滤。系统保留工具恒为 active。
+        """
+        self._active_tools = set(names) if names is not None else None
+
+    def _is_active(self, name: str) -> bool:
+        if self._active_tools is None:
+            return True
+        if name in SYSTEM_RESERVED_TOOLS:
+            return True
+        return name in self._active_tools
 
     def __len__(self) -> int:
         return len(self._tools)

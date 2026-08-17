@@ -5,7 +5,7 @@ System Prompt 构建器 —— 从 prompt/ 目录读取引导文件 + 代码固�
 使用方式：
     from core.system_prompt import SystemPrompt
 
-    builder = SystemPrompt(name="helloworld agent")
+    builder = SystemPrompt(name="JKagent")
     builder.add_session_instruction("本次对话请使用英文回复")
     prompt = builder.build(tool_descs="...")
 
@@ -30,7 +30,7 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
-logger = logging.getLogger("hello_agent")
+logger = logging.getLogger("jk_agent")
 
 # ================================================================
 # 代码内嵌默认值（引导文件缺失时的 fallback）
@@ -103,14 +103,20 @@ class SystemPrompt:
 
 【操作系统】
 {os_name}
-{agent_md_section}{memory_md_section}{session_instructions}
+{agent_md_section}{memory_md_section}{memory_storage_section}{session_instructions}
 </SYSTEM_DYNAMIC_CONTEXT>"""
 
-    def __init__(self, name: str = "helloworld agent"):
+
+    def __init__(self, name: str = "JKagent"):
         self.name = name
         self._session_instructions: list[str] = []
         self._project_root: Optional[str] = None
+        self._framework_prompt_root: Optional[str] = None
+        self._project_prompt_root: Optional[str] = None
         self._workspace: Optional[str] = None
+        self._agent_profile_prompt: Optional[str] = None
+        self._memory_path: Optional[str] = None
+        self._memory_instruction: Optional[str] = None
         # 截断配置（从 config.json 的 prompt 段读取）
         self._max_chars_per_file = 8000
         self._max_chars_total = 32000
@@ -118,6 +124,140 @@ class SystemPrompt:
         self._truncation_warned = False
         self._load_truncation_config()
 
+    # ================================================================
+    # 公开方法
+    # ================================================================
+
+    def add_session_instruction(self, instruction: str) -> None:
+        """添加本轮会话的额外指令，会出现在动态区底部。"""
+        if instruction and instruction.strip():
+            self._session_instructions.append(instruction.strip())
+
+    def set_project_root(self, path: str) -> None:
+        """设置项目根目录路径（兼容入口，等价 set_project_prompt_root）。
+
+        保留原语义：项目 prompt/ 目录与工作目录都锚定到该根。
+        """
+        if path:
+            self._project_root = str(path)
+            self._project_prompt_root = str(path)
+
+    def set_workspace(self, path: str) -> None:
+        """设置工作目录路径（用于动态区声明 + 工具操作边界）。"""
+        self._workspace = str(path)
+
+    def set_framework_prompt_root(self, path: str) -> None:
+        """设置框架级 prompt/ 目录（默认引导文件兜底来源）。"""
+        self._framework_prompt_root = str(path)
+
+    def set_project_prompt_root(self, path: str) -> None:
+        """设置项目级 prompt/ 目录（优先来源）。"""
+        self._project_prompt_root = str(path)
+
+    def set_runtime_context(self, *, framework_root=None, project_root=None,
+                            working_directory=None) -> None:
+        """统一设置三目录运行上下文（Phase 0 WorkspaceRuntimeContext 注入）。"""
+        if framework_root:
+            self._framework_prompt_root = str(framework_root)
+        if project_root:
+            self._project_root = str(project_root)
+            self._project_prompt_root = str(project_root)
+        if working_directory:
+            self._workspace = str(working_directory)
+
+    def set_agent_profile_prompt(self, text: str) -> None:
+        """设置 Agent Profile 的 System Prompt 文本（智能体编辑预览/运行用）。"""
+        self._agent_profile_prompt = text.strip() if text else None
+
+    def set_memory_context(self, memory_path: Optional[str] = None,
+                          instruction: Optional[str] = None) -> None:
+        """设置长期记忆上下文（工作区模式注入记忆路径与优先搜索指令）。"""
+        if memory_path:
+            self._memory_path = str(memory_path)
+        if instruction:
+            self._memory_instruction = instruction.strip()
+
+    def build(self, tool_descs: str, skill_descs: str = "", mcp_descs: str = "") -> str:
+        """构建完整的 System Prompt。"""
+        static = self._build_static(tool_descs, skill_descs, mcp_descs)
+        dynamic = self._build_dynamic()
+        prompt = static + "\n\n" + dynamic
+
+        # 缓存边界日志 + token 估算
+        total_chars = len(prompt)
+        static_chars = len(static)
+        est_tokens = total_chars // 4  # 粗略估算：~4 字符/token
+        logger.debug(
+            f"[PROMPT] total={total_chars} chars (~{est_tokens} tokens) | "
+            f"static(cached)={static_chars} | dynamic={total_chars - static_chars}"
+        )
+        if total_chars > self._max_chars_total:
+            logger.warning(
+                f"[PROMPT] 提示词总量 {total_chars} 超过上限 {self._max_chars_total}，"
+                f"建议精简引导文件"
+            )
+
+        return prompt
+
+    def build_sections(self, tool_descs: str, skill_descs: str = "",
+                       mcp_descs: str = "") -> list[dict]:
+        """分区构建 System Prompt（Phase 2 Prompt 预览/运行共用核心逻辑）。
+
+        返回有序 section 列表：
+          without an Agent Profile: FRAMEWORK_IDENTITY / TOOL_POLICY / BUILTIN_TOOLS /
+          MCP_TOOLS / SKILLS / FRAMEWORK_RULES; with an Agent Profile: AGENT_PROFILE /
+          TOOL_POLICY / BUILTIN_TOOLS / MCP_TOOLS / SKILLS / FRAMEWORK_RULES
+        每个 section: {"name": str, "content": str, "chars": int,
+                       "estimated_tokens": int}
+        """
+        sections = []
+        soul = self._load_prompt_file("SOUL.md") or _DEFAULT_SOUL.format(name=self.name)
+        tools_md = self._load_prompt_file("TOOLS.md")
+        agent_md = self._load_prompt_file("AGENT.md")
+
+        def _add(name, content):
+            if content is None:
+                content = ""
+            sections.append({
+                "name": name,
+                "content": content,
+                "chars": len(content),
+                "estimated_tokens": _estimate_tokens(content),
+            })
+
+        # 1. 框架身份（SOUL.md / 默认人格）
+        # A complete Agent Profile owns its role and behavioral identity. Do not
+        # prepend SOUL.md in that case: the two prompts otherwise duplicate or
+        # conflict in both preview and runtime output.
+        if self._agent_profile_prompt:
+            _add("AGENT_PROFILE", self._agent_profile_prompt)
+        else:
+            _add("FRAMEWORK_IDENTITY", soul)
+        _add("TOOL_POLICY", tools_md or _DEFAULT_TOOLS)
+        # 4. 内置工具描述
+        builtin = f"【内置工具】\n{tool_descs}" if tool_descs else "【内置工具】\n（当前没有可用工具）"
+        _add("BUILTIN_TOOLS", builtin)
+        # 5. MCP 工具描述
+        mcp = f"【MCP 工具】\n{mcp_descs}" if mcp_descs else "【MCP 工具】\n（当前没有可用 MCP 工具）"
+        _add("MCP_TOOLS", mcp)
+        # 6. 技能描述
+        skill = f"【可用技能】\n{skill_descs}" if skill_descs else "【可用技能】\n（当前没有可用技能）"
+        _add("SKILLS", skill)
+        # 7. 框架固定规则
+        _add("FRAMEWORK_RULES", _NATIVE_TOOL_RULES)
+        # 8. 项目行为准则（AGENT.md）并入动态上下文声明
+        dynamic_notice = ""
+        if agent_md:
+            dynamic_notice = f"【项目行为准则（AGENT.md）】\n{agent_md}"
+        _add("PROJECT_CONTEXT", dynamic_notice)
+        if self._memory_path:
+            memory_section = (
+                "【工作区长期记忆】\n"
+                f"- 存储路径：{self._memory_path}\n"
+                f"- {self._memory_instruction or '当用户询问与当前项目相关的问题时，优先调用 memory_search 检索本工作区长期记忆，再作答。'}"
+            )
+            _add("WORKSPACE_MEMORY", memory_section)
+        return sections
     # ================================================================
     # 公开方法
     # ================================================================
@@ -166,14 +306,18 @@ class SystemPrompt:
         parts = []
 
         # 1. 身份 + 人格（从 prompt/SOUL.md 读取，缺失用默认值）
-        soul = self._load_prompt_file("SOUL.md")
-        if soul:
-            soul = soul.replace("{name}", self.name)
-            parts.append(soul)
+        # Agent Profile owns the identity for profile-backed sessions. The
+        # framework SOUL.md identity remains only for base sessions with no
+        # profile, preventing duplicate identity instructions at runtime.
+        if self._agent_profile_prompt:
+            parts.append(f"[Agent Profile]\n{self._agent_profile_prompt}")
         else:
-            parts.append(_DEFAULT_SOUL.replace("{name}", self.name))
+            soul = self._load_prompt_file("SOUL.md")
+            if soul:
+                parts.append(soul.replace("{name}", self.name))
+            else:
+                parts.append(_DEFAULT_SOUL.replace("{name}", self.name))
 
-        # 2. 工具使用规则（从 prompt/TOOLS.md 读取静态部分）
         tools_static = self._load_prompt_file("TOOLS.md")
         if tools_static:
             parts.append(tools_static)
@@ -201,9 +345,14 @@ class SystemPrompt:
         """组装动态区：引导文件说明 + AGENT.md + MEMORY.md + 运行时信息"""
         os_name = self._get_os_name()
         today = date.today().strftime("%Y-%m-%d")
-        workspace = self._workspace or os.getcwd()
+        # 动态区使用显式 working_directory；无显式值时才回退到项目根/框架根，
+        # 绝不依赖进程 CWD（Phase 0：多工作区并发禁止 os.chdir 污染）。
+        workspace = (self._workspace
+                     or (self._project_root if self._project_root else None)
+                     or (self._framework_prompt_root if self._framework_prompt_root else None)
+                     or os.getcwd())
 
-        # AGENT.md（从 prompt/ 目录读取）
+        # AGENT.md（从 prompt/ 目录读取，项目优先、框架兜底）
         agent_md = self._load_prompt_file("AGENT.md")
         agent_md_section = f"\n【项目行为准则（AGENT.md）】\n{agent_md}\n" if agent_md else ""
 
@@ -218,6 +367,14 @@ class SystemPrompt:
         else:
             session_section = ""
 
+        memory_storage_section = ""
+        if self._memory_path:
+            memory_storage_section = (
+                "\n【工作区长期记忆】\n"
+                f"- 存储路径：{self._memory_path}\n"
+                f"- {self._memory_instruction or '当用户询问与当前项目相关的问题时，优先调用 memory_search 检索本工作区长期记忆，再作答。'}\n"
+            )
+
         return self.DYNAMIC_TEMPLATE.format(
             bootstrap_notice=_BOOTSTRAP_NOTICE,
             workspace=workspace,
@@ -225,6 +382,7 @@ class SystemPrompt:
             os_name=os_name,
             agent_md_section=agent_md_section,
             memory_md_section=memory_md_section,
+            memory_storage_section=memory_storage_section,
             session_instructions=session_section,
         )
 
@@ -235,17 +393,24 @@ class SystemPrompt:
     def _load_prompt_file(self, filename: str) -> Optional[str]:
         """从 prompt/ 目录读取引导文件，超限时截断。
 
-        查找顺序：
-          1. {project_root}/prompt/{filename}
-          2. {cwd}/prompt/{filename}
+        查找顺序（Phase 0 起不再依赖进程 CWD）：
+          1. {project_prompt_root}/prompt/{filename}   （项目 prompt/ 优先）
+          2. {framework_prompt_root}/prompt/{filename} （框架 prompt/ 兜底）
+          3. 兼容：旧 set_project_root 设置的根
 
         文件不存在 → 返回 None（调用方使用代码内嵌默认值）。
         超过 _max_chars_per_file → 尾截断 + 追加告警。
         """
         search_paths = []
-        if self._project_root:
-            search_paths.append(Path(self._project_root) / "prompt" / filename)
-        search_paths.append(Path.cwd() / "prompt" / filename)
+        roots = []
+        if self._project_prompt_root:
+            roots.append(self._project_prompt_root)
+        elif self._project_root:
+            roots.append(self._project_root)
+        if self._framework_prompt_root:
+            roots.append(self._framework_prompt_root)
+        for root in roots:
+            search_paths.append(Path(root) / "prompt" / filename)
 
         for md_path in search_paths:
             if md_path.exists() and md_path.is_file():
@@ -267,6 +432,9 @@ class SystemPrompt:
                 except (OSError, UnicodeDecodeError) as e:
                     logger.warning(f"读取引导文件失败 {md_path}: {e}")
         return None
+    # ================================================================
+    # prompt/ 引导文件加载
+    # ================================================================
 
     # ================================================================
     # 工具方法
@@ -288,3 +456,12 @@ class SystemPrompt:
             self._truncation_warning = prompt_cfg.get("truncation_warning", "once")
         except Exception:
             pass  # config 不可用时用默认值
+
+
+def _estimate_tokens(text: str) -> int:
+    """粗略估算 token 数（与 core.message_store._estimate_tokens 一致）。"""
+    if not text:
+        return 0
+    chinese = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff')
+    other = len(text) - chinese
+    return int(chinese / 1.5 + other / 4)

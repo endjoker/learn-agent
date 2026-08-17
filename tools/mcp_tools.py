@@ -24,7 +24,7 @@ from typing import Any, Dict, Optional
 
 from .base_tool import BaseTool
 
-logger = logging.getLogger('hello_agent')
+logger = logging.getLogger('jk_agent')
 
 
 class MCPTool(BaseTool):

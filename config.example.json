@@ -204,7 +204,12 @@
     "webui": {
       "allow_non_loopback": false,
       "allowed_ips": [],
-      "auth_token": ""
+      "auth_token": "",
+      "main_session": {
+        "tools": null,
+        "skills": null,
+        "mcp_servers": null
+      }
     }
   },
   "sandbox": {
@@ -319,6 +324,23 @@
       "downloads",
       "tmp",
       "output"
-    ]
+    ],
+    "allow_unc": false,
+    "list_limit": 50,
+    "list_limit_max": 200,
+    "snapshot_retention_days": 30,
+    "snapshot_retention_per_workspace": 10,
+    "max_json_body_bytes": 1048576,
+    "path_confirmation_required": true,
+    "sensitive_file_patterns": [
+      ".env",
+      ".git/config",
+      "id_rsa",
+      "id_ed25519",
+      "credentials.json",
+      "*.pem",
+      "*.key"
+    ],
+    "block_system_paths": true
   }
 }

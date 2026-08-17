@@ -12,7 +12,7 @@ import logging
 
 from aiohttp import web
 
-logger = logging.getLogger("hello_agent.gateway")
+logger = logging.getLogger("jk_agent.gateway")
 
 
 def register_routes(app: web.Application, module):

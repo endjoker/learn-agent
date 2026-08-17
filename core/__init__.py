@@ -9,12 +9,12 @@ core 包 —— Agent 核心组件
 - token_counter.py Token 计数
 """
 
-from .llm_client import HelloAgentsLLM
+from .llm_client import JKAgentLLM
 from .system_prompt import SystemPrompt
 from .mcp_client import MCPClientManager, MCPConnection
 
 __all__ = [
-    "HelloAgentsLLM",
+    "JKAgentLLM",
     "SystemPrompt",
     "MCPClientManager",
     "MCPConnection",

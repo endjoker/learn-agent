@@ -14,7 +14,7 @@ from openai import OpenAI
 
 from .base import ChatResponse, ProtocolAdapter, ProviderStreamEvent, ProviderToolCall
 
-logger = logging.getLogger('hello_agent')
+logger = logging.getLogger('jk_agent')
 
 
 class OpenAIAdapter(ProtocolAdapter):
@@ -35,7 +35,7 @@ class OpenAIAdapter(ProtocolAdapter):
             timeout=timeout,
             # 部分中转站 WAF 会拦截 SDK 默认的 "OpenAI/Python" User-Agent，
             # 返回 403 "Your request was blocked."；改用自定义 UA 规避。
-            default_headers={"User-Agent": "hello-agent"},
+            default_headers={"User-Agent": "jkagent"},
         )
 
     def _build_request_kwargs(self, model: str, messages: List[Dict], *,

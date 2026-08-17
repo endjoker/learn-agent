@@ -16,7 +16,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger("hello_agent")
+logger = logging.getLogger("jk_agent")
 
 # 扩展名 → MIME 映射（IMAGE_EXTENSIONS 由其派生，保持单一事实来源）
 # 注意：不含 .svg —— OpenAI/Anthropic/Gemini 的 vision 接口均不接受 SVG，

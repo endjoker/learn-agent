@@ -7,7 +7,9 @@ import copy
 import logging
 from typing import Any
 
-logger = logging.getLogger("hello_agent")
+from core.config_loader import _deep_merge
+
+logger = logging.getLogger("jk_agent")
 
 # 默认配置（config.json 无 sandbox section 时使用）
 _DEFAULT_CONFIG = {
@@ -88,16 +90,6 @@ def load_config() -> dict[str, Any]:
         pass
 
     return _DEFAULT_CONFIG
-
-
-def _deep_merge(base: dict, override: dict) -> dict:
-    """递归合并字典"""
-    for key, value in override.items():
-        if key in base and isinstance(base[key], dict) and isinstance(value, dict):
-            base[key] = _deep_merge(base[key], value)
-        else:
-            base[key] = value
-    return base
 
 
 def get_profile(config: dict, name: str) -> dict | None:

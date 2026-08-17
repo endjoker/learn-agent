@@ -29,7 +29,7 @@ from croniter import croniter
 from core.config_loader import load_config, is_enabled
 from gateway.channels.base import Channel, InboundMessage
 
-logger = logging.getLogger("hello_agent.gateway")
+logger = logging.getLogger("jk_agent.gateway")
 
 _STATE_FILE = Path(__file__).parent / "scheduler_state.json"
 _PREVIEW_CHARS = 120  # state/history 中回复预览截断长度
@@ -125,14 +125,6 @@ def delete_job(name: str) -> str:
     if src:
         src.reload_config()
     return f"✅ 已删除定时任务: {name}"
-
-
-def get_job(name: str) -> Optional[dict]:
-    """查看单个任务"""
-    src = get_scheduler()
-    if src is None:
-        return None
-    return src.job_by_name(name)
 
 
 def run_job(name: str) -> str:

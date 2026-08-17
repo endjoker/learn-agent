@@ -16,7 +16,7 @@ from typing import Callable
 
 from .events import HookContext, HookResult, Decision, _coerce
 
-logger = logging.getLogger("hello_agent.hook")
+logger = logging.getLogger("jk_agent.hook")
 
 
 # ================================================================
@@ -81,7 +81,6 @@ def _parse_stdout(text: str) -> HookResult:
         decision=Decision(obj.get("decision", "continue")),
         reason=obj.get("reason", ""),
         data=obj.get("data"),
-        suppress=obj.get("suppress", False),
     )
 
 

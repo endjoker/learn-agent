@@ -10,7 +10,6 @@ init_wizard 与 WebUI ConfigService 共用：
 """
 
 import json
-import os
 import re
 import shutil
 from datetime import datetime
@@ -71,19 +70,13 @@ def backup_file(path: Optional[Path] = None,
 
 
 def write_config(path: Optional[Path], data: dict) -> None:
-    """原子写入：tmp → os.replace"""
+    """原子写入：tmp + fsync + os.replace（复用 core.atomic_io）"""
+    from core.atomic_io import atomic_write_bytes
     path = path or default_config_path()
-    tmp = path.parent / f"{path.name}.tmp"
+    content = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        os.replace(tmp, path)
+        atomic_write_bytes(path, content, prefix=f".{path.name}.")
     except OSError as e:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         raise OSError(f"写入 {path.name} 失败: {e}") from e
 
 

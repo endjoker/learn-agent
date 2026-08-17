@@ -21,8 +21,16 @@ from gateway.webui.glue import Glue
 from gateway.webui.config_service import ConfigService
 from gateway.plan_runtime import PlanRuntime
 from core.runtime import ArtifactStore
+from gateway.webui.workspace_store import (
+    AgentProfileStore,
+    RuntimeSnapshotStore,
+    WorkspaceDatabase,
+    WorkspaceSessionStore,
+    WorkspaceStore,
+)
+from gateway.webui.path_validator import PathValidator, default_validator
 
-logger = logging.getLogger("hello_agent.gateway")
+logger = logging.getLogger("jk_agent.gateway")
 
 STATIC_DIR = Path(__file__).parent / "static"
 _PROBE_INTERVAL = 30  # channel.status 探针周期（秒）
@@ -78,6 +86,23 @@ class WebUIModule:
         self._auth_token = str(self.config.get("auth_token") or "")
         self._allowed_networks = _parse_allowed_networks(
             self.config.get("allowed_ips", []))
+        # ---- Phase 1：Workspace 存储服务（共享同一个 runtime.db）----
+        self.workspace_db = None
+        self.workspace_store = None
+        self.profile_store = None
+        self.session_store = None
+        self.snapshot_store = None
+        if runtime_store is not None:
+            self.workspace_db = WorkspaceDatabase(runtime_store=runtime_store)
+            self.workspace_store = WorkspaceStore(self.workspace_db)
+            self.profile_store = AgentProfileStore(self.workspace_db)
+            self.session_store = WorkspaceSessionStore(self.workspace_db)
+            self.snapshot_store = RuntimeSnapshotStore(self.workspace_db)
+        ws_cfg = self.config.get("workspace", {})
+        self.path_validator = PathValidator(
+            allow_unc=bool(ws_cfg.get("allow_unc", False)),
+            block_system_paths=bool(ws_cfg.get("block_system_paths", True)),
+        )
         self.bus = EventBus()
         self.channel = WebuiChannel(self.bus)
         self._sse = SSEHandler(self.bus)
@@ -104,6 +129,8 @@ class WebUIModule:
         self.session_mgr.on_evicted.append(self._on_session_evicted)
         self._probe_task = asyncio.create_task(self._probe_loop())
         self._mcp_warm_task = asyncio.create_task(self._mcp_warm())
+        self._register_workspace_status_provider()
+        self._seed_system_profiles()
         logger.info("🖥️ WebUI 已启动（static: %s）", STATIC_DIR)
 
     async def recover_persisted_plans(self) -> None:
@@ -139,7 +166,7 @@ class WebUIModule:
         g = self.glue
         d = self.dispatcher
         d.add_command("/perm", g.handle_perm_command,
-                      "/perm ask|allow|unreviewed — 权限档位切换",
+                      "/perm readonly|ask|allow|unreviewed — 权限档位切换",
                       "[ask|allow|unreviewed]")
         d.add_command("/plan-preview", g.handle_plan_preview_command,
                       "", "", client_hint="plan-flow")
@@ -206,6 +233,38 @@ class WebUIModule:
 
     # ---------- 路由 ----------
 
+    def _seed_system_profiles(self):
+        """Phase 6：预置内置默认智能体模板（方案 7.1/7.2，幂等）。"""
+        if self.profile_store is None:
+            return
+        try:
+            added = self.profile_store.seed_system_profiles()
+            if added:
+                logger.info("预置内置智能体模板 %d 个", added)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("预置内置智能体失败: %s", exc)
+
+    def _register_workspace_status_provider(self):
+        """Phase 6：/api/status 聚合 Workspace 运行指标（只返回计数/健康，不含路径与秘密）。"""
+        def provider():
+            if self.workspace_store is None:
+                return {"enabled": False}
+            try:
+                pending_approvals = len(self.glue.bridge.list_pending())
+                return {
+                    "enabled": True,
+                    "workspaces": self.workspace_store.count(),
+                    "profiles": self.profile_store.count(),
+                    "active_sessions": sum(
+                        1 for w in self.workspace_store.list(status="active")
+                        if self.session_store is not None),
+                    "pending_approvals": pending_approvals,
+                    "schema_version": 9,
+                }
+            except Exception as exc:  # pragma: no cover
+                return {"enabled": True, "error": str(exc)}
+        self._status_providers["workspace"] = provider
+
     def register_routes(self, app: web.Application):
         app.middlewares.append(self._guard_middleware)
         app.router.add_get("/api/events", self._sse.handle)
@@ -224,6 +283,12 @@ class WebUIModule:
         # 定时任务端点（修 #6）
         from gateway.webui import api_scheduler
         api_scheduler.register_routes(app, self)
+        # 智能体编辑（Phase 2）
+        from gateway.webui import api_agents
+        api_agents.register_routes(app, self)
+        # 工作区管理（Phase 3）
+        from gateway.webui import api_workspace
+        api_workspace.register_routes(app, self)
         app.router.add_get("/", self._redirect_index)
         # /ui/ 显式返回 index.html（须在 add_static 之前注册；
         # aiohttp 的 show_index 是"目录列表"语义，不会自动给 index.html）

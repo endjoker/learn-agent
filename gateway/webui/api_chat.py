@@ -16,7 +16,7 @@ from core.plan import PlanStatus
 from gateway.dispatcher import Dispatcher
 from gateway.webui.glue import send_and_wait
 
-logger = logging.getLogger("hello_agent.gateway")
+logger = logging.getLogger("jk_agent.gateway")
 
 _BASE_MODES = [
     {"id": "chat", "label": "会话", "available": True},
@@ -238,8 +238,8 @@ def _make_perm_set(module):
         key = request.match_info["key"]
         body = await _body(request)
         mode = (body.get("mode") or "").strip().lower()
-        if mode not in ("ask", "allow", "unreviewed"):
-            return _err("mode 必须是 ask / allow / unreviewed")
+        if mode not in ("readonly", "ask", "allow", "unreviewed"):
+            return _err("mode 必须是 readonly / ask / allow / unreviewed")
         result = await send_and_wait(module, key, f"/perm {mode}", timeout=60)
         status = 200 if result["ok"] else 504
         return web.json_response(result, status=status)
@@ -516,9 +516,15 @@ def _make_approval_answer(module):
         answer = (body.get("answer") or "").strip().lower()
         if answer not in ("y", "n", "a", "s"):
             return _err("answer 必须是 y/n/a/s")
-        ok = module.glue.bridge.resolve(aid, answer)
+        context = {
+            "workspace_id": body.get("workspace_id") or "",
+            "workspace_session_id": body.get("workspace_session_id") or "",
+            "snapshot_id": body.get("snapshot_id") or "",
+            "message_id": body.get("message_id") or "",
+        }
+        ok = module.glue.bridge.resolve(aid, answer, context=context)
         if not ok:
-            return _err("审批不存在或已处理", 404)
+            return _err("审批不存在、已处理或归属不匹配", 404)
         return web.json_response({"ok": True, "id": aid, "answer": answer})
     return handler
 

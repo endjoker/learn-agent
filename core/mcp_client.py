@@ -29,7 +29,7 @@ import threading
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any
 
-logger = logging.getLogger('hello_agent.mcp')
+logger = logging.getLogger('jk_agent.mcp')
 
 
 # ============================================================
@@ -59,7 +59,7 @@ class _MCPLoopRunner:
     def __init__(self):
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
-            target=self._run, name="hello-agent-mcp-loop", daemon=True
+            target=self._run, name="jkagent-mcp-loop", daemon=True
         )
         self._thread.start()
 
@@ -84,18 +84,6 @@ class _MCPLoopRunner:
 def run_in_mcp_loop(coro, timeout: Optional[float] = None):
     """在 MCP 专用事件循环中运行协程（供同步代码调用）。"""
     return _MCPLoopRunner.get().run(coro, timeout=timeout)
-
-
-# ============================================================
-# 异常定义
-
-class MCPError(Exception):
-    """MCP 协议错误"""
-    def __init__(self, code: int, message: str, data: Any = None):
-        self.code = code
-        self.message = message
-        self.data = data
-        super().__init__(f"[{code}] {message}")
 
 
 # ============================================================
@@ -476,13 +464,6 @@ class MCPConnection:
         initialize() → discover_tools() / call_tool() / ... → close()
     """
 
-    # JSON-RPC 标准错误码
-    PARSE_ERROR = -32700
-    INVALID_REQUEST = -32600
-    METHOD_NOT_FOUND = -32601
-    INVALID_PARAMS = -32602
-    INTERNAL_ERROR = -32603
-
     def __init__(self, name: str, transport: MCPTransport):
         self.name = name                       # Server 名称（唯一标识）
         self._transport = transport             # 传输层实例
@@ -532,7 +513,7 @@ class MCPConnection:
                     "prompts": {"listChanged": True},
                 },
                 "clientInfo": {
-                    "name": "hello-agent",
+                    "name": "jkagent",
                     "version": "1.0.0",
                 },
             }
@@ -582,10 +563,6 @@ class MCPConnection:
     def is_initialized(self) -> bool:
         return self._initialized
 
-    @property
-    def capabilities(self) -> dict:
-        return self._capabilities
-
     # ============================================================
     # 工具发现与调用
 
@@ -632,22 +609,6 @@ class MCPConnection:
             }
 
         return response.get("result", {"content": [], "isError": False})
-
-    async def discover_resources(self) -> List[dict]:
-        """获取服务器资源列表（需服务端支持）"""
-        if not self._capabilities.get("resources"):
-            return []
-        response = await self._send_request("resources/list", {})
-        result = response.get("result", {})
-        return result.get("resources", [])
-
-    async def discover_prompts(self) -> List[dict]:
-        """获取提示词模板列表（需服务端支持）"""
-        if not self._capabilities.get("prompts"):
-            return []
-        response = await self._send_request("prompts/list", {})
-        result = response.get("result", {})
-        return result.get("prompts", [])
 
     # ============================================================
     # 内部方法

@@ -13,7 +13,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 
 # ================================================================
@@ -24,16 +24,12 @@ class HookEvent(str, Enum):
     """Hook 生命周期事件（str 枚举，方便 JSON 序列化 & 配置文件匹配）"""
     SESSION_START = "session_start"
     USER_PROMPT   = "user_prompt"
-    PRE_LLM       = "pre_llm"
-    POST_LLM      = "post_llm"
     PRE_TOOL      = "pre_tool"
     POST_TOOL     = "post_tool"
     NOTIFICATION  = "notification"
     DENIED        = "denied"
     STOP          = "stop"
-    SESSION_END   = "session_end"
     PLAN_APPROVED = "plan_approved"
-    TASK_COMPLETE = "task_complete"
 
 
 # ================================================================
@@ -54,7 +50,6 @@ class HookResult:
     decision: Decision = Decision.CONTINUE
     reason: str = ""
     data: dict | None = None   # MODIFY 时的改写数据
-    suppress: bool = False     # True 时不打印到控制台
 
 
 # ================================================================
@@ -72,11 +67,8 @@ class HookContext:
       notification:  {"tool_name": str, "params": dict, "message": str}
       denied:        {"tool_name": str, "reason": str, "level": str}
       stop:          {"answer": str, "step_count": int}
-      pre_llm:       {"step": int, "message_count": int, "total_tokens": int}
-      post_llm:      {"step": int, "response_head": str, "total_chars": int}
       plan_approved: {"plan": str, "tasks": list}
-      task_complete: {"task_id": int, "total": int, "result": str}
-      session_start / session_end: {}
+      session_start: {}
     """
     event: HookEvent
     agent_name: str = ""
@@ -111,7 +103,6 @@ def _coerce(out: Any) -> HookResult:
             decision=Decision(out.get("decision", "continue")),
             reason=out.get("reason", ""),
             data=out.get("data"),
-            suppress=out.get("suppress", False),
         )
     if isinstance(out, bool):
         return HookResult(Decision.ALLOW if out else Decision.BLOCK)

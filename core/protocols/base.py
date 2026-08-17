@@ -34,8 +34,6 @@ class ChatResponse:
     tool_calls: List[ProviderToolCall] = field(default_factory=list)
     finish_reason: str = "unknown"
     usage: Optional[Dict[str, int]] = None
-    raw_metadata: Optional[Dict] = None
-    """{"input_tokens": N, "output_tokens": M}"""
 
 
 @dataclass
@@ -114,7 +112,7 @@ class ProtocolAdapter(ABC):
         """Optional native tool-call stream.
 
         Adapters that do not implement this are handled by the non-streaming
-        native fallback in ``HelloAgentsLLM``; they must not fall back to a
+        native fallback in ``JKAgentLLM``; they must not fall back to a
         textual tool protocol.
         """
         raise NotImplementedError

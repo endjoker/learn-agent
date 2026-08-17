@@ -203,7 +203,7 @@ class Compressor:
     def __init__(self, llm, tail_n: int = _DEFAULT_TAIL_N):
         """
         参数:
-            llm: HelloAgentsLLM 实例（用于全量压缩）
+            llm: JKAgentLLM 实例（用于全量压缩）
             tail_n: 全量压缩时保留的尾部消息数
         """
         self._llm = llm

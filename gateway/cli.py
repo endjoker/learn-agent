@@ -11,7 +11,7 @@ Gateway CLI 入口 —— python agent.py gateway [子命令]
 import logging
 import sys
 
-logger = logging.getLogger("hello_agent.gateway")
+logger = logging.getLogger("jk_agent.gateway")
 
 
 def main(args: list[str], debug: bool = False) -> int:

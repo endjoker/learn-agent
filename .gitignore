@@ -36,6 +36,7 @@ sessions/
 
 # 记忆系统（自动生成的对话归档）
 memory/daily/
+memory/workspaces/
 memory/config.json
 
 # 日志文件（自动生成的调试日志）
@@ -44,6 +45,9 @@ log/
 .review_diff.patch
 
 .claude/
+
+# Gateway ?????????????
+.agent/
 
 # Gateway 凭据（微信 token 等）
 gateway/creds/

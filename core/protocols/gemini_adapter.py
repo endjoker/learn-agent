@@ -20,7 +20,7 @@ from google.genai import types
 
 from .base import ChatResponse, ProtocolAdapter
 
-logger = logging.getLogger('hello_agent')
+logger = logging.getLogger('jk_agent')
 
 
 class GeminiAdapter(ProtocolAdapter):

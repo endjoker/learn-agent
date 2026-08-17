@@ -21,7 +21,7 @@ from typing import List, Dict, Optional, Callable
 from .protocols import create_adapter
 from .protocols.base import ChatResponse, ProviderToolCall
 
-logger = logging.getLogger('hello_agent')
+logger = logging.getLogger('jk_agent')
 
 
 # ============================================================
@@ -158,7 +158,7 @@ def detect_context_length(model_name: Optional[str], default: int = 32768) -> in
 # LLM 客户端
 # ============================================================
 
-class HelloAgentsLLM:
+class JKAgentLLM:
     """
     大语言模型（LLM）客户端
 
@@ -557,10 +557,10 @@ class HelloAgentsLLM:
         prov = f" [{self.provider}]" if self.provider else ""
         proto = f" [{self._protocol}]"
         reasoning = f", reasoning={self.reasoning_level}"
-        return f"HelloAgentsLLM({mode}{prov}{proto}, model={self.model}, ctx={self.context_length}{reasoning})"
+        return f"JKAgentLLM({mode}{prov}{proto}, model={self.model}, ctx={self.context_length}{reasoning})"
 
     def __repr__(self) -> str:
-        return f"<HelloAgentsLLM type={self.llm_type} model='{self.model}'>"
+        return f"<JKAgentLLM type={self.llm_type} model='{self.model}'>"
 
 
 # ============================================================
@@ -588,7 +588,7 @@ if __name__ == "__main__":
 
     # 测试初始化
     try:
-        llm = HelloAgentsLLM()
+        llm = JKAgentLLM()
         print(f"\n  ✅ 当前: {llm}")
     except ValueError as e:
         print(f"\n  ⚠️  配置不完整: {e}")

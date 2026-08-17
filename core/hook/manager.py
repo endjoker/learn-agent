@@ -3,9 +3,9 @@
 Hook 管理器 — 注册 / 分发 / 配置加载 / 结果合并
 
 HookManager 是用户和 agent 的唯一交互入口：
-  - register()  / unregister()     — 代码注册 hook
-  - dispatch()                      — agent 在各事件点调用
-  - 便捷方法（run_*）                — agent 用，少写样板
+  - register()                  — 代码注册 hook
+  - dispatch()                  — agent 在各事件点调用
+  - 便捷方法（run_*）            — agent 用，少写样板
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from typing import Callable
 from .events import HookEvent, HookContext, HookResult, Decision
 from .hooks import BaseHook, PythonHook, CommandHook
 
-logger = logging.getLogger("hello_agent.hook")
+logger = logging.getLogger("jk_agent.hook")
 
 
 # ================================================================
@@ -173,18 +173,6 @@ class HookManager:
         self._hooks[event].append(_HookEntry(hook, pattern, priority))
         logger.debug(f"注册 hook: {event.value}={hook} matcher={matcher or '*'}"
                      f" priority={priority}")
-
-    def unregister(self, event: HookEvent, hook: BaseHook) -> bool:
-        """移除指定 hook 实例（按对象 identity）。"""
-        entries = self._hooks.get(event)
-        if not entries:
-            return False
-        for i, e in enumerate(entries):
-            if e.hook is hook:
-                entries.pop(i)
-                logger.debug(f"注销 hook: {event.value}={hook}")
-                return True
-        return False
 
     def bind_agent(self, agent_name: str, session_id: str) -> None:
         self._agent_name = agent_name

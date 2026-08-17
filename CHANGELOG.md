@@ -1,3 +1,16 @@
+## 2026-08-15 项目更名：hello-agent → JKagent
+
+**背景**：智能体正式命名为 JKagent，项目全局完成更名，同步更新代码、Prompt、前端与文档。
+
+### 更名范围
+
+- **默认智能体名称**：`helloworld agent` → `JKagent`（`create_agent()` / `SystemPrompt` / gateway 默认）
+- **LLM 客户端类**：`HelloAgentsLLM` → `JKAgentLLM`（含 `core.__init__` 导出与 repr）
+- **日志 logger**：`hello_agent` → `jk_agent`（含 `.gateway` / `.mcp` / `.hook` 等子 logger）
+- **内部标识**：线程名 / MCP clientInfo / User-Agent / localStorage key（`hello-agent.theme` → `jkagent.theme`）
+- **前端**：控制台标题与品牌改为 `JKagent`，样式注释同步
+- **文档**：README / GUIDE / 设计文档同步更名
+- 说明：目录名 `D:\project\hello-agent` 与运行期数据（sessions / scheduler_state / 日志）未改动
 # 更新日志
 
 ## 2026-07-29 多模态图片支持（新功能）+ 8 角度代码审查全量修复
@@ -630,3 +643,81 @@
 - `future.result()` 加 `try/except` 兜底，防止单个工具抛异常拖垮整个并发
 - 异步执行结果现在分 ✅ 成功 / ❌ 失败 显示汇总（如 "✅ 2 成功，❌ 1 失败"）
 - `_combine_results()` 合并结果带每个工具的 ✅/❌ 标记，LLM 能清楚识别哪个工具执行失败
+
+## 2026-08-14 工作区模块（Phase 0~6 实施）
+
+**背景**：按桌面《hello-agent-工作区模块详细设计方案.md》（V2.1）与
+`C:\Users\Administrator\Desktop\Phase` 全部 Phase 计划完成开发。
+工作区/智能体编辑为现有 Runtime 之上的上下文配置层，不另起执行链路。
+
+### Phase 0 — 无 chdir / 运行上下文
+
+- `create_agent()` 移除 `os.chdir()`，新增 `framework_root / agent_data_root /
+  project_root / working_directory / extra_workspace_roots / runtime_context`
+  显式三目录分离参数。
+- `core/system_prompt.py`：`set_framework_prompt_root / set_project_prompt_root /
+  set_runtime_context / set_agent_profile_prompt / build_sections`；`_load_prompt_file`
+  项目 prompt/ 优先、框架兜底，不再依赖进程 CWD。
+- `core/permission.py`：`PermissionChecker` 支持显式 `workspace` 与 `extra_workspaces`
+  （哨兵区分未传与显式空列表，工作区模式不回退全局 `["."]`）。
+- `gateway/agent_factory.py`：`create_gateway_agent` 支持 `runtime_context /
+  mcp_servers / profile_prompt / allowed_tools / allowed_skills`；
+  `is_workspace_session_key` + map 写操作 fail-fast。
+- 新增 `gateway/webui/workspace_models.py`（WorkspaceRuntimeContext + 领域模型）、
+  `code/adr/ADR-00 / ADR-01`、无 chdir 与上下文测试。
+
+### Phase 1 — 领域模型与存储
+
+- `core/runtime/sqlite_store.py`：SCHEMA_VERSION 8 → 9，新增 5 张工作区表
+  （workspaces / agent_profiles / workspace_sessions /
+  workspace_runtime_snapshots / agent_profile_versions），公开 `connection()`。
+- 新增 `gateway/webui/workspace_store.py`：WorkspaceStore / AgentProfileStore /
+  WorkspaceSessionStore / RuntimeSnapshotStore，乐观锁、软删除、外键、组合事务、
+  异常映射（404/409/400/503）。
+- 工作区会话唯一事实源为 SQLite，绝不写 `sessions_map.json`。
+- `config.example.json` 新增 `workspace` 配置段默认值。
+
+### Phase 2 — 智能体编辑
+
+- `tools/registry.py`：`get_catalog / get_descriptions_for / get_available_names /
+  set_active_tools`（系统保留工具不可选）。
+- `skills/manager.py` 只读 Catalog；新增 `catalog_service`（工具/Skill/MCP/Models
+  全脱敏）与 `prompt_preview`（分区/预算/hash/warnings 只读）。
+- 新增 `api_agents.py`：Profile CRUD / duplicate / references / preview / catalog。
+- WebUI「智能体编辑」页面（agent-editor.js + runtime-components.js + workspace.css）。
+
+### Phase 3 — 工作区管理
+
+- 新增 `path_validator.py`：Windows 路径安全校验（系统路径/UNC/链接/`..`/敏感文件）。
+- 新增 `api_workspace.py`：Workspace/Session CRUD、validate-path、配置摘要、
+  创建 Workspace+首会话原子事务。
+- WebUI「工作区」页面（workspace.js：三栏、创建向导、路由状态、请求竞态保护）。
+
+### Phase 4 — 工作区运行链路
+
+- 新增 `workspace_runtime.py`：EffectiveConfigResolver（继承/include/exclude/
+  fallback/缺失能力）、WorkspaceRuntimeService（Snapshot 组装/去重/hash/stale）。
+- `InboundMessage` 新增 `metadata`；`glue.send_and_wait` 支持 metadata/message_id；
+  ApprovalBridge 记录 workspace/session/snapshot/message 归属。
+- Dispatcher `_create()` 按 SessionEntry 的 runtime_context 创建上下文化 Agent；
+  `agent_factory` 完成 `workspace:` 分支（SQLite 唯一源 + MessageStore 恢复）。
+- chat / prompt-preview / runtime-status / apply-config API。
+
+### Phase 5 — 会话体验
+
+- EventBus：单调 event_id + 有界 ring backlog + Last-Event-ID 断线补齐。
+- WebuiChannel：运行事件填充 workspace/session/message/snapshot 公共字段。
+- 会话控制：stop / clear / delete / switch（busy 拒绝）。
+- WebUI 聊天体验：消息气泡、工具卡、审批卡、Plan 卡、SSE 身份过滤、
+  断线状态、stale banner；`components.js` 增加 XSS 净化。
+
+### Phase 6 — 稳定性与发布
+
+- 安全/并发/恢复/性能/E2E/发布回归测试分组。
+- 文档：workspaces / workspace-migration / workspace-troubleshooting /
+  workspace-security / release checklist；`scripts/workspace_smoke_test.py`。
+- `/api/status` 聚合 Workspace 运行指标。
+
+### 测试
+
+`python -m unittest discover -s tests -p "test_*.py"`（246 项全部通过）。

@@ -21,7 +21,7 @@ from typing import List, Optional
 
 from .skill import Skill
 
-logger = logging.getLogger("hello_agent")
+logger = logging.getLogger("jk_agent")
 
 # 技能名允许的字符
 _VALID_NAME_RE = re.compile(r"^[a-zA-Z0-9\-_]+$")
@@ -83,8 +83,22 @@ class SkillManager:
     def skill_count(self) -> int:
         return len(self._skills)
 
-    def skill_exists(self, name: str) -> bool:
-        return name in self._skills
+    def get_catalog(self) -> list:
+        """只读 Catalog API（Phase 2）：不实例化执行工具，只返回元数据。
+
+        每项含 id/name/description/version/available/source；缓存按文件 mtime 由调用方刷新。
+        """
+        out = []
+        for skill in self._skills.values():
+            out.append({
+                "id": skill.name,
+                "name": skill.name,
+                "description": skill.description,
+                "version": skill.version,
+                "available": True,
+                "source": "skills",
+            })
+        return out
 
     # ============================================================
     # 创建
@@ -161,43 +175,6 @@ class SkillManager:
 
         self._skills.pop(name, None)
         return True
-
-    # ============================================================
-    # 更新
-    # ============================================================
-
-    def update_skill(
-        self,
-        name: str,
-        *,
-        description: Optional[str] = None,
-        instruction: Optional[str] = None,
-        parameters: Optional[dict] = None,
-        tags: Optional[List[str]] = None,
-    ) -> Optional[Skill]:
-        """更新技能的元数据和/或指令"""
-        skill = self._skills.get(name)
-        if not skill:
-            return None
-
-        folder = Path(skill.source_dir) if skill.source_dir else self._skills_dir / name
-
-        if description is not None:
-            skill.description = description
-        if parameters is not None:
-            skill.parameters = parameters
-        if tags is not None:
-            skill.tags = tags
-        if instruction is not None:
-            skill.instruction = instruction
-            (folder / "instruction.md").write_text(instruction.strip() + "\n", encoding="utf-8")
-
-        skill.version += 1
-        with open(folder / "skill.json", "w", encoding="utf-8") as f:
-            json.dump(skill.to_dict(), f, ensure_ascii=False, indent=2)
-
-        self._skills[name] = skill
-        return skill
 
     # ============================================================
     # System Prompt 文本

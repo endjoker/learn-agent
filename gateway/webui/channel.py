@@ -13,7 +13,7 @@ import logging
 
 from gateway.channels.base import Channel, InboundMessage
 
-logger = logging.getLogger("hello_agent.gateway")
+logger = logging.getLogger("jk_agent.gateway")
 
 
 class WebuiChannel(Channel):
@@ -74,12 +74,26 @@ class WebuiChannel(Channel):
         })
 
     def publish_agent_event(self, msg: InboundMessage, event: dict) -> None:
-        """Forward a worker-thread Agent runtime event to the SSE bus."""
+        """Forward a worker-thread Agent runtime event to the SSE bus.
+
+        Phase 5：填充公共字段（workspace/session/message/snapshot/sequence），
+        便于前端按 identity 精确过滤，防止迟到事件串页。
+        """
         event_type = event.get("type")
         if not event_type:
             return
         payload = dict(event.get("data") or {})
-        payload.update({"session_key": msg.session_key, "message_id": msg.message_id})
+        meta = dict(getattr(msg, "metadata", None) or {})
+        payload.update({
+            "session_key": msg.session_key,
+            "message_id": msg.message_id,
+            "workspace_id": meta.get("workspace_id", ""),
+            "workspace_session_id": meta.get("workspace_session_id", ""),
+            "snapshot_id": meta.get("snapshot_id", ""),
+            "timestamp": event.get("at") or 0,
+        })
+        if "sequence" not in payload:
+            payload["sequence"] = event.get("sequence", 0)
         self.bus.publish(f"chat.{event_type}", payload)
 
     def status(self) -> dict:

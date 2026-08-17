@@ -34,6 +34,37 @@ def _tokenize(text: str) -> List[str]:
     return list(jieba.cut(text))
 
 
+def _validate_workspace_id(workspace_id: str) -> None:
+    """校验 workspace_id，防止路径穿越。"""
+    if not isinstance(workspace_id, str) or not workspace_id.strip():
+        raise ValueError("workspace_id 不能为空")
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+    if set(workspace_id) - allowed:
+        raise ValueError(f"非法的 workspace_id: {workspace_id!r}")
+
+
+def workspace_memory_dir(workspace_id: str) -> Path:
+    """返回工作区专用长期记忆目录：memory/workspaces/<workspace_id>。"""
+    _validate_workspace_id(workspace_id)
+    root = Path(__file__).resolve().parent / "workspaces"
+    return root / workspace_id
+
+
+def delete_workspace_memory(workspace_id: str) -> bool:
+    """安全删除工作区长期记忆目录（仅允许删除 memory/workspaces/<workspace_id>）。"""
+    _validate_workspace_id(workspace_id)
+    root = (Path(__file__).resolve().parent / "workspaces").resolve()
+    target = workspace_memory_dir(workspace_id).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise ValueError(f"拒绝删除记忆目录边界之外的路径: {target}")
+    if target.exists():
+        shutil.rmtree(target)
+        return True
+    return False
+
+
 class MemoryManager:
     """跨会话记忆管理器"""
 

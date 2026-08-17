@@ -25,6 +25,9 @@ ALLOW = "allow"   # 直接执行
 ASK = "ask"       # 询问用户
 DENY = "deny"     # 直接拒绝
 
+# 哨兵：区分"未传 extra_workspaces"与"显式空列表"（Phase 0 工作区模式）
+_UNSET = object()
+
 
 # ============================================================
 # bash 命令分类（可从 config.json 覆盖）
@@ -135,13 +138,17 @@ class PermissionChecker:
         # → "deny"（工作区外写入）
     """
 
-    def __init__(self, workspace: str = None, config: dict = None):
+    def __init__(self, workspace: str = None, config: dict = None,
+                 extra_workspaces: object = _UNSET):
         """
         初始化权限检查器
 
         参数:
             workspace: 项目工作区路径（默认：config → permission.workspace → 当前目录）
             config:    permission section 的配置 dict（None 时自动从 config_loader 加载）
+            extra_workspaces: 显式额外白名单根列表。
+                传 None / _UNSET 时继承 config.permission.extra_workspaces（默认 ["."]）；
+                传显式空列表 [] 时表示"没有任何额外根"（工作区模式，不回退全局 ["."]）。
         """
         # 从统一配置读取
         if config is None:
@@ -152,8 +159,7 @@ class PermissionChecker:
                 config = {}
 
         # workspace: 参数 > config > 当前目录
-        # 注意：必须锚定项目根解析（create_agent 会 os.chdir 到 workspace，
-        # 此处 CWD 不可靠），否则出现 workspace\workspace 递归（#7）
+        # 注意：必须锚定项目根解析（不再依赖 os.chdir，见 Phase 0）
         try:
             from core.config_loader import _find_project_root
             _root = _find_project_root()
@@ -168,7 +174,11 @@ class PermissionChecker:
             self.workspace = (_root / "workspace").resolve()
 
         # 额外白名单根（#8：默认含项目根，允许 LLM 修改根目录配置文件）
-        extra = config.get("extra_workspaces", ["."])
+        # Phase 0：工作区模式必须显式替换，显式空列表不回退全局 ["."]。
+        if extra_workspaces is not _UNSET and extra_workspaces is not None:
+            extra = list(extra_workspaces)
+        else:
+            extra = config.get("extra_workspaces", ["."])
         self._extra_roots = []
         for x in extra:
             self._extra_roots.append((_root / x).resolve() if x != "." else _root.resolve())

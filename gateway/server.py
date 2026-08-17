@@ -17,7 +17,7 @@ from gateway.session import SessionManager
 from core.config_loader import _find_project_root, load_config
 from core.runtime import RuntimeStore
 
-logger = logging.getLogger("hello_agent.gateway")
+logger = logging.getLogger("jk_agent.gateway")
 
 
 class GatewayServer:
@@ -65,6 +65,10 @@ class GatewayServer:
                 **agent_cfg,
                 "soft_timeout_seconds": sess_cfg.get("soft_timeout_seconds", 90),
                 "hard_timeout_seconds": sess_cfg.get("hard_timeout_seconds", 1200),
+                # 所有非工作区会话的默认能力子集。
+                # 为空/缺省时表示继承全部工具、技能和 MCP 服务。
+                "main_session_caps": self.config.get("webui", {}).get(
+                    "main_session", {}),
             },
             runtime_store=self.runtime_store,
             task_runtime_config=self.task_runtime_config,
@@ -76,6 +80,14 @@ class GatewayServer:
         self.webui = None
 
     async def start(self):
+        # 回收上次 Gateway 崩溃遗留的孤儿子进程（bash/python/proc_*）
+        try:
+            from core.orphan_processes import reap_stale_orphans
+            _reaped = reap_stale_orphans()
+            if _reaped:
+                logger.info("回收孤儿子进程: %d", _reaped)
+        except Exception as _exc:
+            logger.warning("孤儿进程回收失败: %s", _exc)
         """启动所有服务"""
         logger.info("🚀 Gateway 启动中 → %s:%d", self.host, self.port)
 

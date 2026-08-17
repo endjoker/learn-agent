@@ -22,7 +22,7 @@ from typing import Optional, Tuple
 from core.permission import PermissionChecker, ALLOW, ASK, DENY
 from core.sandbox.guard import check_command_safety, check_python_code, check_proc_send_input
 
-logger = logging.getLogger("hello_agent")
+logger = logging.getLogger("jk_agent")
 
 
 class SecurityGate:

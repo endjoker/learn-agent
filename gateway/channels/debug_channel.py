@@ -12,7 +12,7 @@ from aiohttp import web
 
 from gateway.channels.base import Channel, InboundMessage
 
-logger = logging.getLogger("hello_agent.gateway")
+logger = logging.getLogger("jk_agent.gateway")
 
 
 class DebugChannel(Channel):

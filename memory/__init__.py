@@ -6,6 +6,6 @@
 并支持按关键词/日期搜索历史记忆。
 """
 
-from .manager import MemoryManager
+from .manager import MemoryManager, workspace_memory_dir
 
-__all__ = ["MemoryManager"]
+__all__ = ["MemoryManager", "workspace_memory_dir"]

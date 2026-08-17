@@ -7,10 +7,6 @@ Heartbeat —— 心跳检查模块（P2）
   读 HEARTBEAT.md 清单注入为 prompt，agent 自主决定是否行动
 - 静默抑制：回复含 HEARTBEAT_OK → 只记日志不投递
 - 防堆积：心跳会话 busy / 超出 active_hours / 有 cron 在跑 → 跳过而非排队
-- 健康探针循环（60s）：通道存活 + 线程池压力 + scheduler/heartbeat 状态，
-  供 /health 聚合读取
-- 注：系统健康探针与 WebUI 30s 探针分工——本探针供 /health 聚合字段，
-  WebUI 探针（P3a）供 SSE channel.status 增量事件，读同一 ch.status() 数据
 """
 
 import asyncio
@@ -23,14 +19,13 @@ from typing import Optional
 from gateway.channels.base import Channel, InboundMessage
 from gateway.scheduler import deliver_reply, _now_dt
 
-logger = logging.getLogger("hello_agent.gateway")
+logger = logging.getLogger("jk_agent.gateway")
 
 _OK_MARKER = "HEARTBEAT_OK"
 _PREVIEW_CHARS = 120
 # 清单之外的固定指令（即使模板被编辑也保证静默抑制语义）
 _SUFFIX = ("\n\n【系统指令】评估以上清单：若无需行动，仅回复 HEARTBEAT_OK"
            "（不要包含任何其他内容）；否则执行必要的行动并简要汇报结果。")
-_PROBE_INTERVAL = 60  # 健康探针周期（秒）
 
 
 def _parse_duration(value, default_seconds: int = 1800) -> int:
@@ -102,13 +97,11 @@ class Heartbeat:
         self._session_mgr = session_mgr
         self._scheduler = scheduler
         self._task: Optional[asyncio.Task] = None
-        self._probe_task: Optional[asyncio.Task] = None
         self._paused = False
         self._beats = 0
         self._skips = 0
         self._last_beat: Optional[str] = None
         self._last_result: Optional[str] = None  # ok | acted | error
-        self._health: dict = {}
         self.channel = HeartbeatChannel(self)
 
     # ---------- 配置 ----------
@@ -149,19 +142,17 @@ class Heartbeat:
 
     async def start(self):
         self._task = asyncio.create_task(self._beat_loop())
-        self._probe_task = asyncio.create_task(self._probe_loop())
         logger.info("❤️ Heartbeat 已启动: every=%s session=%s active_hours=%s",
                     self._cfg.get("every", "30m"), self.session_key,
                     self._cfg.get("active_hours", "always"))
 
     async def stop(self):
-        for t in (self._task, self._probe_task):
-            if t:
-                t.cancel()
-                try:
-                    await t
-                except asyncio.CancelledError:
-                    pass
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
         logger.info("❤️ Heartbeat 已停止")
 
     # ---------- 心跳循环 ----------
@@ -257,32 +248,6 @@ class Heartbeat:
         if deliver.get("mode", "none") != "none":
             await deliver_reply(self._dispatcher, deliver, "心跳",
                                 f"❤️ [心跳]\n{t}")
-
-    # ---------- 健康探针 ----------
-
-    async def _probe_loop(self):
-        while True:
-            try:
-                self._health = self._collect_health()
-            except Exception as e:
-                logger.debug("heartbeat 探针采集异常: %s", e)
-            await asyncio.sleep(_PROBE_INTERVAL)
-
-    def _collect_health(self) -> dict:
-        return {
-            "channels": {
-                n: ch.status()
-                for n, ch in self._dispatcher.channels().items()
-            },
-            "executor": self._session_mgr.executor_stats(),
-            "scheduler": (self._scheduler.channel.status()
-                          if self._scheduler else {"present": False}),
-            "heartbeat": self.channel.status(),
-        }
-
-    def health_snapshot(self) -> dict:
-        """最近一次探针结果（/health 聚合用，避免同步重复采集）"""
-        return self._health or self._collect_health()
 
     # ---------- /heartbeat 命令 ----------
 

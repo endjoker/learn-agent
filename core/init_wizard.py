@@ -518,7 +518,7 @@ def _step_hooks(existing: dict) -> Optional[dict]:
         # 用户明确不要 filters，但原配置有 → 不主动删除（保持原样）
         print("  💡 已有过滤器配置保持不变，如需删除请手动编辑 config.json")
 
-    print("  💡 12 个事件桶（pre_tool / stop / task_complete …）可稍后在 config.json")
+    print("  💡 8 个事件桶（pre_tool / stop / plan_approved …）可稍后在 config.json")
     print("     的 hooks 段手写脚本，交互模式下 /hook reload 即时生效")
 
     if not changes:
@@ -914,7 +914,7 @@ def _print_summary(fragments: list[dict], existing: dict) -> None:
 def _print_banner(status: str, existing: dict) -> None:
     """打印向导横幅和当前配置概览"""
     print("\n╔═══════════════════════════════════════════════╗")
-    print("║   🛠️  HelloAgent 初始化向导                   ║")
+    print("║   🛠️  JKagent 初始化向导                   ║")
     print("║   每一步回车 = 使用默认值，Ctrl+C 随时退出     ║")
     print("╚═══════════════════════════════════════════════╝")
 

@@ -18,7 +18,7 @@ from core.config_writer import mask_dict
 from gateway.webui.config_service import ConfigService, ConfigConflictError
 from core.reasoning import normalize_reasoning_level
 
-logger = logging.getLogger("hello_agent.gateway")
+logger = logging.getLogger("jk_agent.gateway")
 
 
 def register_routes(app: web.Application, module):
@@ -30,7 +30,6 @@ def register_routes(app: web.Application, module):
     app.router.add_put("/api/config/models/{name}", _make_model_write(module))
     app.router.add_delete("/api/config/models/{name}", _make_model_delete(module))
     app.router.add_put("/api/config/llm", _make_llm_default(module))
-    app.router.add_get("/api/config/backups", _make_backups(module))
 
 
 def _err(text, status=400):
@@ -242,17 +241,6 @@ def _make_llm_default(module):
         backup_and_write(module, data)
         module.bus.publish("config.updated", {"section": "llm"})
         return web.json_response({"ok": True})
-    return handler
-
-
-def _make_backups(module):
-    async def handler(request):
-        from core.config_writer import default_config_path
-        p = default_config_path()
-        baks = sorted(
-            (f.name for f in p.parent.glob(f"{p.name}.bak-*")),
-            reverse=True)
-        return web.json_response({"backups": baks})
     return handler
 
 

@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
-logger = logging.getLogger("hello_agent.gateway")
+logger = logging.getLogger("jk_agent.gateway")
 
 
 @dataclass
@@ -23,6 +23,11 @@ class SessionEntry:
     created_at: float = 0.0
     last_active: float = 0.0
     is_busy: bool = False          # 是否正在执行 agent.run()
+    # ---- Phase 0/4：工作区运行上下文（预留字段，必须有默认值）----
+    runtime_context: object = None         # WorkspaceRuntimeContext（工作区会话）
+    runtime_snapshot_id: str = ""          # 当前消息使用的 RuntimeSnapshot id
+    config_stale: bool = False             # Profile/Workspace 更新后标记 stale
+    agent_config_hash: str = ""            # 已加载 Agent 的配置指纹（重建判定）
 
     def __post_init__(self):
         if self.queue is None:
@@ -186,6 +191,19 @@ class SessionManager:
                 break
             except Exception as e:
                 logger.error("janitor 异常: %s", e)
+
+            # 临时文件 TTL 清理（每 60s 扫描一次，代价低）
+            try:
+                from core.temp_cleanup import cleanup_old_files, cleanup_agent_output_logs
+                import tempfile
+                from core.config_loader import _find_project_root
+                _removed = 0
+                _removed += cleanup_old_files([str(_find_project_root() / "workspace" / "tmp")], 7 * 86400)
+                _removed += cleanup_agent_output_logs(tempfile.gettempdir(), 7 * 86400)
+                if _removed:
+                    logger.info("临时文件清理: %d", _removed)
+            except Exception as _e:
+                logger.warning("临时文件清理失败: %s", _e)
 
     async def _cleanup_entry(self, key: str, entry: SessionEntry, save: bool = True):
         """清理单个会话：保存 → 释放资源"""

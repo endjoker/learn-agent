@@ -21,18 +21,3 @@ def get_gateway_config() -> dict:
     feishu["app_secret"] = os.getenv("FEISHU_APP_SECRET", feishu.get("app_secret", ""))
 
     return cfg
-
-
-def get_agent_config() -> dict:
-    """读取 gateway.agent 子配置"""
-    return get_gateway_config().get("agent", {})
-
-
-def get_session_config() -> dict:
-    """读取 gateway.sessions 子配置"""
-    return get_gateway_config().get("sessions", {})
-
-
-def get_channel_config(name: str) -> dict:
-    """读取指定 channel 的配置"""
-    return get_gateway_config().get("channels", {}).get(name, {})

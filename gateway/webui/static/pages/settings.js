@@ -2,6 +2,19 @@
 // 大模型（列表 + 厂商向导 + 默认模型）/ 工作区 / Prompt 截断 / Gateway 会话
 "use strict";
 
+const WEBUI_THEME_STORAGE_KEY = "jkagent.theme";
+
+function readWebUITheme() {
+  try { return localStorage.getItem(WEBUI_THEME_STORAGE_KEY) === "dark" ? "dark" : "light"; }
+  catch (e) { return "light"; }
+}
+
+function applyWebUITheme(theme) {
+  const next = theme === "dark" ? "dark" : "light";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem(WEBUI_THEME_STORAGE_KEY, next); } catch (e) { }
+}
+
 const REASONING_LEVEL_LABELS = {
   provider_default: "服务商默认",
   none: "关闭推理",
@@ -19,10 +32,6 @@ window.PageSettings = class {
   async render(root) {
     this._root = root;
     root.appendChild(HA.el("h1", { text: "⚙️ 设置" }));
-    this._note = HA.el("div", { class: "dim settings-note" },
-      "保守白名单：仅 llm / gateway.sessions / prompt / workspace 可编辑；" +
-      "mcp.servers 在 MCP 页管理；permission / sandbox / hooks / gateway 主段请手编 config.json。");
-    root.appendChild(this._note);
     this._container = HA.el("div", { class: "settings-sections" });
     root.appendChild(this._container);
     this._offs.push(HA.onSSE("config.updated", () => this._loadConfig()));
@@ -42,6 +51,7 @@ window.PageSettings = class {
   _renderSections() {
     this._container.innerHTML = "";
     this._container.append(
+      this._sectionAppearance(),
       this._sectionLLM(),
       this._sectionWorkspace(),
       this._sectionPrompt(),
@@ -51,6 +61,22 @@ window.PageSettings = class {
   _card(title, ...body) {
     return HA.el("div", { class: "settings-card" },
       HA.el("h2", { text: title }), ...body);
+  }
+
+  _sectionAppearance() {
+    const theme = readWebUITheme();
+    const selector = HA.el("select", {},
+      HA.el("option", { value: "light", text: "\u660e\u4eae", selected: theme === "light" }),
+      HA.el("option", { value: "dark", text: "\u591c\u95f4", selected: theme === "dark" }));
+    selector.addEventListener("change", () => {
+      applyWebUITheme(selector.value);
+      HA.toast(selector.value === "dark" ? "\u5df2\u5207\u6362\u4e3a\u591c\u95f4\u4e3b\u9898" : "\u5df2\u5207\u6362\u4e3a\u660e\u4eae\u4e3b\u9898", "ok");
+    });
+    return this._card("\u754c\u9762", 
+      HA.el("div", { class: "dim", style: "margin-bottom:10px" },
+        "\u4e3b\u9898\u4fdd\u5b58\u5728\u5f53\u524d\u6d4f\u89c8\u5668\uff0c\u5237\u65b0\u540e\u4ecd\u4f1a\u4fdd\u7559\u3002"),
+      HA.el("div", { class: "form-row" },
+        HA.el("label", { class: "dim", text: "\u4e3b\u9898" }), selector));
   }
 
   // ---------- 大模型 ----------
@@ -157,8 +183,8 @@ window.PageSettings = class {
     const modal = HA.el("div", { class: "modal-mask" },
       HA.el("div", { class: "modal" },
         HA.el("h2", { text: `编辑模型 ${name}` }),
-        HA.el("label", { class: "form-label" }, "base_url", baseIn),
-        HA.el("label", { class: "form-label" }, "context_length", ctxIn),
+        HA.el("label", { class: "form-label" }, "\u670d\u52a1\u5730\u5740\uff08base_url\uff09", baseIn),
+        HA.el("label", { class: "form-label" }, "\u4e0a\u4e0b\u6587\u957f\u5ea6\uff08context_length\uff09", ctxIn),
         HA.el("label", { class: "form-label" },
           supportsReasoning ? "推理等级" : "推理等级（该协议仅支持 provider_default）", reasoningIn),
         HA.el("label", { class: "form-label" }, "api_key（不明文显示）", keyIn),
@@ -239,9 +265,9 @@ window.PageSettings = class {
       HA.el("div", { class: "modal" },
         HA.el("h2", { text: `添加模型 — ${spec.label}` }),
         HA.el("label", { class: "form-label" }, "名称", nameIn),
-        HA.el("label", { class: "form-label" }, "base_url", urlIn),
-        HA.el("label", { class: "form-label" }, "api_key", keyIn),
-        HA.el("label", { class: "form-label" }, "context_length", ctxIn),
+        HA.el("label", { class: "form-label" }, "\u670d\u52a1\u5730\u5740\uff08base_url\uff09", urlIn),
+        HA.el("label", { class: "form-label" }, "API \u5bc6\u94a5", keyIn),
+        HA.el("label", { class: "form-label" }, "\u4e0a\u4e0b\u6587\u957f\u5ea6\uff08context_length\uff09", ctxIn),
         HA.el("label", { class: "form-label" },
           supportsReasoning ? "推理等级" : "推理等级（该协议仅支持 provider_default）", reasoningIn),
         HA.el("div", { class: "modal-actions" },

@@ -20,7 +20,7 @@ import logging
 from pathlib import Path
 from typing import Any, Optional
 
-logger = logging.getLogger("hello_agent")
+logger = logging.getLogger("jk_agent")
 
 # ============================================================
 # 默认配置（所有 section 的硬编码 fallback）
@@ -103,9 +103,9 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "hooks": {
             "pre_tool": [{"matcher": "bash|write|file_mgr", "hooks": []}],
             "post_tool": [], "user_prompt": [], "notification": [],
-            "denied": [], "stop": [], "pre_llm": [], "post_llm": [],
-            "session_start": [], "session_end": [],
-            "plan_approved": [], "task_complete": [],
+            "denied": [], "stop": [],
+            "session_start": [],
+            "plan_approved": [],
         },
     },
     "mcp": {
@@ -367,28 +367,3 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             base[key] = value
     return base
-
-
-def export_config(path: Optional[str] = None) -> str:
-    """导出当前配置为 JSON 字符串（用于迁移）"""
-    config = load_config()
-    if path:
-        cfg_path = Path(path)
-        # 如果指定了路径且 config.json 使用方需要相对路径，我们这里直接保存
-        with open(cfg_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-        logger.info("配置已导出到 %s", path)
-    return json.dumps(config, ensure_ascii=False, indent=2)
-
-
-if __name__ == "__main__":
-    # 独立测试
-    import sys
-    cfg = load_config()
-    if "--export" in sys.argv:
-        print(export_config())
-    else:
-        for section in ["llm", "permission", "hooks", "mcp", "sandbox"]:
-            print(f"[{section}] {'OK' if section in cfg else 'MISSING'}")
-        print(f"\n当前模型: {cfg['llm']['model_id']}")
-        print(f"已配置模型: {list(cfg['llm']['models'].keys())}")

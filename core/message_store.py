@@ -90,6 +90,7 @@ class MessageStore:
         on_update: Optional[Callable[["MessageStore"], None]] = None,
     ):
         self._messages: List[Dict] = []
+        self._events: List[Dict] = []
         self.max_tokens = max_tokens
         self._on_update = on_update
         self._created_at = datetime.now()
@@ -128,6 +129,21 @@ class MessageStore:
 
     def __iter__(self):
         return iter(self._messages)
+
+    # ================================================================
+    # 运行期配置/压缩事件（结构化审计，随会话持久化）
+    # ================================================================
+
+    @property
+    def events(self) -> List[Dict]:
+        return self._events
+
+    def record_event(self, event_type: str, **fields) -> None:
+        """记录一条结构化会话事件（模型切换/权限变更/推理等级/压缩等）。"""
+        event = {"type": event_type, "timestamp": datetime.now().isoformat(timespec="seconds")}
+        event.update(fields)
+        self._events.append(event)
+        self._notify()
 
     # ============================================================
     # 核心操作
@@ -281,8 +297,9 @@ class MessageStore:
         ]
 
         result = {
-            "schema_version": 2,
+            "schema_version": 3,
             "session_id": self.session_id,
+            "events": self._events,
             "created_at": self._created_at.isoformat(),
             "model_id": self.model_id,
             "model_provider": self.model_provider,
@@ -325,6 +342,9 @@ class MessageStore:
         恢复模型配置和消息列表（不含 system prompt，由 Agent 负责插入）。
         """
         self.session_id = data.get("session_id", self.session_id)
+        # 会话事件（v3+）。老版本无 events 字段，迁移为空列表。
+        events = data.get("events", [])
+        self._events = events if isinstance(events, list) else []
         self.model_id = data.get("model_id", "")
         self.model_provider = data.get("model_provider", "")
         self.model_base_url = data.get("model_base_url", "")

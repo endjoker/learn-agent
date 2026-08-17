@@ -13,7 +13,9 @@ L2-B 资源隔离层（nanosandbox）为设计预留，暂未实现。
 """
 
 import os
+import signal
 import subprocess
+import tempfile
 import threading
 import logging
 from pathlib import Path
@@ -30,7 +32,27 @@ from .guard import (
 from .audit import log_interception, log_bypass, log_error
 from . import profiles as profile_loader
 
-logger = logging.getLogger("hello_agent")
+logger = logging.getLogger("jk_agent")
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Kill the whole process tree rooted at proc (Windows: taskkill /T)."""
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=8,
+            )
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
 
 
 class SandboxResult:
@@ -44,6 +66,8 @@ class SandboxResult:
         timeout: bool = False,
         blocked: bool = False,
         block_reason: str = "",
+        full_output_path: str = "",
+        spilled: bool = False,
     ):
         self.stdout = stdout
         self.stderr = stderr
@@ -51,6 +75,8 @@ class SandboxResult:
         self.timeout = timeout
         self.blocked = blocked
         self.block_reason = block_reason
+        self.full_output_path = full_output_path
+        self.spilled = spilled
 
     @property
     def success(self) -> bool:
@@ -67,16 +93,19 @@ class SandboxResult:
             parts.append(self.stdout.rstrip()[:8000])
         if self.stderr:
             parts.append(f"⚠️ 错误:\n{self.stderr.rstrip()[:2000]}")
+        if self.full_output_path:
+            parts.append(f"📄 完整输出已落盘: {self.full_output_path}")
         if not parts:
             parts.append("（执行完毕，无输出）")
         return "\n".join(parts)
 
 
 class OutputDrainer:
-    """流式读取子进程管道写入 sink，供 SandboxExecutor._execute 和 ProcessManager 共用。
+    """流式读取子进程管道，支持一次性命令、长驻 ring、以及超限落盘。
 
-    - sink 为 list + kill_on_exceed=True：一次性命令，累计超 max_bytes 则 kill 进程（BashTool）
-    - sink 为 deque(maxlen) + kill_on_exceed=False：长驻会话，ring 天然驱丢，记 dropped（ProcessManager）
+    - sink 为 list + kill_on_exceed=True + 无 spill：累计超 max_bytes 则 kill（旧行为）
+    - sink 为 list + kill_on_exceed=True + spill：超 threshold 写临时文件，内存只留尾部
+    - sink 为 deque(maxlen) + kill_on_exceed=False：长驻会话 ring，记 dropped
     """
 
     def __init__(
@@ -86,13 +115,23 @@ class OutputDrainer:
         sink,
         max_bytes: int,
         kill_on_exceed: bool = True,
+        spill_dir: str | None = None,
+        spill_threshold: int = 0,
+        tail_limit: int = 8192,
     ):
         self._proc = proc
         self._pipe = pipe
         self._sink = sink
         self._max_bytes = max_bytes
         self._kill_on_exceed = kill_on_exceed
-        self.truncated = False   # 一次性：是否触发 kill 截断
+        self._spill_dir = spill_dir
+        self._spill_threshold = spill_threshold
+        self._tail_limit = tail_limit
+        self._spill_fh = None
+        self._spill_bytes = 0
+        self.full_output_path = ""
+        self.spilled = False
+        self.truncated = False   # 一次性：是否触发截断（kill 或落盘截断）
         self.dropped = 0          # 长驻：ring 驱丢的 chunk 累计计数
         self._thread: threading.Thread | None = None
 
@@ -104,32 +143,56 @@ class OutputDrainer:
         if self._thread:
             self._thread.join(timeout=timeout)
 
+    def _ensure_spill(self) -> None:
+        if self._spill_fh is not None:
+            return
+        directory = self._spill_dir or tempfile.gettempdir()
+        fd, path = tempfile.mkstemp(prefix="agent-output-", suffix=".log", dir=directory)
+        self._spill_fh = os.fdopen(fd, "wb")
+        self.full_output_path = path
+        self.spilled = True
+
     def _drain(self) -> None:
         try:
             while True:
-                # read1：一次底层读取，返回当前可得字节（不阻塞等待填满缓冲），
-                # 否则低频输出（如 dev server 日志）会被 read(65536) 阻塞到 EOF
                 chunk = self._pipe.read1(65536)
                 if not chunk:
                     break
                 if self._kill_on_exceed:
-                    # 一次性模式：累计超限则 kill
-                    if sum(len(c) for c in self._sink) + len(chunk) > self._max_bytes:
-                        self.truncated = True
-                        try:
-                            self._proc.kill()
-                        except (ProcessLookupError, OSError):
-                            pass
-                        break
-                    self._sink.append(chunk)
+                    if self._spill_threshold > 0:
+                        # spill mode: keep full output on disk, only tail in memory
+                        if self._spill_fh is None and (self._spill_bytes + len(chunk)) > self._spill_threshold:
+                            self._ensure_spill()
+                        if self._spill_fh is not None:
+                            self._spill_fh.write(chunk)
+                            self._spill_bytes += len(chunk)
+                            self.truncated = True
+                        self._sink.append(chunk)
+                        total = sum(len(c) for c in self._sink)
+                        while total > self._tail_limit and len(self._sink) > 1:
+                            total -= len(self._sink.pop(0))
+                    else:
+                        if sum(len(c) for c in self._sink) + len(chunk) > self._max_bytes:
+                            self.truncated = True
+                            try:
+                                self._proc.kill()
+                            except (ProcessLookupError, OSError):
+                                pass
+                            break
+                        self._sink.append(chunk)
                 else:
-                    # ring 模式：deque(maxlen) 自动驱丢最旧；append 前若满则记一次 drop
                     mx = getattr(self._sink, "maxlen", None)
                     if mx is not None and len(self._sink) >= mx:
                         self.dropped += 1
                     self._sink.append(chunk)
         except (OSError, ValueError):
             pass
+        finally:
+            if self._spill_fh is not None:
+                try:
+                    self._spill_fh.close()
+                except Exception:
+                    pass
 
     def result_bytes(self) -> bytes:
         """一次性模式用：拼接 sink 为 bytes。ring 模式由 ProcessManager 自管读指针。"""
@@ -295,21 +358,26 @@ class SandboxExecutor:
     ) -> SandboxResult:
         """L2-C subprocess 执行（L2-A 内容拦截已在前置步骤完成）
 
-        使用 Popen + OutputDrainer 双线程流式读取 stdout/stderr，按 max_output_mb
-        截断输出，避免 `yes`/`cat /dev/zero` 类命令把输出全量读进内存导致 OOM。
+        使用 Popen + OutputDrainer 双线程流式读取 stdout/stderr，超限输出落盘，
+        避免 ``yes``/``cat /dev/zero`` 类命令把输出全量读进内存导致 OOM。
+        超时/取消时杀掉整个进程树，避免残留子进程。
         """
         timeout = self._get_timeout()
         max_bytes = self.get_max_output_bytes()
+        popen_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "stdin": subprocess.DEVNULL,
+            "cwd": cwd or str(self._workspace),
+            "env": sanitize_env(env or os.environ.copy()),
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
 
         try:
-            proc = subprocess.Popen(
-                [command] + (args or []),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
-                cwd=cwd or str(self._workspace),
-                env=sanitize_env(env or os.environ.copy()),
-            )
+            proc = subprocess.Popen([command] + (args or []), **popen_kwargs)
         except FileNotFoundError:
             return SandboxResult(
                 stderr=f"命令未找到: {command}", exit_code=-1
@@ -318,13 +386,18 @@ class SandboxExecutor:
             log_error(f"{command} run", str(e))
             return SandboxResult(stderr=str(e), exit_code=-1)
 
+        from ..orphan_processes import record as _record_orphan
+        _record_orphan(proc.pid, True)
+
         out_sink: list[bytes] = []
         err_sink: list[bytes] = []
         out_drainer = OutputDrainer(
-            proc, proc.stdout, out_sink, max_bytes, kill_on_exceed=True
+            proc, proc.stdout, out_sink, max_bytes, kill_on_exceed=True,
+            spill_threshold=max_bytes, tail_limit=8192,
         )
         err_drainer = OutputDrainer(
-            proc, proc.stderr, err_sink, max_bytes, kill_on_exceed=True
+            proc, proc.stderr, err_sink, max_bytes, kill_on_exceed=True,
+            spill_threshold=max_bytes, tail_limit=8192,
         )
         out_drainer.start()
         err_drainer.start()
@@ -334,37 +407,51 @@ class SandboxExecutor:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
+            _kill_process_tree(proc)
             try:
-                proc.kill()
-            except (ProcessLookupError, OSError):
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
                 pass
-            proc.wait()
 
-        out_drainer.join()
-        err_drainer.join()
-
-        # 关闭管道，释放文件描述符
+        # 给 drainer 一段收尾时间；Windows 上孙进程可能继承管道句柄，
+        # 超过 grace 后主动关闭管道，避免阻塞在 read。
+        out_drainer.join(timeout=2)
+        err_drainer.join(timeout=2)
         for pipe in (proc.stdout, proc.stderr):
             try:
-                pipe.close()
+                if pipe:
+                    pipe.close()
             except Exception:
                 pass
 
+        _record_orphan(proc.pid, False)
+
+        full_path = out_drainer.full_output_path or err_drainer.full_output_path
+        spilled = out_drainer.spilled or err_drainer.spilled
+
         if timed_out:
-            return SandboxResult(timeout=True)
+            return SandboxResult(timeout=True, full_output_path=full_path, spilled=spilled)
 
         stdout = out_drainer.result_bytes().decode("utf-8", errors="replace")
         stderr = err_drainer.result_bytes().decode("utf-8", errors="replace")
         if out_drainer.truncated or err_drainer.truncated:
-            stderr = (
-                (stderr + "\n" if stderr else "")
-                + f"[沙箱] 输出超过 max_output_mb 上限（{max_bytes // (1024 * 1024)}MB），已截断"
-            )
+            if spilled:
+                stderr = (
+                    (stderr + "\n" if stderr else "")
+                    + f"[沙箱] 输出超过阈值，已落盘到 {full_path}"
+                )
+            else:
+                stderr = (
+                    (stderr + "\n" if stderr else "")
+                    + f"[沙箱] 输出超过 max_output_mb 上限（{max_bytes // (1024 * 1024)}MB），已截断"
+                )
 
         return SandboxResult(
             stdout=sanitize_output(stdout),
             stderr=stderr,
             exit_code=proc.returncode,
+            full_output_path=full_path,
+            spilled=spilled,
         )
 
     # ================================================================

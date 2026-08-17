@@ -85,6 +85,7 @@ window.PageChat = class {
         ["max", "推理：最大"],
       ].map(([value, text]) => HA.el("option", { value, text })));
     this._permSeg = this._segmented([
+      { value: "readonly", label: "\u53ea\u8bfb" },
       { value: "ask", label: "询问" },
       { value: "allow", label: "允许" },
       { value: "unreviewed", label: "免审" },
@@ -404,6 +405,14 @@ window.PageChat = class {
           i = j;
           continue;
         }
+      }
+      // Tool-invocation records often have assistant role but intentionally
+      // carry no visible text.  Rendering them as normal messages leaves an
+      // empty ???? card between tool calls and the final reply.
+      const visibleText = String(m.content_text ?? (typeof m.content === "string" ? m.content : "")).trim();
+      if (m.role === "assistant" && !visibleText) {
+        i++;
+        continue;
       }
       this._msgArea.appendChild(this._bubble(m));
       i++;

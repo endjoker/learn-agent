@@ -54,7 +54,7 @@ except ImportError:
     SandboxExecutor = None  # type: ignore
     SandboxResult = None  # type: ignore
 
-logger = logging.getLogger('hello_agent')
+logger = logging.getLogger('jk_agent')
 
 
 # ============================================================
@@ -810,9 +810,10 @@ class BashTool(BaseTool):
 
         # --- 沙箱检查（如果注入） ---
         if self._sandbox:
+            from core.shell import shell_command
+            shell_cmd = shell_command(command)
             result = self._sandbox.run(
-                "powershell" if self.IS_WINDOWS else "bash",
-                ["-NoProfile", "-Command", command] if self.IS_WINDOWS else ["-c", command],
+                shell_cmd[0], shell_cmd[1:],
                 tool_name="bash",
             )
             if result.blocked:
@@ -828,27 +829,16 @@ class BashTool(BaseTool):
         try:
             # --- 执行命令 ---
             # Windows 用 PowerShell（单引号/管道/Unix 别名均正常），Linux/Mac 用 bash
-            if self.IS_WINDOWS:
-                result = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", command],
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    encoding="utf-8",
-                    errors="replace",
-                    stdin=subprocess.DEVNULL,
-                )
-            else:
-                result = subprocess.run(
-                    command,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    encoding="utf-8",
-                    errors="replace",
-                    stdin=subprocess.DEVNULL,
-                )
+            from core.shell import shell_command
+            result = subprocess.run(
+                shell_command(command),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                encoding="utf-8",
+                errors="replace",
+                stdin=subprocess.DEVNULL,
+            )
 
             return self._format_output(command, result.stdout, result.stderr, result.returncode, cmd_name)
 

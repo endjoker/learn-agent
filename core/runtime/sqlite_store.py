@@ -30,7 +30,7 @@ class TaskSnapshot:
 class RuntimeStore:
     """Small transactional store with one connection per operation."""
 
-    SCHEMA_VERSION = 8
+    SCHEMA_VERSION = 10
 
     def __init__(self, path: str | Path, *, wal: bool = True,
                  busy_timeout_ms: int = 5000):
@@ -58,6 +58,17 @@ class RuntimeStore:
             raise
         finally:
             connection.close()
+
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        """Public connection contextmanager (Phase 1).
+
+        Lets WorkspaceStore share the same SQLite file/PRAGMA configuration
+        without duplicating connection setup. Commits on success, rolls back
+        on error.
+        """
+        with self._connection() as connection:
+            yield connection
 
     def initialize(self) -> None:
         with self._connection() as connection:
@@ -117,6 +128,20 @@ class RuntimeStore:
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (8, utc_now()),
                 )
+            if current < 9:
+                self._migrate_v9(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (9, utc_now()),
+                )
+            if current < 10:
+                self._migrate_v10(connection)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (10, utc_now()),
+                )
+            # 兼容：已存在的 v9 库补 agent_profiles.is_system 列（幂等）
+            self._ensure_profile_is_system_column(connection)
 
     @staticmethod
     def _migrate_v1(connection: sqlite3.Connection) -> None:
@@ -963,6 +988,171 @@ class RuntimeStore:
         return TaskSnapshot(envelope=envelope, record=record, result=result)
 
 
+    @staticmethod
+    def _migrate_v9(connection: sqlite3.Connection) -> None:
+        """Workspace module domain tables (Phase 1).
+
+        Adds workspaces / agent_profiles / workspace_sessions /
+        workspace_runtime_snapshots / agent_profile_versions.
+        All JSON columns store UTF-8 JSON text via the workspace store.
+        """
+        connection.executescript(
+            """
+            CREATE TABLE workspaces (
+                workspace_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                project_path TEXT NOT NULL,
+                working_directory TEXT NOT NULL DEFAULT '',
+                extra_workspace_roots TEXT NOT NULL DEFAULT '[]',
+                description TEXT NOT NULL DEFAULT '',
+                default_agent_profile_id TEXT NOT NULL DEFAULT '',
+                default_model TEXT NOT NULL DEFAULT '',
+                permission_mode TEXT NOT NULL DEFAULT 'ask',
+                chat_mode TEXT NOT NULL DEFAULT 'chat',
+                include_tools TEXT NOT NULL DEFAULT '[]',
+                exclude_tools TEXT NOT NULL DEFAULT '[]',
+                include_skills TEXT NOT NULL DEFAULT '[]',
+                exclude_skills TEXT NOT NULL DEFAULT '[]',
+                include_mcp_servers TEXT NOT NULL DEFAULT '[]',
+                exclude_mcp_servers TEXT NOT NULL DEFAULT '[]',
+                ui_preferences TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'active',
+                version INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT NOT NULL DEFAULT '',
+                path_risk_level TEXT NOT NULL DEFAULT 'none',
+                path_warnings TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE INDEX workspaces_status_idx ON workspaces(status, updated_at);
+            CREATE INDEX workspaces_project_path_idx ON workspaces(project_path);
+
+            CREATE TABLE agent_profiles (
+                profile_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                system_prompt TEXT NOT NULL DEFAULT '',
+                tools TEXT NOT NULL DEFAULT '[]',
+                skills TEXT NOT NULL DEFAULT '[]',
+                mcp_servers TEXT NOT NULL DEFAULT '[]',
+                default_model TEXT NOT NULL DEFAULT '',
+                permission_mode TEXT NOT NULL DEFAULT 'ask',
+                chat_mode TEXT NOT NULL DEFAULT 'chat',
+                max_steps INTEGER NOT NULL DEFAULT 100,
+                include_tools TEXT NOT NULL DEFAULT '[]',
+                exclude_tools TEXT NOT NULL DEFAULT '[]',
+                ui_preferences TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'active',
+                version INTEGER NOT NULL DEFAULT 1,
+                is_system INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE UNIQUE INDEX agent_profiles_name_idx ON agent_profiles(name);
+            CREATE INDEX agent_profiles_status_idx ON agent_profiles(status, updated_at);
+
+            CREATE TABLE workspace_sessions (
+                session_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                agent_profile_id TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                permission_mode TEXT NOT NULL DEFAULT 'ask',
+                chat_mode TEXT NOT NULL DEFAULT 'chat',
+                reasoning_level TEXT NOT NULL DEFAULT 'inherit',
+                status TEXT NOT NULL DEFAULT 'active',
+                client_config_version INTEGER NOT NULL DEFAULT 0,
+                last_snapshot_id TEXT NOT NULL DEFAULT '',
+                last_active_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+                is_busy INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+            );
+            CREATE UNIQUE INDEX workspace_sessions_key_idx ON workspace_sessions(session_key);
+            CREATE INDEX workspace_sessions_workspace_idx
+                ON workspace_sessions(workspace_id, status, updated_at);
+
+            CREATE TABLE workspace_runtime_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL DEFAULT '',
+                workspace_session_id TEXT NOT NULL DEFAULT '',
+                agent_profile_id TEXT NOT NULL DEFAULT '',
+                agent_profile_version INTEGER NOT NULL DEFAULT 0,
+                workspace_version INTEGER NOT NULL DEFAULT 0,
+                session_client_config_version INTEGER NOT NULL DEFAULT 0,
+                model TEXT NOT NULL DEFAULT '',
+                permission_mode TEXT NOT NULL DEFAULT 'ask',
+                chat_mode TEXT NOT NULL DEFAULT 'chat',
+                reasoning_level TEXT NOT NULL DEFAULT 'inherit',
+                working_directory TEXT NOT NULL DEFAULT '',
+                project_root TEXT NOT NULL DEFAULT '',
+                framework_root TEXT NOT NULL DEFAULT '',
+                agent_data_root TEXT NOT NULL DEFAULT '',
+                extra_workspace_roots TEXT NOT NULL DEFAULT '[]',
+                tools TEXT NOT NULL DEFAULT '[]',
+                skills TEXT NOT NULL DEFAULT '[]',
+                mcp_servers TEXT NOT NULL DEFAULT '[]',
+                system_prompt TEXT NOT NULL DEFAULT '',
+                prompt_hash TEXT NOT NULL DEFAULT '',
+                expected_prompt_hash TEXT NOT NULL DEFAULT '',
+                capability_hash TEXT NOT NULL DEFAULT '',
+                dedup_key TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX workspace_snapshots_dedup_idx
+                ON workspace_runtime_snapshots(dedup_key);
+            CREATE INDEX workspace_snapshots_session_idx
+                ON workspace_runtime_snapshots(workspace_session_id, created_at);
+
+            CREATE TABLE agent_profile_versions (
+                version_id TEXT PRIMARY KEY,
+                profile_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(profile_id) REFERENCES agent_profiles(profile_id)
+            );
+            CREATE INDEX agent_profile_versions_profile_idx
+                ON agent_profile_versions(profile_id, version);
+            """
+        )
 
 
+    @staticmethod
+    def _migrate_v10(connection: sqlite3.Connection) -> None:
+        """Persist per-workspace-session reasoning selections and snapshots."""
+        RuntimeStore._ensure_column(
+            connection, "workspace_sessions", "reasoning_level",
+            "TEXT NOT NULL DEFAULT 'inherit'")
+        RuntimeStore._ensure_column(
+            connection, "workspace_runtime_snapshots", "reasoning_level",
+            "TEXT NOT NULL DEFAULT 'inherit'")
+
+    @staticmethod
+    def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        try:
+            cols = {row[1] for row in connection.execute(
+                f"PRAGMA table_info({table})").fetchall()}
+        except sqlite3.OperationalError:
+            return
+        if column not in cols:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+    @staticmethod
+    def _ensure_profile_is_system_column(connection: sqlite3.Connection) -> None:
+        """幂等补列：老 v9 库的 agent_profiles 没有 is_system（Phase 6 内置模板）。"""
+        try:
+            cols = {r[1] for r in connection.execute(
+                "PRAGMA table_info(agent_profiles)").fetchall()}
+        except sqlite3.OperationalError:
+            return  # 表不存在（旧版本库尚未建表，后续 migration 会建）
+        if "is_system" not in cols:
+            connection.execute(
+                "ALTER TABLE agent_profiles ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0")
 

@@ -14,7 +14,7 @@ from aiohttp import web
 
 from core.config_writer import mask_key
 
-logger = logging.getLogger("hello_agent.gateway")
+logger = logging.getLogger("jk_agent.gateway")
 
 
 def register_routes(app: web.Application, module):
@@ -25,7 +25,6 @@ def register_routes(app: web.Application, module):
     app.router.add_post("/api/mcp/servers/{name}/reconnect",
                         _make_mcp_reconnect(module))
     app.router.add_post("/api/mcp/apply", _make_mcp_apply(module))
-    app.router.add_get("/api/mcp/servers/{name}/tools", _make_mcp_tools(module))
     app.router.add_get("/api/skills", _make_skills(module))
     app.router.add_get("/api/skills/meta", _make_skills_meta(module))
     app.router.add_get("/api/skills/{name}", _make_skill_detail(module))
@@ -34,6 +33,10 @@ def register_routes(app: web.Application, module):
     app.router.add_get("/api/prompt/files/{name}", _make_prompt_read(module))
     app.router.add_put("/api/prompt/files/{name}", _make_prompt_write(module))
     app.router.add_post("/api/prompt/apply", _make_prompt_apply(module))
+    app.router.add_get("/api/prompt/main-session", _make_main_session_get(module))
+    app.router.add_put("/api/prompt/main-session", _make_main_session_put(module))
+    app.router.add_post("/api/prompt/main-session/preview",
+                        _make_main_session_preview(module))
 
 
 def _err(text, status=400):
@@ -286,31 +289,6 @@ def _make_mcp_reconnect(module):
     return handler
 
 
-def _make_mcp_tools(module):
-    async def handler(request):
-        name = request.match_info["name"]
-        # 从任一活跃会话的 live 连接发现工具
-        for e in module.session_mgr.list_entries():
-            entry = module.session_mgr._sessions.get(e["session_key"])
-            agent = entry.agent if entry else None
-            mgr = getattr(agent, "mcp_manager", None) if agent else None
-            if not mgr:
-                continue
-            conn = mgr.get_connection(name)
-            if conn is None or not conn.is_initialized:
-                continue
-            from core.mcp_client import run_in_mcp_loop
-            try:
-                tools = run_in_mcp_loop(conn.discover_tools(), timeout=15)
-            except Exception as e:
-                return _err(f"发现工具失败: {e}", 500)
-            return web.json_response(
-                {"server": name,
-                 "tools": [t.get("name") for t in (tools or [])]})
-        return _err(f"无活跃连接可查询 {name}", 404)
-    return handler
-
-
 # ---------- Skills ----------
 
 def _skill_manager():
@@ -491,3 +469,206 @@ def _make_prompt_apply(module):
         module.bus.publish("prompt.updated", {"file": "", "applied_to": n})
         return web.json_response({"queued": n})
     return handler
+
+
+
+# ---------- Prompt 页 · 主会话默认能力（tools / skills / MCP） ----------
+
+_NON_WORKSPACE_SCOPE = "gateway:non-workspace"
+
+
+def _read_main_session_caps() -> dict:
+    """读取 gateway.webui.main_session 配置；缺省返回空 dict。"""
+    from core.config_writer import read_raw_config
+    data, status = read_raw_config()
+    if status == "corrupt":
+        raise ValueError("config.json 损坏，请人工修复后重试")
+    gateway = data.get("gateway") or {}
+    webui = gateway.get("webui") or {}
+    caps = webui.get("main_session") or {}
+    return {str(k): v for k, v in caps.items()} if isinstance(caps, dict) else {}
+
+
+def _normalize_caps_value(value, field_name: str):
+    """主会话能力数组规范化：None 保留为 null（继承全部），否则仅保留非空字符串并去重。"""
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} 必须是数组")
+    seen = set()
+    out = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{field_name} 只能包含非空字符串")
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _runtime_update_main_session_caps(module, caps: dict) -> None:
+    """让运行中的 Dispatcher 在下次创建主会话 Agent 时读取最新能力子集。"""
+    dispatcher = getattr(module, "dispatcher", None)
+    if dispatcher is None:
+        return
+    dispatcher.agent_config["main_session_caps"] = dict(caps or {})
+
+
+def _make_main_session_get(module):
+    async def handler(request):
+        from gateway.webui import catalog_service
+        try:
+            caps = _read_main_session_caps()
+        except ValueError as exc:
+            return _err(str(exc), 500)
+        try:
+            catalog = catalog_service.get_all_catalogs(module)
+        except Exception as exc:
+            logger.warning("主会话能力 Catalog 加载失败: %s", exc)
+            catalog = {"tools": [], "skills": [], "mcp": {"servers": []}}
+        return web.json_response({
+            "session_key": _NON_WORKSPACE_SCOPE,
+            "config": {
+                "tools": caps.get("tools"),
+                "skills": caps.get("skills"),
+                "mcp_servers": caps.get("mcp_servers"),
+            },
+            "catalog": catalog,
+        })
+    return handler
+
+
+def _make_main_session_put(module):
+    async def handler(request):
+        body = await _body(request)
+        if body is None:
+            return _err("无效的 JSON")
+        try:
+            tools = _normalize_caps_value(body.get("tools"), "tools")
+            skills = _normalize_caps_value(body.get("skills"), "skills")
+            mcp_servers = _normalize_caps_value(
+                body.get("mcp_servers"), "mcp_servers")
+        except ValueError as exc:
+            return _err(str(exc), 400)
+
+        from core.config_writer import read_raw_config, backup_file, write_config
+        from core.config_loader import load_config
+
+        data, status = read_raw_config()
+        if status == "corrupt":
+            return _err("config.json 损坏，请人工修复后重试", 500)
+
+        if mcp_servers is not None:
+            servers = data.get("mcp", {}).get("servers") or []
+            configured = {
+                s.get("name")
+                for s in servers
+                if isinstance(s, dict) and s.get("name")
+            }
+            unknown = [n for n in mcp_servers if n not in configured]
+            if unknown:
+                return _err("未配置的 MCP 服务器: " + ", ".join(unknown), 400)
+
+        gateway = data.setdefault("gateway", {})
+        webui = gateway.setdefault("webui", {})
+        webui["main_session"] = {
+            "tools": tools,
+            "skills": skills,
+            "mcp_servers": mcp_servers,
+        }
+        try:
+            backup_file()
+            write_config(None, data)
+            load_config(force_reload=True)
+        except OSError as exc:
+            return _err(str(exc), 500)
+
+        _runtime_update_main_session_caps(module, webui["main_session"])
+        module.bus.publish("config.updated",
+                           {"section": "gateway.webui.main_session"})
+        return web.json_response({"ok": True, "config": webui["main_session"]})
+    return handler
+
+
+def _make_main_session_preview(module):
+    async def handler(request):
+        body = await _body(request)
+        if body is None:
+            return _err("??? JSON")
+
+        try:
+            tools = _normalize_caps_value(body.get("tools"), "tools")
+            skills = _normalize_caps_value(body.get("skills"), "skills")
+            mcp_servers = _normalize_caps_value(
+                body.get("mcp_servers"), "mcp_servers")
+        except ValueError as exc:
+            return _err(str(exc), 400)
+
+        from gateway.webui import catalog_service
+        from gateway.webui import prompt_preview
+        from tools import ToolRegistry
+        from tools.builtin_tools import register_all_tools
+        from tools.web_tools import register_web_tools
+        from skills.manager import SkillManager
+        from core.config_loader import _find_project_root, load_config
+        from pathlib import Path
+
+        _cfg = load_config()
+        _workspace_cfg = _cfg.get("permission", {}).get("workspace", "./workspace")
+        _workspace_path = Path(_workspace_cfg)
+        if not _workspace_path.is_absolute():
+            _workspace_path = _find_project_root() / _workspace_path
+
+        # null ??????????????? catalog ????
+        try:
+            tool_catalog = catalog_service.get_tools_catalog()
+            skill_catalog = catalog_service.get_skills_catalog()
+            mcp_catalog = catalog_service.get_mcp_catalog(module)
+        except Exception as exc:
+            logger.warning("??????? catalog ????: %s", exc)
+            tool_catalog, skill_catalog = [], []
+            mcp_catalog = {"servers": []}
+
+        all_tools = [t.get("name") for t in tool_catalog if t.get("name")]
+        all_skills = [s.get("id") or s.get("name") for s in skill_catalog]
+        all_mcp = [s.get("name") for s in (mcp_catalog or {}).get("servers", [])
+                   if s.get("name")]
+
+        selected_tools = all_tools if tools is None else tools
+        selected_skills = all_skills if skills is None else skills
+        selected_mcp = all_mcp if mcp_servers is None else mcp_servers
+
+        registry = ToolRegistry()
+        register_all_tools(registry, memory_manager=None, sandbox=None,
+                           process_manager=None)
+        register_web_tools(registry)
+
+        skill_mgr = SkillManager(skills_dir=str(_find_project_root() / "SKILLS"))
+        try:
+            skill_mgr.load_all()
+        except Exception:
+            pass
+
+        profile = type("PreviewProfile", (), {
+            "name": "Gateway Non-workspace",
+            "system_prompt": "",
+            "tools": list(selected_tools),
+            "skills": list(selected_skills),
+            "mcp_servers": list(selected_mcp),
+        })()
+
+        try:
+            data = prompt_preview.build_preview(
+                profile,
+                tool_registry=registry,
+                skill_manager=skill_mgr,
+                framework_root=str(_find_project_root()),
+                project_root=str(_find_project_root()),
+                working_directory=str(_workspace_path.resolve()),
+            )
+        except Exception as exc:
+            logger.exception("????? preview failed")
+            return _err(str(exc), status=500)
+        return web.json_response(data)
+    return handler
+

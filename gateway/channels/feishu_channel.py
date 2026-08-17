@@ -19,7 +19,7 @@ from core.protocols.vision import _REJECT_SIZE
 from gateway.channels.base import Channel, InboundMessage
 from gateway.textutil import split_text, md_to_feishu_card
 
-logger = logging.getLogger("hello_agent.gateway.feishu")
+logger = logging.getLogger("jk_agent.gateway.feishu")
 
 
 class FeishuChannel(Channel):
@@ -55,7 +55,7 @@ class FeishuChannel(Channel):
         self._running = True
         self._thread = threading.Thread(
             target=self._run_ws_client,
-            name="hello-agent-feishu",
+            name="jkagent-feishu",
             daemon=True,
         )
         self._thread.start()

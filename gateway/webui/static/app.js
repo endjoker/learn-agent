@@ -10,6 +10,9 @@
     status: window.PageStatus,
     cron: window.PageCron,
     settings: window.PageSettings,
+    agents: window.PageAgents,
+    "agent-editor": window.PageAgents,
+    workspace: window.PageWorkspace,
   };
 
   const main = document.getElementById("main");
@@ -20,8 +23,11 @@
   // ---------- 全局唯一 EventSource ----------
   const sseState = document.getElementById("sse-state");
   let es = null;
+  let lastEventId = 0;
   function connectSSE() {
-    try { es = new EventSource("/api/events"); } catch (e) { return; }
+    // Phase 5：带 Last-Event-ID 重连，服务端先补 backlog 再进实时
+    const url = "/api/events" + (lastEventId ? "?last_event_id=" + lastEventId : "");
+    try { es = new EventSource(url); } catch (e) { return; }
     es.onopen = function () {
       sseState.textContent = "SSE: 已连接";
       sseState.className = "sse-state ok";
@@ -34,26 +40,35 @@
     es.onmessage = function (ev) {
       let evt;
       try { evt = JSON.parse(ev.data); } catch (e) { return; }
-      const set = sseListeners[evt.type];
-      if (!set) return;
-      for (const h of Array.from(set)) {
-        try { h(evt.data || {}); } catch (e) { console.error(e); }
+      if (evt.event_id && evt.event_id > lastEventId) lastEventId = evt.event_id;
+      const sets = [sseListeners[evt.type], sseListeners["*"]];
+      for (const set of sets) {
+        if (!set) continue;
+        for (const h of Array.from(set)) {
+          try { h(evt.data || {}, evt); } catch (e) { console.error(e); }
+        }
       }
     };
   }
   connectSSE();
+  // 连接状态与 last event id 暴露给页面（重连/resync）
+  HA.getSSEState = function () {
+    return { connected: es && es.readyState === 1, lastEventId };
+  };
 
-  // 页面订阅/注销 SSE 事件
+  // 页面订阅/注销 SSE 事件（type 支持 "*" 通配，接收全部事件）
   HA.onSSE = function (type, handler) {
-    (sseListeners[type] = sseListeners[type] || new Set()).add(handler);
-    return function () { (sseListeners[type] || new Set()).delete(handler); };
+    const key = type || "*";
+    (sseListeners[key] = sseListeners[key] || new Set()).add(handler);
+    return function () { (sseListeners[key] || new Set()).delete(handler); };
   };
 
   // ---------- 路由 ----------
   function route() {
     const hash = location.hash || "#/chat";
     const name = hash.replace(/^#\//, "").split("?")[0] || "chat";
-    const PageCls = PAGES[name] || PAGES.chat;
+    const knownPage = Object.prototype.hasOwnProperty.call(PAGES, name);
+    const PageCls = knownPage ? PAGES[name] : PAGES.chat;
 
     if (current && typeof current.destroy === "function") {
       try { current.destroy(); } catch (e) { console.error(e); }
@@ -63,11 +78,25 @@
       a.classList.toggle("active", a.dataset.page === (PAGES[name] ? name : "chat"));
     });
 
-    current = new PageCls();
-    currentName = name;
     const container = HA.el("div", { class: "page" });
     main.appendChild(container);
-    current.render(container);
+    if (typeof PageCls !== "function") {
+      current = null;
+      currentName = name;
+      container.appendChild(HA.el("div", { class: "page-load-error" },
+        HA.el("div", { class: "page-load-error-title", text: "页面模块加载失败" }),
+        HA.el("div", { text: `「${name}」页面脚本未正确加载，请刷新页面或查看浏览器控制台。` })));
+      return;
+    }
+    current = new PageCls();
+    currentName = name;
+    Promise.resolve(current.render(container)).catch((error) => {
+      console.error(error);
+      container.innerHTML = "";
+      container.appendChild(HA.el("div", { class: "page-load-error" },
+        HA.el("div", { class: "page-load-error-title", text: "页面渲染失败" }),
+        HA.el("div", { text: error && error.message ? error.message : "未知错误" })));
+    });
   }
 
   window.addEventListener("hashchange", route);

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from .sandbox.guard import sanitize_output
+from .shell import shell_command
 from .sandbox.executor import OutputDrainer
 
 _IS_WINDOWS = os.name == "nt"
@@ -33,23 +34,12 @@ _CHUNK = 65536
 
 def _kill_tree(proc: subprocess.Popen) -> None:
     """杀整个进程树（shell 包装层启动 python 时，杀 shell 会留下 python 孤儿，
-    其仍持有管道 → drain 线程阻塞。必须杀树让子进程退出、管道关闭）。"""
-    try:
-        if _IS_WINDOWS:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True, timeout=8,
-            )
-        else:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                proc.kill()
-    except Exception:
-        try:
-            proc.kill()
-        except (ProcessLookupError, OSError):
-            pass
+    其仍持有管道 → drain 线程阻塞。必须杀树让子进程退出、管道关闭）。
+
+    统一实现见 core.sandbox.executor._kill_process_tree（taskkill /T + killpg）。
+    """
+    from .sandbox.executor import _kill_process_tree
+    _kill_process_tree(proc)
 
 
 @dataclass
@@ -117,6 +107,11 @@ class ProcessManager:
 
     def _close_session(self, s: ProcessSession):
         """关闭会话的管道/drain，从注册表移除"""
+        try:
+            from .orphan_processes import record as _record_orphan
+            _record_orphan(s.proc.pid, False)
+        except Exception:
+            pass
         for d in (s.out_drainer, s.err_drainer):
             if d:
                 d.join(timeout=1)
@@ -150,7 +145,7 @@ class ProcessManager:
 
         # Popen 包装 shell（与 BashTool 一致；L2 已查 command 原串）
         # CREATE_NEW_PROCESS_GROUP / start_new_session：便于 _kill_tree 杀整树
-        shell = ["powershell", "-NoProfile", "-Command", command] if _IS_WINDOWS else ["bash", "-c", command]
+        shell = shell_command(command)
         kwargs = dict(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -168,6 +163,9 @@ class ProcessManager:
             return -1, f"❌ shell 未找到: {shell[0]}"
         except Exception as e:
             return -1, f"❌ 启动失败: {e}"
+
+        from .orphan_processes import record as _record_orphan
+        _record_orphan(proc.pid, True)
 
         # 确保 Popen 成功后无论 drainer 创建/启动是否异常，都能清理子进程
         session = None

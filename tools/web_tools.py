@@ -24,7 +24,7 @@ from urllib.parse import urlparse
 from .base_tool import BaseTool
 from core.safe_http import UnsafeUrl, request as safe_request
 
-logger = logging.getLogger('hello_agent')
+logger = logging.getLogger('jk_agent')
 
 
 # ============================================================
