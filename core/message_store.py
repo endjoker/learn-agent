@@ -92,6 +92,9 @@ class MessageStore:
         self._messages: List[Dict] = []
         self._events: List[Dict] = []
         self.max_tokens = max_tokens
+        # 模型真实上下文窗口（token），由 Agent 初始化/切换模型时同步。
+        # 与 max_tokens（历史预算，= context_length - 输出预留）区分。
+        self.model_context_length = 0
         self._on_update = on_update
         self._created_at = datetime.now()
 
@@ -270,7 +273,8 @@ class MessageStore:
         return {
             "total_messages": len(self._messages),
             "total_tokens": total_tokens,
-            "max_tokens": self.max_tokens,
+            "max_tokens": self.max_tokens,                 # 历史预算（压缩/截断阈值）
+            "model_context_length": self.model_context_length,  # 模型真实上下文窗口
             "usage_ratio": total_tokens / self.max_tokens if self.max_tokens > 0 else 0,
             "remaining_tokens": max(0, self.max_tokens - total_tokens),
             "breakdown": breakdown,
@@ -306,6 +310,7 @@ class MessageStore:
             "model_base_url": self.model_base_url,
             "model_llm_type": self.model_llm_type,
             "max_tokens": self.max_tokens,
+            "model_context_length": self.model_context_length,
             "message_count": len(messages),
             "messages": messages,
         }
@@ -349,7 +354,10 @@ class MessageStore:
         self.model_provider = data.get("model_provider", "")
         self.model_base_url = data.get("model_base_url", "")
         self.model_llm_type = data.get("model_llm_type", "")
-        self.max_tokens = data.get("max_tokens", self.max_tokens)
+        # 注意：不恢复 max_tokens / model_context_length —— 它们是运行期派生值，
+        # 由 Agent 按当前模型上下文重新计算（_history_budget），磁盘旧值可能对应
+        # 旧模型/旧算法，恢复时不应覆盖当前预算。
+        # self.max_tokens = data.get("max_tokens", self.max_tokens)
 
         # 恢复消息（不含 system prompt）
         # 注意：使用 clear + extend 保持列表对象不变，避免外部引用断开
@@ -458,13 +466,17 @@ class MessageStore:
         anchor_indicator = ""
         if s.get("anchored"):
             anchor_indicator = f"  📌 锚点: {s['anchored_tokens']:,} tokens（API 实测）"
+        model_ctx = s.get("model_context_length") or 0
         parts = [
             f"📊 上下文状态  session: {self.session_id}",
             f"  ─────────────────",
             f"  消息: {s['total_messages']} 条",
-            f"  占用: {s['total_tokens']:,} / {s['max_tokens']:,} tokens ({ratio:.1f}%)",
-            f"  剩余: {s['remaining_tokens']:,} tokens",
         ]
+        if model_ctx > 0:
+            parts.append(f"  模型上下文: {model_ctx:,} tokens")
+            parts.append(f"  历史预算: {s['max_tokens']:,} tokens（预留输出）")
+        parts.append(f"  占用: {s['total_tokens']:,} / {s['max_tokens']:,} tokens ({ratio:.1f}%)")
+        parts.append(f"  剩余: {s['remaining_tokens']:,} tokens")
         if anchor_indicator:
             parts.append(anchor_indicator)
         parts.append(f"  按角色（估算值）:")

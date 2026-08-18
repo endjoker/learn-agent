@@ -254,12 +254,10 @@
       ],
       "linux": [
         "/etc",
-        "/usr",
-        "/boot",
         "/sys",
         "/proc",
-        "/var/log",
-        "/var/lib"
+        "/var/lib",
+        "/boot"
       ],
       "mac": [
         "/System",

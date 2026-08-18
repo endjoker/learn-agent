@@ -1,0 +1,26 @@
+{
+  "name": "find-skill",
+  "description": "从 GitHub 上查找高星、高质量的 agent skill。当用户问『有没有做 X 的 skill』『帮我找某个功能的 skill』『怎么实现 Y（可能已有现成 skill）』『想扩展能力』时使用。基于 GitHub API 搜索 + 星数/维护状态评估，输出候选清单与推荐，并可联动 skill-inspector 做安全审查。",
+  "version": 1,
+  "created_at": "2026-08-19T00:00:00",
+  "tags": [
+    "search",
+    "discovery",
+    "github",
+    "skill"
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "搜索关键词，如 'claude skill debugging'、'skill pdf processing'"
+      },
+      "domain": {
+        "type": "string",
+        "description": "可选，领域过滤：如 'code-review'、'security'、'document'"
+      }
+    },
+    "required": ["query"]
+  }
+}

@@ -50,6 +50,7 @@ def register_routes(app: web.Application, module):
     app.router.add_get("/api/approvals", _make_approvals(module))
     app.router.add_post("/api/approvals/{aid}", _make_approval_answer(module))
     app.router.add_get("/api/commands", _make_commands(module))
+    app.router.add_get("/api/sessions/{key}/context", _make_context(module))
 
 
 def _err(text, status=400):
@@ -96,6 +97,27 @@ def _make_sessions(module):
                 "source": "disk",
             })
         return web.json_response({"sessions": out})
+    return handler
+
+
+def _make_context(module):
+    """会话上下文占用统计（WebUI 输入框上下文指示器数据源）。"""
+    async def handler(request):
+        key = request.match_info["key"]
+        entry = module.session_mgr._sessions.get(key)
+        agent = entry.agent if entry else None
+        if agent is None or not hasattr(agent, "store"):
+            return web.json_response({"available": False})
+        try:
+            stats = agent.store.stats()
+        except Exception:
+            return web.json_response({"available": False})
+        return web.json_response({
+            "available": True,
+            "session_key": key,
+            "model": getattr(agent.llm, "model", "") or "",
+            **stats,
+        })
     return handler
 
 
@@ -531,9 +553,53 @@ def _make_approval_answer(module):
 
 # ---------- 命令补全 ----------
 
+def _skills_for_session(module, session_key: str, allowed_skills=None) -> list:
+    """Return only skills available to this session's effective capability scope."""
+    entry = module.session_mgr._sessions.get(session_key) if session_key else None
+    agent = getattr(entry, "agent", None) if entry else None
+    if agent is not None:
+        names = set(getattr(agent.tool_registry, "_skill_tool_names", set()))
+        manager = getattr(agent, "skill_manager", None)
+        skills = manager.get_all_skills() if manager else []
+        return [skill for skill in skills if skill.name in names]
+
+    from gateway.webui.catalog_service import get_skills_catalog
+    skills = get_skills_catalog()
+    if allowed_skills is not None:
+        allowed = set(allowed_skills)
+        skills = [skill for skill in skills if skill.get("name") in allowed]
+    return skills
+
+
+def _skill_name(skill) -> str:
+    """统一从 Skill 对象或 dict 提取名称（catalog 返回 dict，运行期返回 Skill 对象）。"""
+    if isinstance(skill, dict):
+        return skill.get("name") or ""
+    return getattr(skill, "name", "") or ""
+
+
+def _skill_description(skill) -> str:
+    """统一从 Skill 对象或 dict 提取描述。"""
+    if isinstance(skill, dict):
+        return skill.get("description") or ""
+    return getattr(skill, "description", "") or ""
+
+
+def _skill_command_items(skills: list) -> list:
+    return [{"name": f"/{_skill_name(skill)} ",
+             "args": "[任务描述]",
+             "help": "⚡ " + _skill_description(skill),
+             "kind": "skill", "insert_text": f"/{_skill_name(skill)} "}
+            for skill in skills]
+
+
 def _make_commands(module):
     async def handler(request):
+        session_key = (request.query.get("session_key") or "").strip()
         commands = module.dispatcher.commands_table()
+        main_caps = module.dispatcher.agent_config.get("main_session_caps") or {}
+        commands.extend(_skill_command_items(_skills_for_session(
+            module, session_key, main_caps.get("skills"))))
         # /plan 由前端编排（两阶段 API），补一条 client_hint
         commands.append({"name": "/plan", "args": "[任务描述]",
                          "help": "/plan — 生成执行方案（两阶段确认）",

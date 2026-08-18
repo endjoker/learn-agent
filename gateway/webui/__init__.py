@@ -296,7 +296,11 @@ class WebUIModule:
         app.router.add_static("/ui/", STATIC_DIR)
 
     async def _serve_index(self, request: web.Request) -> web.Response:
-        return web.FileResponse(STATIC_DIR / "index.html")
+        # index.html 永不缓存：资源 URL 已带版本号（?v=），index 本身必须
+        # 每次拉新，否则浏览器缓存的旧 index 会引用旧版本资源（改动不生效）。
+        resp = web.FileResponse(STATIC_DIR / "index.html")
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return resp
 
     async def _redirect_index(self, request: web.Request) -> web.Response:
         raise web.HTTPFound("/ui/")

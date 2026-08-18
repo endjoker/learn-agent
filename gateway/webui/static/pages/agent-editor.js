@@ -422,7 +422,9 @@ window.PageAgents = class {
     panel.appendChild(HA.el("div", { class: "ws-field" },
       HA.el("label", { text: `技能（${(d.skills || []).length}）` }),
       new HA.SearchSelector({
-        items: (this.state.catalogs.skills || []).map(s => ({ id: s.id, name: s.name })),
+        items: (this.state.catalogs.skills || []).map(s => ({
+          id: s.id, name: s.name, description: s.description || "",
+        })),
         selected: new Set(d.skills || []),
         onToggle: toggle("skills"), placeholder: "搜索 技能…",
       }).render()));

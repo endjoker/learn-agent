@@ -5,6 +5,7 @@
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from collections import OrderedDict
@@ -677,9 +678,15 @@ class Dispatcher:
         if cancellation_token is not None and cancellation_token.is_cancelled:
             agent.request_stop()
 
+        # ---- /skill：将已注册（即当前会话可用）的 Skill 指令与任务组合后执行 ----
+        skill_handled, skill_task, skill_reply = self._prepare_skill_command(agent, msg.text)
+        if skill_handled and skill_reply is not None:
+            return skill_reply
+
         # ---- / 命令拦截（不经过 LLM） ----
+        command_text = skill_task if skill_handled else msg.text
         cmd_reply = await self._handle_gateway_command(
-            agent, msg.text, loop, executor, entry)
+            agent, command_text, loop, executor, entry)
         if cmd_reply is not None:
             return cmd_reply
 
@@ -701,7 +708,8 @@ class Dispatcher:
             # execution input as a request to reconfigure the scheduler.
             agent._runtime_tool_blocklist = (
                 frozenset(prior_blocklist) | _SCHEDULER_ADMIN_TOOLS)
-        task_input = self._task_input_for_agent(msg, runtime_metadata)
+        task_input = (skill_task if skill_handled
+                      else self._task_input_for_agent(msg, runtime_metadata))
         afuture = loop.run_in_executor(
             executor,
             lambda: agent.run(task_input, False, images=_images,
@@ -738,6 +746,65 @@ class Dispatcher:
                 return result
             except asyncio.TimeoutError:
                 return f"⏰ 处理超时（>{self._hard_timeout}s），请简化问题后重试"
+
+    def _prepare_skill_command(self, agent, text: str) -> tuple[bool, str, Optional[str]]:
+        """Resolve a slash token against the Skill tools registered in this session.
+
+        A skill is invoked directly by its own name: ``/code-review <task>`` loads
+        the skill's instruction and executes the task in the same agent run.
+        Builtin gateway commands take priority over same-named skills.
+
+        支持可选 JSON 参数段：``/code-review {"files":["a.py"]} 检查这些文件``，
+        参数会透传给 SkillTool.execute，使 skill 声明的 parameters 在调用记录中可见。
+        Returns ``(handled, task_input, immediate_reply)``.
+        """
+        stripped = (text or "").strip()
+        parts = stripped.split(None, 1)
+        if not parts or not parts[0].startswith("/"):
+            return False, text, None
+        cmd_token = parts[0]
+        # 内置命令优先（/compact、/clear 等），避免与同名 skill 冲突
+        if cmd_token.lower() in self._commands:
+            return False, text, None
+        name = cmd_token[1:]
+        skill_names = set(getattr(agent.tool_registry, "_skill_tool_names", set()))
+        if name not in skill_names:
+            # 非内置命令、非当前会话 skill —— 交给后续普通命令 / LLM 处理
+            return False, text, None
+        task = parts[1].strip() if len(parts) > 1 else ""
+        tool = agent.tool_registry.get_tool(name)
+        if tool is None:
+            return True, "", f"❌ Skill '{name}' 不可用于当前会话"
+
+        # 可选 JSON 参数段：解析任务文本开头的 JSON 对象（健壮处理嵌套），
+        # 透传给 SkillTool.execute，使 skill 声明的 parameters 在调用记录中可见。
+        params: dict = {}
+        if task.startswith("{"):
+            try:
+                parsed, end = json.JSONDecoder().raw_decode(task)
+                if isinstance(parsed, dict):
+                    params = parsed
+                    task = task[end:].strip()
+            except json.JSONDecodeError:
+                pass  # 不是合法 JSON，整体当作任务文本
+
+        if not task and not params:
+            return True, "", f"已选择 skill '{name}'，请在后面补充要执行的任务。"
+        # 有必填参数但未在 JSON 中提供时，把自然语言 task 映射到第一个必填参数
+        # （仅用于【技能执行】头部展示，task 仍保留作为用户任务传给 LLM）。
+        # 例如 /find-skill 找代码审查的skill → query="找代码审查的skill"
+        schema = getattr(tool, "parameters", None) or {}
+        required = schema.get("required") or []
+        if required and task and not params:
+            params[required[0]] = task
+        try:
+            instruction = tool.execute(**params)
+        except Exception as exc:
+            logger.warning("准备 skill '%s' 失败: %s", name, exc)
+            return True, "", f"❌ 载入 skill '{name}' 失败"
+        # 审计标记：skill 名与参数已包含在 instruction 中（SkillTool.execute 输出），
+        # 与用户任务合并后作为单条输入，保留完整调用痕迹供历史追踪。
+        return True, f"{instruction}\n\n【用户任务】\n{task}", None
 
     async def _handle_gateway_command(
         self, agent, text: str, loop, executor, entry=None

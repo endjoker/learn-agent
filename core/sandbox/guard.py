@@ -42,8 +42,7 @@ SYSTEM_PATHS_WIN = [
     r"C:\System32",
 ]
 SYSTEM_PATHS_LINUX = [
-    "/etc", "/usr", "/boot", "/sys", "/proc",
-    "/var/log", "/var/lib",
+    "/etc", "/sys", "/proc", "/var/lib", "/boot",
 ]
 SYSTEM_PATHS_MAC = [
     "/System", "/Library", "/Applications",
@@ -468,11 +467,13 @@ def check_write_content(file_path: str, content: str) -> tuple[bool, str]:
 _CMD_ABS_PATH_RE = re.compile(r'(/[^\s;|&<>`\'"(){}\[\]]{2,})')
 
 
-def _check_command_for_paths(command: str) -> tuple[bool, str]:
+def _check_command_for_paths(command: str, sensitive_files: list | None = None) -> tuple[bool, str]:
     """检查命令字符串中引用的路径是否命中系统路径或敏感文件。
 
     从命令中提取绝对路径并调用 _is_system_path()；同时检测命令引用的
     token 是否命中 SENSITIVE_FILES 基名。
+    sensitive_files 可传入自定义列表（如 unreviewed 模式只查密钥/版本库），
+    默认使用模块级 SENSITIVE_FILES。
     返回 (is_blocked, reason)。
     """
     # 1. 绝对路径 → 系统路径检查
@@ -483,7 +484,8 @@ def _check_command_for_paths(command: str) -> tuple[bool, str]:
 
     # 2. 敏感文件引用（按文件名 token 检测，如 rm agent.py / cat .env / > core/…）
     cmd_lower = command.lower()
-    for sf in SENSITIVE_FILES:
+    sf_list = SENSITIVE_FILES if sensitive_files is None else sensitive_files
+    for sf in sf_list:
         sf_base = os.path.basename(sf).lower()
         if not sf_base:
             continue

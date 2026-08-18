@@ -101,4 +101,34 @@
 
   window.addEventListener("hashchange", route);
   route();
+
+  // ---------- UI 版本检测：代码热更新后提示刷新（避免旧 JS 渲染异常）----------
+  // 页面打开期间不会自动重载脚本；后端静态资源更新后，已打开的页面仍跑旧代码。
+  // 定期用 no-store 拉取 index.html，对比其中资源版本号签名；不一致时提示刷新。
+  function uiVersionSignature() {
+    const list = [...document.querySelectorAll('script[src*="?v="], link[href*="?v="]')]
+      .map(el => (el.src || el.href).split("/").pop())
+      .sort()
+      .join("|");
+    return list;
+  }
+  const loadedSignature = uiVersionSignature();
+  let versionWarned = false;
+  async function checkUiVersion() {
+    try {
+      const resp = await fetch("/ui/", { cache: "no-store" });
+      if (!resp.ok) return;
+      const html = await resp.text();
+      const latest = [...html.matchAll(/(?:script[^>]*src|link[^>]*href)="([^"]*\?v=[0-9.]+)"/g)]
+        .map(m => m[1].split("/").pop())
+        .sort()
+        .join("|");
+      if (latest && latest !== loadedSignature && !versionWarned) {
+        versionWarned = true;
+        HA.toast("检测到界面已更新，请刷新页面以加载新版本（Ctrl+Shift+R）", "ok");
+      }
+    } catch (e) { /* 版本检测失败静默 */ }
+  }
+  setInterval(checkUiVersion, 30000);
+  checkUiVersion();
 })();

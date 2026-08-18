@@ -1,0 +1,22 @@
+{
+  "name": "skill-inspector",
+  "description": "审查 AI agent skill 是否安全可安装。基于 NVIDIA SkillSpector 静态扫描 + 源码语义审查，输出 APPROVE / CAUTION / REJECT 判定。用于：下载/安装 skill 前评估其安全性、检查是否过度授权、是否存在恶意行为（提示注入、数据外泄、凭据窃取、持久化等）。",
+  "version": 1,
+  "created_at": "2026-08-19T00:00:00",
+  "tags": [
+    "security",
+    "audit",
+    "review",
+    "skill"
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "要审查的目标：本地 skill 目录、压缩包路径或仓库 URL"
+      }
+    },
+    "required": ["target"]
+  }
+}

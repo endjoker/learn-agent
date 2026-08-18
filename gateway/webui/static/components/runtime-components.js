@@ -43,10 +43,16 @@ HA.SearchSelector = class {
         high: "\u9ad8\u98ce\u9669\uff08\u6267\u884c\u547d\u4ee4/\u4ee3\u7801\uff09",
       };
       const tag = item.risk ? HA.badge(riskLabels[item.risk] || item.risk, item.risk) : null;
+      // 名称 + 可选描述（描述存在时在名称下方小字展示，便于配置时了解能力）
+      const textWrap = HA.el("span", { class: "ws-check-text" },
+        HA.el("span", { class: "ws-check-name", text: item.name || id }),
+        item.description
+          ? HA.el("span", { class: "ws-check-desc", text: item.description })
+          : null);
       const row = HA.el("label", { class: "ws-check" },
         HA.el("input", { type: "checkbox", checked, disabled: item.available === false,
           onchange: (e) => { this.onToggle(id, e.target.checked); } }),
-        HA.el("span", { text: item.name || id }),
+        textWrap,
         tag || null);
       if (item.available === false) {
         row.classList.add("dim");
@@ -112,6 +118,15 @@ HA.confirm = function (message, okText) {
 // 组件接收数据，不直接订阅全局 SSE。
 // ============================================================
 
+// 任务耗时格式化（deepseek-harness 风格 HH:MM:SS）
+HA.fmtDuration = function (ms) {
+  const total = Math.max(0, Math.floor((ms || 0) / 1000));
+  const h = String(Math.floor(total / 3600)).padStart(2, "0");
+  const m = String(Math.floor((total % 3600) / 60)).padStart(2, "0");
+  const s = String(total % 60).padStart(2, "0");
+  return `${h}:${m}:${s}`;
+};
+
 // 消息气泡：与主会话复用 .bubble / .bubble-text 视觉体系。
 HA.MessageBubble = class {
   constructor(msg) {
@@ -123,7 +138,17 @@ HA.MessageBubble = class {
     const content = String(this.msg.content || "");
     const bubble = HA.el("div", { class: `bubble ${visualRole}` });
     if (visualRole === "user") {
+      bubble.dataset.copyText = content;
       bubble.appendChild(HA.el("div", { class: "bubble-text", text: content }));
+      let copyBtn;
+      copyBtn = HA.el("button", {
+        class: "answer-action",
+        type: "button",
+        text: "复制",
+        title: "复制输入内容",
+        onclick: () => this._copyAnswer(bubble, copyBtn),
+      });
+      bubble.appendChild(HA.el("div", { class: "answer-actions" }, copyBtn));
     } else if (visualRole === "assistant") {
       bubble.dataset.copyText = content;
       bubble.appendChild(HA.el("div", { class: "bubble-text md", html: HA.renderMd(content) }));
@@ -135,7 +160,10 @@ HA.MessageBubble = class {
         title: "复制回答",
         onclick: () => this._copyAnswer(bubble, copyBtn),
       });
-      bubble.appendChild(HA.el("div", { class: "answer-actions" }, copyBtn));
+      const timer = (this.msg.duration != null)
+        ? HA.el("span", { class: "task-timer", text: `⏱ ${HA.fmtDuration(this.msg.duration)}` })
+        : null;
+      bubble.appendChild(HA.el("div", { class: "answer-actions" }, copyBtn, timer || null));
     } else {
       bubble.appendChild(HA.el("pre", { class: "bubble-text", text: content }));
     }

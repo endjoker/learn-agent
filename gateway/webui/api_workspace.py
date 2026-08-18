@@ -56,6 +56,9 @@ def register_routes(app: web.Application, module):
     app.router.add_post("/api/workspaces/{workspace_id}/sessions/{session_id}/archive",
                        _make_session_archive(module))
     # Phase 4：运行链路
+    app.router.add_get(
+        "/api/workspaces/{workspace_id}/sessions/{session_id}/commands",
+        _make_commands(module))
     app.router.add_post(
         "/api/workspaces/{workspace_id}/sessions/{session_id}/chat",
         _make_chat(module))
@@ -569,6 +572,30 @@ def _filter_mcp_servers(module, selected_names: list) -> list:
     return [s for s in servers if (s.get("name") or "") in selected]
 
 
+def _make_commands(module):
+    """Return slash-command completions in the workspace session capability scope."""
+    async def handler(request):
+        wid = request.match_info["workspace_id"]
+        sid = request.match_info["session_id"]
+        try:
+            _require(module, "session_store").get_owned(wid, sid)
+            snapshot = _runtime_service(module).build_snapshot(wid, sid)
+        except (WorkspaceSessionNotFound, WorkspaceNotFound) as exc:
+            return _handle_store_error(exc)
+        except Exception as exc:
+            logger.warning("构建 workspace commands snapshot 失败: %s", exc)
+            return _err("运行配置解析失败", 422, "SNAPSHOT_BUILD_FAILED")
+        from gateway.webui.api_chat import _skill_command_items, _skills_for_session
+        commands = module.dispatcher.commands_table()
+        commands.extend(_skill_command_items(_skills_for_session(
+            module, "", snapshot.skills)))
+        commands.append({"name": "/plan", "args": "[任务描述]",
+                         "help": "/plan — 生成执行方案（两阶段确认）",
+                         "client_hint": "plan-flow"})
+        return web.json_response({"commands": commands})
+    return handler
+
+
 def _make_chat(module):
     async def handler(request):
         ws_store = _require(module, "workspace_store")
@@ -830,8 +857,15 @@ def _make_runtime_status(module):
         stale = False
         if snapshot is not None:
             stale = service.is_stale(snapshot, workspace=workspace, session=session)
+        context = None
+        if entry is not None and entry.agent is not None and hasattr(entry.agent, "store"):
+            try:
+                context = entry.agent.store.stats()
+            except Exception:
+                context = None
         return web.json_response({
             "workspace_id": wid,
+            "context": context,
             "session_id": sid,
             "session_key": session.session_key,
             "is_busy": session.is_busy or bool(entry and entry.is_busy),

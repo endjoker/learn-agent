@@ -33,6 +33,14 @@
 - 回答时先给结论，再给细节
 - 用户项目存在虚拟环境时，验证测试时尽量在虚拟环境中进行
 
+## 技能（Skill）使用规则
+
+- 用户需要查找/发现/搜索可用 skill 时，**优先使用 `find-skill`** 技能（GitHub 高星搜索 + 候选评估）
+- **安装任何外部 skill 前，必须先运行 `skill-inspector`** 做安全审查（静态扫描 + 语义审查），输出 APPROVE/CAUTION/REJECT 判定后才可安装
+- **用户需要设计方案/做设计决策/捋需求时，使用 `grill-me` 技能**（反复追问直到达成共识，走完决策树每个分支）
+- **当任务较长/多步骤时，使用 `executing-plans` 技能**（先制定计划，再逐步执行并验证，每步有明确完成定义）
+- 安装的 skill 需适配本项目格式：`SKILLS/{name}/skill.json` + `instruction.md`
+
 ## 禁止
 
 - 不执行 rm -rf /、format、shutdown 等破坏性命令

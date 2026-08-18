@@ -312,7 +312,9 @@ window.PagePrompt = class {
       "风险说明：低=只读/查询；中=写入/网络；高=执行命令或代码。实际执行仍受权限与审批控制。"));
 
     panel.appendChild(this._capField(
-      "技能", (cat.skills || []).map(s => ({ id: s.id || s.name, name: s.name })),
+      "技能", (cat.skills || []).map(s => ({
+        id: s.id || s.name, name: s.name, description: s.description || "",
+      })),
       "skills", null));
 
     panel.appendChild(this._capField(

@@ -1,0 +1,25 @@
+{
+  "name": "code-review",
+  "description": "全面的代码审查指南（来自 awesome-skills/code-review-skill ⭐1.7k）：覆盖 20+ 语言生态（Python/Go/Rust/TS/Java/C++ 等），含架构审查、性能审查、安全审计、代码质量反模式与常见 bug。用于：PR 审查、代码变更评审、建立审查标准、安全审计、性能检查。",
+  "version": 2,
+  "created_at": "2026-07-15T20:54:19",
+  "tags": [
+    "code",
+    "review",
+    "security",
+    "performance"
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "files": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "File paths to review"
+      }
+    },
+    "required": []
+  }
+}

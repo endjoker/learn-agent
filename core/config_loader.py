@@ -135,8 +135,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
                 "C:\\Program Files (x86)", "C:\\System32",
             ],
             "linux": [
-                "/etc", "/usr", "/boot", "/sys", "/proc",
-                "/var/log", "/var/lib",
+                "/etc", "/sys", "/proc", "/var/lib", "/boot",
             ],
             "mac": ["/System", "/Library", "/Applications"],
         },

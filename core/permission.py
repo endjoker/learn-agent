@@ -60,7 +60,14 @@ WRITE_COMMANDS = [
 ]
 
 # 危险命令检测 —— 统一从 guard.py 获取，避免重复定义
-from core.sandbox.guard import SENSITIVE_FILES, _match_dangerous, _check_command_for_paths
+from core.sandbox.guard import (SENSITIVE_FILES, _is_system_path,
+                                _match_dangerous, _check_command_for_paths)
+
+
+# unreviewed 模式下仍需拦截的敏感文件（密钥与版本库元数据）。
+# 核心代码文件（agent.py / core/*.py / requirements.txt 等）在 unreviewed
+# 下放行——用户可在免审模式编辑项目自身；ask 模式仍走完整 SENSITIVE_FILES。
+_UNREVIEWED_SENSITIVE_FILES = [".env", ".git"]
 
 
 def classify_bash_command(command: str) -> str:
@@ -473,6 +480,30 @@ class PermissionChecker:
                     return True
         return False
 
+    @staticmethod
+    def _classify_unreviewed_path(path: Path) -> str:
+        """unreviewed 模式下对路径分类，返回 "allow"（放行）或 "sensitive"（需审批）。
+
+        规则（顺序敏感）：
+        - .git/config 精确路径：放行（用户此前要求免审改 git 配置）
+        - .env（任意位置）与 .git 目录其余部分：敏感，需审批
+        - 其他：放行
+        """
+        # .git/config 精确路径 → 放行
+        try:
+            if path.name.lower() == "config" and path.parent.name.lower() == ".git":
+                return "allow"
+        except Exception:
+            pass
+        # .env 密钥文件（任意位置）
+        norm = os.path.normpath(str(path)).lower()
+        if norm == ".env" or norm.endswith(os.sep + ".env"):
+            return "sensitive"
+        # .git 目录其余部分（含 .git/HEAD、.git/objects 等）
+        if ".git" in {part.lower() for part in path.parts}:
+            return "sensitive"
+        return "allow"
+
     def _unreviewed_exception(self, tool_name: str, params: dict) -> str:
         """返回 unreviewed 下仍需人工审批的风险说明，空字符串表示普通操作。"""
         if tool_name == "bash":
@@ -480,18 +511,28 @@ class PermissionChecker:
             dangerous = _match_dangerous(command.lower())
             if dangerous:
                 return f"高危命令需审批: {dangerous}"
-            blocked, reason = _check_command_for_paths(command)
+            # unreviewed 下仅拦：系统路径 + 密钥文件 + .git；核心代码文件放行
+            blocked, reason = _check_command_for_paths(
+                command, sensitive_files=_UNREVIEWED_SENSITIVE_FILES)
             if blocked:
                 return f"敏感路径操作需审批: {reason}"
         for key in ("file_path", "path", "dest"):
             value = params.get(key)
-            if value and self._is_sensitive_path(self._resolve(str(value))):
-                return f"敏感路径操作需审批: {value}"
+            if value:
+                resolved = self._resolve(str(value))
+                if _is_system_path(resolved):
+                    return f"系统路径操作需审批: {value}"
+                if self._classify_unreviewed_path(resolved) == "sensitive":
+                    return f"敏感文件操作需审批: {value}"
         values = params.get("paths")
         if isinstance(values, list):
             for value in values:
-                if value and self._is_sensitive_path(self._resolve(str(value))):
-                    return f"敏感路径操作需审批: {value}"
+                if value:
+                    resolved = self._resolve(str(value))
+                    if _is_system_path(resolved):
+                        return f"系统路径操作需审批: {value}"
+                    if self._classify_unreviewed_path(resolved) == "sensitive":
+                        return f"敏感文件操作需审批: {value}"
         return ""
 
     def allow_workspace(self):

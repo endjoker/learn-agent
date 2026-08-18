@@ -1,0 +1,14 @@
+{
+  "name": "codebase-design",
+  "description": "代码库架构设计：在动手前规划模块边界、依赖方向、演进路径",
+  "version": 1,
+  "created_at": "2026-08-19T00:00:00",
+  "tags": [
+    "engineering"
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {},
+    "required": []
+  }
+}

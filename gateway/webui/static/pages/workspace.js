@@ -462,8 +462,10 @@ window.PageWorkspace = class {
     this._messageArea = HA.el("div", { class: "ws-chat-timeline" });
     shell.appendChild(this._messageArea);
     const composer = HA.el("div", { class: "ws-chat-composer" },
+      this._wsAcBox = HA.el("div", { class: "ws-ac-box", style: "display:none" }),
       HA.el("textarea", { class: "ws-chat-input", rows: 2,
-        placeholder: "\u8f93\u5165\u4efb\u52a1\u2026\u2026Enter \u53d1\u9001\uff0cShift+Enter \u6362\u884c",
+        placeholder: "\u8f93\u5165\u4efb\u52a1\u2026\u2026\uff08/ \u89e6\u53d1\u547d\u4ee4\u8865\u5168\uff1bEnter \u53d1\u9001\uff0cShift+Enter \u6362\u884c\uff09",
+        oninput: () => this._maybeWorkspaceAutocomplete(),
         onkeydown: (e) => {
           if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault();
@@ -471,14 +473,23 @@ window.PageWorkspace = class {
           }
         } }),
       HA.el("div", { class: "ws-chat-composer-actions" },
-        HA.el("span", { class: "ws-chat-keyhint", text: "Enter \u53d1\u9001" }),
-        HA.el("button", { class: "btn primary ws-chat-send", text: "\u53d1\u9001",
-          onclick: () => this._sendChat() })));
+        HA.el("span", { class: "ws-chat-keyhint", text: "Enter \u53d1\u9001 \u00b7 Shift+Enter \u6362\u884c" }),
+        this._wsCtxMeter = HA.el("div", { class: "ctx-meter ws-ctx-meter" },
+          HA.el("span", { class: "ctx-icon", text: "\ud83d\udcca" }),
+          HA.el("span", { class: "ctx-pct", text: "\u2013" }),
+          HA.el("div", { class: "ctx-tip" })),
+        HA.el("button", { class: "ws-chat-send", type: "button", title: "\u53d1\u9001\uff08Enter\uff09",
+          onclick: () => this._sendChat() },
+          HA.el("span", { class: "ws-chat-send-ico", text: "\u25b6" }))));
     this._composer = composer.querySelector("textarea");
+    this._workspaceCommands = [];
+    this._loadWorkspaceCommands();
     shell.appendChild(composer);
     this._centerBody.appendChild(shell);
     this._renderMessages();
+    this._stopWsCtxPoll();
     this._refreshRuntimeStatus();
+    this._startWsCtxPoll();
   }
 
   // ---------- 右栏：配置摘要 ----------
@@ -802,6 +813,13 @@ window.PageWorkspace = class {
         // the raw streamed text with it instead of rendering both variants.
         if (data.content && !isToolTurn) last.content = data.content;
         last.kind = isToolTurn ? "tool_calls" : (data.status === "error" ? "process" : "final");
+        // 任务耗时：仅最终回答（final）结算，工具轮不结算
+        if (!isToolTurn && this._chatState.taskStart) {
+          last.duration = Date.now() - this._chatState.taskStart;
+          this._chatState.taskStart = 0;
+          this._chatState.taskDuration = last.duration;
+          this._stopWsTaskTimer();
+        }
       }
       this._renderMessages();
     } else if (type === "text_reset") {
@@ -866,6 +884,14 @@ window.PageWorkspace = class {
       this._renderMessages();
     } else if (type === "agent_end" || type === "chat.done") {
       this._chatBusy = false;
+      if (this._chatState && this._chatState.taskStart) {
+        const last = [...this._chatState.messages].reverse().find(message => message.role === "assistant");
+        if (last && last.kind === "final" && last.duration == null) {
+          last.duration = Date.now() - this._chatState.taskStart;
+        }
+        this._chatState.taskStart = 0;
+      }
+      this._stopWsTaskTimer();
       this._updateStatusBar();
     }
   }
@@ -986,6 +1012,60 @@ window.PageWorkspace = class {
     } catch (e) { HA.toast("\u5ba1\u6279\u7b54\u590d\u5931\u8d25: " + e.message, "err"); }
   }
 
+  async _loadWorkspaceCommands() {
+    const wid = this.state.selectedWs, sid = this.state.selectedSession;
+    if (!wid || !sid) return;
+    try {
+      const d = await HA.api("GET",
+        `/api/workspaces/${encodeURIComponent(wid)}/sessions/${encodeURIComponent(sid)}/commands`,
+        undefined, { silent: true });
+      if (this.state.selectedWs === wid && this.state.selectedSession === sid) {
+        this._workspaceCommands = d.commands || [];
+      }
+    } catch (e) { this._workspaceCommands = []; }
+  }
+
+  // ---------- 任务运行时长（deepseek-harness 风格 HH:MM:SS）----------
+  _startWsTaskTimer() {
+    this._stopWsTaskTimer();
+    this._wsTaskTimer = setInterval(() => {
+      const state = this._chatState;
+      if (!state || !state.taskStart) { this._stopWsTaskTimer(); this._updateStatusBar(); return; }
+      if (this._statusBar) {
+        this._statusBar.textContent = `\u23f3 ${HA.fmtDuration(Date.now() - state.taskStart)}`;
+        this._statusBar.classList.add("busy");
+      }
+    }, 1000);
+  }
+  _stopWsTaskTimer() {
+    if (this._wsTaskTimer) { clearInterval(this._wsTaskTimer); this._wsTaskTimer = null; }
+  }
+
+  _maybeWorkspaceAutocomplete() {
+    const value = this._composer && this._composer.value || "";
+    if (!value.startsWith("/") || value.includes(" ")) return this._hideWorkspaceAutocomplete();
+    const hits = (this._workspaceCommands || []).filter(c => c.name.startsWith(value));
+    if (!hits.length) return this._hideWorkspaceAutocomplete();
+    this._wsAcBox.innerHTML = "";
+    for (const command of hits.slice(0, 8)) {
+      this._wsAcBox.appendChild(HA.el("div", {
+        class: "ws-ac-item", title: command.help || "",
+        onclick: () => {
+          this._composer.value = command.insert_text || (command.name + " ");
+          this._hideWorkspaceAutocomplete();
+          this._composer.focus();
+        },
+      },
+        HA.el("div", { class: "ws-ac-name", text: `${command.name} ${command.args || ""}`.trim() }),
+        command.help ? HA.el("div", { class: "ws-ac-desc", text: command.help }) : null));
+    }
+    this._wsAcBox.style.display = "block";
+  }
+
+  _hideWorkspaceAutocomplete() {
+    if (this._wsAcBox) this._wsAcBox.style.display = "none";
+  }
+
   async _sendChat() {
     const text = (this._composer && this._composer.value || "").trim();
     if (!text) return;
@@ -997,9 +1077,13 @@ window.PageWorkspace = class {
     const chatState = this._chatStateFor(wid, sid);
     chatState.messages.push({ role: "user", content: text,
       render_order: this._nextRenderOrder(chatState) });
+    chatState.taskStart = Date.now();
+    chatState.taskDuration = 0;
     this._chatBusy = true;
+    this._startWsTaskTimer();
     this._updateStatusBar();
     if (this._composer) this._composer.value = "";
+    this._hideWorkspaceAutocomplete();
     this._renderMessages();
     try {
       const d = await HA.api("POST",
@@ -1063,6 +1147,15 @@ window.PageWorkspace = class {
     }
   }
 
+  // ---------- 上下文统计定期刷新（deepseek-harness 风格实时占用）----------
+  _startWsCtxPoll() {
+    this._stopWsCtxPoll();
+    this._wsCtxPollTimer = setInterval(() => this._refreshRuntimeStatus(), 5000);
+  }
+  _stopWsCtxPoll() {
+    if (this._wsCtxPollTimer) { clearInterval(this._wsCtxPollTimer); this._wsCtxPollTimer = null; }
+  }
+
   async _refreshRuntimeStatus() {
     const wid = this.state.selectedWs, sid = this.state.selectedSession;
     if (!wid || !sid) return;
@@ -1070,12 +1163,74 @@ window.PageWorkspace = class {
       this._runtimeStatus = await HA.api("GET",
         `/api/workspaces/${encodeURIComponent(wid)}/sessions/${encodeURIComponent(sid)}/runtime-status`,
         undefined, { silent: true });
+      this._renderWsCtxMeter(this._runtimeStatus);
       this._updateStatusBar();
     } catch (e) { /* status is advisory */ }
   }
 
+  _wsCtxFmtTokens(n) {
+    return n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
+  }
+  _renderWsCtxMeter(status) {
+    if (!this._wsCtxMeter) return;
+    const ctx = status && status.context;
+    if (!this._wsCtxMeter._hoverBound) {
+      this._wsCtxMeter.addEventListener("mouseenter", () => {
+        const tip = this._wsCtxMeter.querySelector(".ctx-tip");
+        if (tip) tip.style.display = "block";
+      });
+      this._wsCtxMeter.addEventListener("mouseleave", () => {
+        const tip = this._wsCtxMeter.querySelector(".ctx-tip");
+        if (tip) tip.style.display = "none";
+      });
+      this._wsCtxMeter._hoverBound = true;
+    }
+    const pctEl = this._wsCtxMeter.querySelector(".ctx-pct");
+    const tipEl = this._wsCtxMeter.querySelector(".ctx-tip");
+    if (!ctx || !ctx.total_tokens) {
+      this._wsCtxMeter.classList.add("dim");
+      this._wsCtxMeter.classList.remove("warn", "danger");
+      if (pctEl) pctEl.textContent = "\u2013";
+      if (tipEl) tipEl.innerHTML = '<div class="ctx-tip-row"><span>上下文</span><b>会话未加载</b></div>';
+      return;
+    }
+    const pct = Math.round((ctx.usage_ratio || 0) * 100);
+    this._wsCtxMeter.classList.remove("dim");
+    this._wsCtxMeter.classList.toggle("warn", pct >= 70);
+    this._wsCtxMeter.classList.toggle("danger", pct >= 90);
+    if (pctEl) pctEl.textContent = pct + "%";
+    // 与主会话一致：模型真实上下文窗口 与 历史预算（压缩阈值）分开展示
+    const rows = [
+      ["模型", status.model || "—"],
+      ["消息数", String(ctx.total_messages ?? 0)],
+      ["已用", `${this._wsCtxFmtTokens(ctx.total_tokens ?? 0)} tokens`],
+      ["占用", `${pct}%`],
+    ];
+    const modelCtx = ctx.model_context_length || 0;
+    const budget = ctx.max_tokens || 0;
+    if (modelCtx > 0) rows.push(["模型上下文", `${this._wsCtxFmtTokens(modelCtx)} tokens`]);
+    if (budget > 0) {
+      rows.push(["历史预算", `${this._wsCtxFmtTokens(budget)} tokens`]);
+      rows.push(["剩余", `${this._wsCtxFmtTokens(ctx.remaining_tokens ?? 0)} tokens`]);
+    }
+    if (ctx.anchored) rows.push(["锚定", `${this._wsCtxFmtTokens(ctx.anchored_tokens ?? 0)} tokens`]);
+    let tipHtml = '<div class="ctx-tip-title">上下文占用</div>' + rows.map(([k, v]) =>
+      `<div class="ctx-tip-row"><span>${k}</span><b>${v}</b></div>`).join("");
+    if (modelCtx > 0 && budget > 0) {
+      tipHtml += '<div class="ctx-tip-foot">历史预算 = 模型上下文 − 输出预留，达到阈值自动压缩</div>';
+    }
+    if (tipEl) tipEl.innerHTML = tipHtml;
+  }
+
   _updateStatusBar() {
     if (!this._statusBar) return;
+    // 任务计时中：状态栏显示实时耗时，避免被轮询/其他刷新覆盖
+    const state = this._chatState;
+    if (state && state.taskStart) {
+      this._statusBar.textContent = `\u23f3 ${HA.fmtDuration(Date.now() - state.taskStart)}`;
+      this._statusBar.classList.add("busy");
+      return;
+    }
     const parts = [];
     if (this._chatBusy || (this._runtimeStatus && this._runtimeStatus.is_busy)) parts.push("\u8fd0\u884c\u4e2d");
     if (this._runtimeStatus && this._runtimeStatus.snapshot_stale) parts.push("\u65b0\u914d\u7f6e\u5c06\u5728\u4e0b\u6761\u6d88\u606f\u5e94\u7528");

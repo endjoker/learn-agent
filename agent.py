@@ -68,6 +68,19 @@ from core.runtime.tool_runtime import ToolRuntime
 from core.runtime.text_normalization import normalize_model_text
 
 
+# 输出预留（tokens）：从模型上下文窗口中扣减，作为回复/工具调用输出的余量。
+# 历史预算 = context_length - 输出预留（替代旧的 context_length // 2）。
+# 8192 为默认单次输出上限，×3 覆盖多轮 ReAct 内的连续输出，另加 4096 固定余量；
+# 小上下文模型按 1/4 缩放，避免预留挤占历史空间。
+OUTPUT_RESERVE = 8192 * 3 + 4096
+
+
+def _history_budget(context_length: int) -> int:
+    """历史消息预算：模型上下文减去输出预留（上限 28k、小模型按 1/4 缩放），最低 4096。"""
+    reserve = min(OUTPUT_RESERVE, max(context_length // 4, 0))
+    return max(context_length - reserve, 4096)
+
+
 def _configured_workspace_path(config: Optional[dict] = None) -> Path:
     """Return the configured workspace anchored to the project root.
 
@@ -227,7 +240,7 @@ class Agent:
         system_prompt: str = None,
         system_prompt_builder: SystemPrompt = None,
         max_steps: int = 100,          # 最大 ReAct 循环步数
-        max_history_tokens: int = 0,   # 上下文预算阈值（0=自动：取 context_length/2）
+        max_history_tokens: int = 0,   # 上下文预算阈值（0=自动：模型上下文-输出预留）
         debug: bool = False,
         permission_checker: PermissionChecker = None,
         memory: MemoryManager = None,  # 跨会话记忆系统（可选）
@@ -256,9 +269,9 @@ class Agent:
         self.ask_callback = None
         # 协作式停止标志（WebUI 暂停按钮；run/_run_task_list 每步检查）
         self._stop_requested = False
-        # 上下文预算阈值：0 时取模型上下文长度的一半（留一半给输出）
+        # 上下文预算阈值：0 时取模型上下文减去输出预留（留足输出空间）
         if max_history_tokens == 0:
-            self.max_history_tokens = max(llm.context_length // 2, 4096)
+            self.max_history_tokens = _history_budget(llm.context_length)
         else:
             self.max_history_tokens = max_history_tokens
         self.debug = debug
@@ -294,6 +307,7 @@ class Agent:
         self.store = MessageStore(
             max_tokens=self.max_history_tokens,
         )
+        self.store.model_context_length = self.llm.context_length
         self.messages = self.store.messages  # 指向同一列表，现有代码兼容
         # 保存当前模型配置到 store（用于会话持久化）
         self.store.model_id = self.llm.model or ""
@@ -528,10 +542,11 @@ class Agent:
         """
 
         self.llm = JKAgentLLM(**kwargs)
-        # 根据新模型的上下文长度重新计算压缩阈值
-        self.max_history_tokens = max(self.llm.context_length // 2, 4096)
+        # 根据新模型的上下文长度重新计算压缩阈值（模型上下文 - 输出预留）
+        self.max_history_tokens = _history_budget(self.llm.context_length)
         # 同步 store 的阈值和模型配置（/stats 显示用的 store.max_tokens）
         self.store.max_tokens = self.max_history_tokens
+        self.store.model_context_length = self.llm.context_length
         self.store.model_id = self.llm.model or ""
         self.store.model_provider = getattr(self.llm, "provider", "") or ""
         self.store.model_base_url = getattr(self.llm, "base_url", "") or ""

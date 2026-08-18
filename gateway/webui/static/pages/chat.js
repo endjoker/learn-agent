@@ -39,6 +39,41 @@ window.PageChat = class {
     this._finalBubbles = new Map();
     this._modeAvailability = { chat: true, plan: true };
     this._planCards = new Map();
+    this._taskStart = 0;
+    this._taskTimer = null;
+  }
+
+  // ---------- 任务运行时长（顶部栏常驻显示，无需 hover）----------
+  _startTaskTimer() {
+    this._stopTaskTimer();
+    if (!this._taskStart) this._taskStart = Date.now();
+    if (this._topTimer) {
+      this._topTimer.style.display = "inline-flex";
+      this._topTimer.classList.add("live");
+    }
+    this._taskTimer = setInterval(() => {
+      if (this._topTimer) {
+        this._topTimer.textContent = `\u23f3 ${HA.fmtDuration(Date.now() - this._taskStart)}`;
+      }
+    }, 1000);
+  }
+  _stopTaskTimer() {
+    if (this._taskTimer) { clearInterval(this._taskTimer); this._taskTimer = null; }
+  }
+  _settleTaskTimer(bubble) {
+    if (!this._taskStart) return;
+    const elapsed = Date.now() - this._taskStart;
+    this._taskStart = 0;
+    this._stopTaskTimer();
+    if (this._topTimer) {
+      this._topTimer.textContent = `\u23f1 ${HA.fmtDuration(elapsed)}`;
+      this._topTimer.classList.remove("live");
+      // 结束后保留 5 秒展示总耗时，然后隐藏
+      clearTimeout(this._topTimer._hideT);
+      this._topTimer._hideT = setTimeout(() => {
+        if (this._topTimer) this._topTimer.style.display = "none";
+      }, 5000);
+    }
   }
 
   get sessionKey() { return this._state.sessionKey; }
@@ -59,6 +94,10 @@ window.PageChat = class {
     await this._refreshWorkMode();
     this._bindSSE();
     this._applyToolFilter();
+    this._loadContext();
+    if (!this._ctxPollTimer) {
+      this._ctxPollTimer = setInterval(() => this._loadContext(), 5000);
+    }
   }
 
   // ---------- 顶部栏 ----------
@@ -66,7 +105,7 @@ window.PageChat = class {
     const bar = HA.el("div", { class: "chat-topbar" });
 
     this._sessionSel = HA.el("select", {
-      onchange: async () => { this.sessionKey = this._sessionSel.value; await this.loadHistory(); await this._refreshWorkMode(); },
+      onchange: async () => { this.sessionKey = this._sessionSel.value; await this._loadCommands(); await this.loadHistory(); await this._refreshWorkMode(); },
     });
     this._newSessionBtn = HA.el("button", { class: "btn", text: "＋ 新会话",
       onclick: () => this._newSession() });
@@ -106,6 +145,7 @@ window.PageChat = class {
       onclick: () => this._deleteSession() });
 
     this._modeHint = HA.el("div", { class: "mode-hint" });
+    this._topTimer = HA.el("span", { class: "topbar-timer", style: "display:none" });
 
     bar.append(
       HA.el("div", { class: "tb-row" },
@@ -117,6 +157,7 @@ window.PageChat = class {
         HA.el("span", { class: "tb-label", text: "模式" }), this._modeSeg,
         this._toolToggle, this._clearBtn, delBtn),
       this._modeHint,
+      this._topTimer,
     );
     return bar;
   }
@@ -193,35 +234,66 @@ window.PageChat = class {
     }
   }
 
-  // ---------- 输入栏 ----------
+  // ---------- 输入栏（卡片式，deepseek-harness 风格）----------
   _buildInputbar() {
     const bar = HA.el("div", { class: "chat-inputbar" });
     this._acBox = HA.el("div", { class: "ac-box", style: "display:none" });
 
-    // 图片缩略图预览区
+    // 图片缩略图预览区（卡片内顶部）
     this._imgPrev = HA.el("div", { class: "img-preview" });
     this._imgList = [];  // [{media_type, data}] base64
 
     this._input = HA.el("textarea", {
-      class: "chat-input", rows: "2",
+      class: "chat-input", rows: "1",
       placeholder: "输入消息…（/ 触发命令补全；Ctrl+V 粘贴图片）",
     });
     this._input.addEventListener("keydown", e => {
       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); this._send(); }
     });
     this._input.addEventListener("input", () => this._maybeAutocomplete());
+    this._input.addEventListener("input", () => this._autoResizeInput());
     this._input.addEventListener("paste", e => this._onPaste(e));
 
-    // 文件导入按钮
+    // 文件导入按钮（圆形 + 图标）
     this._fileInp = HA.el("input", { type: "file", accept: "image/*", multiple: "multiple",
       style: "display:none", onchange: e => this._onFiles(e) });
-    const attachBtn = HA.el("button", { class: "btn", text: "📎",
-      title: "导入图片（或 Ctrl+V 粘贴）", onclick: () => this._fileInp.click() });
+    const attachBtn = HA.el("button", { class: "chat-attach", type: "button",
+      title: "添加图片（或 Ctrl+V 粘贴）", onclick: () => this._fileInp.click() },
+      HA.el("span", { class: "chat-attach-ico", text: "＋" }));
 
-    this._sendBtn = HA.el("button", { class: "btn primary", text: "发送",
-      onclick: () => this._send() });
-    bar.append(this._acBox, attachBtn, this._imgPrev, this._fileInp, this._input, this._sendBtn);
+    this._ctxMeter = HA.el("div", { class: "ctx-meter" },
+      HA.el("span", { class: "ctx-icon", text: "📊" }),
+      HA.el("span", { class: "ctx-pct", text: "–" }),
+      HA.el("div", { class: "ctx-tip" }));
+    this._ctxMeter.addEventListener("mouseenter", () => {
+      const tip = this._ctxMeter.querySelector(".ctx-tip");
+      if (tip) tip.style.display = "block";
+    });
+    this._ctxMeter.addEventListener("mouseleave", () => {
+      const tip = this._ctxMeter.querySelector(".ctx-tip");
+      if (tip) tip.style.display = "none";
+    });
+
+    this._sendBtn = HA.el("button", { class: "chat-send", type: "button",
+      title: "发送（Enter）", onclick: () => this._send() },
+      HA.el("span", { class: "chat-send-ico", text: "➤" }));
+
+    // 卡片式容器：预览区 + textarea + 底部操作栏
+    const composer = HA.el("div", { class: "chat-composer" },
+      this._imgPrev, this._input,
+      HA.el("div", { class: "chat-composer-actions" },
+        attachBtn, this._fileInp,
+        HA.el("span", { class: "chat-keyhint", text: "Enter 发送 · Shift+Enter 换行" }),
+        this._ctxMeter, this._sendBtn));
+    bar.append(this._acBox, composer);
     return bar;
+  }
+
+  _autoResizeInput() {
+    const el = this._input;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 200) + "px";
   }
 
   _onPaste(e) {
@@ -283,10 +355,66 @@ window.PageChat = class {
 
   async _loadCommands() {
     try {
-      const d = await HA.api("GET", "/api/commands", undefined, { silent: true });
+      const query = this.sessionKey ? `?session_key=${encodeURIComponent(this.sessionKey)}` : "";
+      const d = await HA.api("GET", "/api/commands" + query, undefined, { silent: true });
       this.commands = d.commands || [];
       this._commandsLoaded = true;
-    } catch (e) { this.commands = []; }
+    } catch (e) { this.commands = []; this._commandsLoaded = true; }
+  }
+
+  // ---------- 上下文占用指示器（deepseek-harness 风格）----------
+  _ctxFmtTokens(n) {
+    return n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
+  }
+  _ctxTipHtml(d) {
+    const pct = Math.round((d.usage_ratio || 0) * 100);
+    const rows = [
+      ["模型", d.model || "—"],
+      ["消息数", String(d.total_messages ?? 0)],
+      ["已用", `${this._ctxFmtTokens(d.total_tokens ?? 0)} tokens`],
+      ["占用", `${pct}%`],
+    ];
+    // 模型真实上下文窗口 与 历史预算（压缩阈值）分开展示，避免"上限=一半"的误解
+    const ctx = d.model_context_length || 0;
+    const budget = d.max_tokens || 0;
+    if (ctx > 0) rows.push(["模型上下文", `${this._ctxFmtTokens(ctx)} tokens`]);
+    if (budget > 0) {
+      rows.push(["历史预算", `${this._ctxFmtTokens(budget)} tokens`]);
+      rows.push(["剩余", `${this._ctxFmtTokens(d.remaining_tokens ?? 0)} tokens`]);
+    }
+    if (d.anchored) rows.push(["锚定", `${this._ctxFmtTokens(d.anchored_tokens ?? 0)} tokens`]);
+    const title = `<div class="ctx-tip-title">上下文占用</div>`;
+    const foot = ctx > 0 && budget > 0
+      ? `<div class="ctx-tip-foot">历史预算 = 模型上下文 − 输出预留，达到阈值自动压缩</div>`
+      : "";
+    return title + rows.map(([k, v]) =>
+      `<div class="ctx-tip-row"><span>${k}</span><b>${v}</b></div>`).join("") + foot;
+  }
+  _renderCtxMeter(d) {
+    if (!this._ctxMeter) return;
+    const pctEl = this._ctxMeter.querySelector(".ctx-pct");
+    const tipEl = this._ctxMeter.querySelector(".ctx-tip");
+    if (!d || !d.available) {
+      this._ctxMeter.classList.add("dim");
+      this._ctxMeter.classList.remove("warn", "danger");
+      if (pctEl) pctEl.textContent = "–";
+      if (tipEl) tipEl.innerHTML = '<div class="ctx-tip-row"><span>上下文</span><b>会话未加载</b></div>';
+      return;
+    }
+    const pct = Math.round((d.usage_ratio || 0) * 100);
+    this._ctxMeter.classList.remove("dim");
+    this._ctxMeter.classList.toggle("warn", pct >= 70);
+    this._ctxMeter.classList.toggle("danger", pct >= 90);
+    if (pctEl) pctEl.textContent = pct + "%";
+    if (tipEl) tipEl.innerHTML = this._ctxTipHtml(d);
+  }
+  async _loadContext() {
+    try {
+      const d = await HA.api("GET",
+        `/api/sessions/${encodeURIComponent(this.sessionKey)}/context`,
+        undefined, { silent: true });
+      this._renderCtxMeter(d);
+    } catch (e) { /* 会话未加载时静默 */ }
   }
 
   async _loadSessions() {
@@ -342,6 +470,7 @@ window.PageChat = class {
     await this._loadPlans();
     this._loadPermission();
     this._loadReasoning();
+    this._loadContext();
   }
 
   async _loadReasoning() {
@@ -424,24 +553,28 @@ window.PageChat = class {
     const role = (m.role === "user" && m.name !== "tool_result") ? "user"
       : (m.role === "assistant" ? "assistant" : "system");
     const text = m.content_text ?? (typeof m.content === "string" ? m.content : "");
-    const body = role === "user"
-      ? HA.el("div", { class: "bubble-text", text })
-      : HA.el("div", { class: "bubble-text md", html: HA.renderMd(text) });
     const bubble = HA.el("div", { class: `bubble ${role}` },
       HA.el("div", { class: "bubble-role",
-        text: role === "user" ? "👤 我" : (role === "assistant" ? "🤖 助手" : "ℹ️") }),
-      body);
-    if (role === "assistant") {
+        text: role === "user" ? "👤 我" : (role === "assistant" ? "🤖 助手" : "ℹ️") }));
+    if (role === "user" || role === "assistant") {
+      const body = role === "user"
+        ? HA.el("div", { class: "bubble-text", text })
+        : HA.el("div", { class: "bubble-text md", html: HA.renderMd(text) });
+      bubble.appendChild(body);
+      // 复制操作栏：用户消息与助手回答都提供（悬停显示）
       bubble.dataset.copyText = text;
       let copyBtn;
       copyBtn = HA.el("button", {
         class: "answer-action",
         type: "button",
         text: "复制",
-        title: "复制回答",
+        title: role === "user" ? "复制输入内容" : "复制回答",
         onclick: () => this._copyAnswer(bubble, copyBtn),
       });
-      bubble.appendChild(HA.el("div", { class: "answer-actions" }, copyBtn));
+      bubble.appendChild(HA.el("div", { class: "answer-actions" },
+        copyBtn));
+    } else {
+      bubble.appendChild(HA.el("div", { class: "bubble-text md", html: HA.renderMd(text) }));
     }
     return bubble;
   }
@@ -498,9 +631,12 @@ window.PageChat = class {
 
   // ---------- 发送 ----------
   _updateSendBtn() {
-    this._sendBtn.textContent = this._busy ? "⏹ 停止" : "发送";
-    this._sendBtn.className = "btn" + (this._busy ? " danger" : " primary");
-    this._sendBtn.disabled = false;
+    const ico = this._sendBtn && this._sendBtn.querySelector(".chat-send-ico");
+    if (ico) ico.textContent = this._busy ? "⏹" : "➤";
+    if (this._sendBtn) {
+      this._sendBtn.classList.toggle("busy", this._busy);
+      this._sendBtn.title = this._busy ? "停止运行" : "发送（Enter）";
+    }
   }
 
   async _send() {
@@ -522,6 +658,7 @@ window.PageChat = class {
 
     this._appendUser(text, images);
     this._setBusy(true);
+    this._startTaskTimer();
     try {
       const r = await HA.api("POST", "/api/chat",
         { session_key: this.sessionKey, text, images: images || undefined, timeout: 120 });
@@ -529,6 +666,7 @@ window.PageChat = class {
       else if (r && r.error) this._appendSystem(`⏳ ${r.error}（回复将稍后经事件到达）`);
     } catch (e) { /* toast 已弹 */ }
     this._setBusy(false);
+    this._loadContext();
     // 命令回复不写入会话历史，不能用 loadHistory 重渲染（会清掉刚追加的回复）。
     // 仅对改写历史的命令重载历史。
     if (/^\/(clear|compact)\b/.test(text)) this.loadHistory();
@@ -706,6 +844,7 @@ window.PageChat = class {
         this._finalBubbles.delete(this._finalBubbles.keys().next().value);
       }
     }
+    this._settleTaskTimer(answerBubble);
   }
 
   _insertToolCard(card, messageId) {
@@ -807,15 +946,18 @@ window.PageChat = class {
     if (!hits.length) return this._hideAutocomplete();
     this._acBox.innerHTML = "";
     for (const c of hits.slice(0, 8)) {
-      this._acBox.appendChild(HA.el("div", {
-        class: "ac-item", text: `${c.name} ${c.args || ""}`.trim(),
+      const item = HA.el("div", {
+        class: "ac-item",
         title: c.help,
         onclick: () => {
-          this._input.value = c.name + " ";
+          this._input.value = c.insert_text || (c.name + " ");
           this._hideAutocomplete();
           this._input.focus();
         },
-      }));
+      },
+        HA.el("div", { class: "ac-name", text: `${c.name} ${c.args || ""}`.trim() }),
+        c.help ? HA.el("div", { class: "ac-desc", text: c.help }) : null);
+      this._acBox.appendChild(item);
     }
     this._acBox.style.display = "block";
   }

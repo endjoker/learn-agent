@@ -13,11 +13,50 @@ HA.renderMd = function (text) {
   try {
     html = marked.parse(String(text));
   } catch (e) {
-    const d = document.createElement("div");
-    d.textContent = String(text);
-    return d.innerHTML;
+    // marked 异常时降级为基础 Markdown 渲染（同样支持粗体/标题/列表/代码块），
+    // 绝不把 Markdown 源码直接输出成未格式化内容。
+    return HA.renderMdFallback(String(text));
   }
   return HA.sanitizeHtml(html);
+};
+
+// marked 不可用/抛错时的降级渲染：转义 HTML + 渲染基础 Markdown 语法
+// （标题 / 粗体 / 斜体 / 行内代码 / 链接 / 列表 / 代码块），避免显示源码。
+HA.renderMdFallback = function (text) {
+  const esc = (s) => String(s).replace(/[&<>"']/g, ch => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[ch]));
+  // 行内标记：先转义 HTML，再替换 Markdown 语法（顺序保证安全）
+  const inline = (s) => esc(s)
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
+      '<a href="$2" rel="noopener" target="_blank">$1</a>');
+  const lines = String(text).split("\n");
+  let out = "", list = null, inCode = false, fence = "";
+  const closeList = () => { if (list) { out += `</${list}>`; list = null; } };
+  const closeCode = () => { if (inCode) { out += "</code></pre>"; inCode = false; } };
+  for (const line of lines) {
+    if (inCode) {
+      if (line.trim().startsWith(fence)) { fence = ""; closeCode(); }
+      else out += esc(line) + "\n";
+      continue;
+    }
+    const fm = line.trim().match(/^```+/);
+    if (fm) { closeList(); fence = fm[0]; inCode = true; out += "<pre><code>"; continue; }
+    const hm = line.match(/^(#{1,6})\s+(.*)$/);
+    if (hm) { closeList(); closeCode(); const lv = hm[1].length; out += `<h${lv}>${inline(hm[2])}</h${lv}>`; continue; }
+    const lm = line.match(/^\s*[-*+]\s+(.*)$/);
+    if (lm) { closeCode(); if (list !== "ul") { closeList(); out += "<ul>"; list = "ul"; } out += `<li>${inline(lm[1])}</li>`; continue; }
+    const om = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (om) { closeCode(); if (list !== "ol") { closeList(); out += "<ol>"; list = "ol"; } out += `<li>${inline(om[1])}</li>`; continue; }
+    if (!line.trim()) { closeList(); continue; }
+    closeList(); closeCode();
+    out += `<p>${inline(line)}</p>`;
+  }
+  closeList(); closeCode();
+  return out;
 };
 
 // 基础 HTML 净化（DOM 白名单过滤）

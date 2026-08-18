@@ -60,7 +60,12 @@ class SecurityGate:
         # unreviewed 先走 L1 例外判定：高危命令、敏感文件/目录会返回
         # ASK 并进入审批桥；其他操作明确跳过普通 L2 内容/路径规则。
         if self.permission.is_unreviewed_mode():
-            return self._policy(name, params, caps, tool)
+            # 直接交给 PermissionChecker 的 unreviewed 例外判定（普通工具/
+            # 路径全部 ALLOW，仅高危命令与敏感/系统路径 ASK）。不要走
+            # _policy —— 其中的 MCP trust / 未知工具分支不感知 unreviewed
+            # 模式，会把 web-search、cron_* 等普通操作也拦成 ASK。
+            level = self.permission.check(name, params)
+            return level, ""
 
         # ---- L2 内容硬拦（按 capability + 参数形状）----
         if self._l2_active():
