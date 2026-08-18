@@ -190,6 +190,10 @@ class Glue:
         from core.permission import ALLOW, DENY
 
         cfg_perm = load_config().get("permission", {})
+        agent.permission.set_permission_mode(mode)
+        sandbox = getattr(agent, "sandbox", None)
+        if sandbox is not None:
+            sandbox.set_unreviewed_mode(mode == "unreviewed")
         if mode == "ask":
             agent.permission._init_default_rules(cfg_perm)
             agent.ask_callback = (
@@ -202,9 +206,14 @@ class Glue:
                 agent.permission.set_rule(t, ALLOW)
             agent.ask_callback = None
         elif mode == "unreviewed":
-            for t in agent.tool_registry.list_tool_names():
-                agent.permission.set_rule(t, ALLOW)
-            agent.ask_callback = None
+            # PermissionChecker handles this mode centrally: normal operations are
+            # allowed regardless of tool/path; only high-risk or sensitive cases
+            # return ASK. Keep the bridge attached for those explicit exceptions.
+            agent.permission._init_default_rules(cfg_perm)
+            agent.ask_callback = (
+                lambda tool, params, _a=agent: self.bridge.ask(
+                    self._session_key_of(_a), tool, params,
+                    metadata=getattr(_a, "_webui_metadata", None) or {}))
         elif mode == "readonly":
             # Read-only is intentionally a strict allowlist: inspecting local
             # files and using approved search tools are allowed; every write,

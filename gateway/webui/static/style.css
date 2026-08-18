@@ -19,6 +19,8 @@
   --toolbar-bg: rgba(255, 255, 255, .92);
   --chat-input-bg: #ffffff;
   --chat-input-border: #cbd5e1;
+  --chat-user-bg: #eef4ff;
+  --chat-user-border: #dbe7ff;
   --reasoning-bg: #f8fafc;
   --reasoning-border: #d6deea;
   --reasoning-summary-bg: #eef3f9;
@@ -47,6 +49,8 @@
   --toolbar-bg: rgba(20, 23, 30, .84);
   --chat-input-bg: #11151c;
   --chat-input-border: #3b4658;
+  --chat-user-bg: #202d46;
+  --chat-user-border: #304566;
   --reasoning-bg: rgba(19, 23, 31, .72);
   --reasoning-border: #313b4b;
   --reasoning-summary-bg: rgba(22, 28, 37, .84);
@@ -159,26 +163,42 @@ select, textarea.chat-input {
      keeps long rich replies within the visible conversation column. */
   align-self: flex-start;
   min-width: 0;
+  width: min(100%, 860px);
   max-width: min(86%, 920px);
   box-sizing: border-box;
 }
-.bubble { background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; }
-.bubble.user { align-self: flex-end; max-width: min(86%, 720px); border-color: #35507e; }
+.bubble { background: transparent; border: 0; border-radius: 0; padding: 8px 0 18px; }
+.bubble.user {
+  align-self: flex-end;
+  width: auto;
+  max-width: min(86%, 720px);
+  padding: 10px 14px;
+  border: 1px solid var(--chat-user-border, #dbe7ff);
+  border-radius: 18px;
+  background: var(--chat-user-bg, #eef4ff);
+}
 .bubble.system { align-self: center; color: var(--text-dim); font-size: 12px; background: transparent; border: none; }
-.bubble-role { font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
+.bubble-role { display: none; }
 .bubble-text { min-width: 0; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; line-height: 1.55; }
-.bubble-text.md p { margin: 4px 0; }
+.bubble-text.md { font-size: 15px; line-height: 1.75; }
+.bubble-text.md p { margin: .8em 0; }
+.bubble-text.md > :first-child { margin-top: 0; }
+.bubble-text.md > :last-child { margin-bottom: 0; }
 /* The global CSS reset removes browser list padding.  Restore it inside a
    Markdown reply so list markers remain inside the bubble instead of hanging
    over its left border. */
 .bubble-text.md :is(ul, ol) { margin: 6px 0; padding-inline-start: 1.5rem; }
 .bubble-text.md li + li { margin-top: 4px; }
 .bubble-text.md :is(pre, code) { max-width: 100%; }
-.bubble-text.md pre { background: var(--bg); padding: 8px; border-radius: 6px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
-.bubble-text.md code { background: var(--bg); padding: 1px 4px; border-radius: 4px; }
+.bubble-text.md pre { background: var(--code-bg); border: 1px solid var(--border); padding: 12px 14px; border-radius: 9px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+.bubble-text.md code { background: var(--code-bg); padding: 2px 5px; border-radius: 5px; }
 .bubble-text.md table { display: block; width: 100%; max-width: 100%; overflow-x: auto; table-layout: fixed; }
 .bubble-text.md :is(th, td) { min-width: 0; overflow-wrap: anywhere; word-break: break-word; vertical-align: top; }
 .bubble-text.md img { display: block; max-width: 100%; height: auto; }
+.answer-actions { display: flex; align-items: center; gap: 4px; margin-top: 10px; opacity: 0; transition: opacity .16s ease; }
+.bubble.assistant:hover .answer-actions, .answer-actions:focus-within { opacity: 1; }
+.answer-action { padding: 4px 8px; color: var(--text-dim); background: transparent; border: 0; border-radius: 6px; cursor: pointer; font-size: 12px; }
+.answer-action:hover { color: var(--text); background: var(--bg-hover); }
 
 .tool-group { display: flex; flex-direction: column; gap: 4px; padding-left: 26px; }
 .tool-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; max-width: 70%; }

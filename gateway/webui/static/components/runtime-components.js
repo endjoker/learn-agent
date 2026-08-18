@@ -112,28 +112,55 @@ HA.confirm = function (message, okText) {
 // 组件接收数据，不直接订阅全局 SSE。
 // ============================================================
 
-// 消息气泡
+// 消息气泡：与主会话复用 .bubble / .bubble-text 视觉体系。
 HA.MessageBubble = class {
   constructor(msg) {
     this.msg = msg || {};
   }
   render() {
     const role = this.msg.role || "assistant";
-    const cls = "ws-msg " + (role === "user" ? "user" : role === "tool" ? "tool" : "assistant");
-    const bubble = HA.el("div", { class: cls });
-    const head = HA.el("div", { class: "ws-msg-head" },
-      HA.el("span", { class: "ws-msg-role", text: role }),
-      this.msg.message_id
-        ? HA.el("span", { class: "dim", style: "font-size:10px", text: this.msg.message_id.slice(0, 12) })
-        : null);
-    bubble.appendChild(head);
-    const content = this.msg.content || "";
-    if (role === "assistant" || role === "user") {
-      bubble.appendChild(HA.el("div", { class: "md ws-msg-body", html: HA.renderMd(content) }));
+    const visualRole = role === "user" ? "user" : role === "tool" ? "system" : "assistant";
+    const content = String(this.msg.content || "");
+    const bubble = HA.el("div", { class: `bubble ${visualRole}` });
+    if (visualRole === "user") {
+      bubble.appendChild(HA.el("div", { class: "bubble-text", text: content }));
+    } else if (visualRole === "assistant") {
+      bubble.dataset.copyText = content;
+      bubble.appendChild(HA.el("div", { class: "bubble-text md", html: HA.renderMd(content) }));
+      let copyBtn;
+      copyBtn = HA.el("button", {
+        class: "answer-action",
+        type: "button",
+        text: "复制",
+        title: "复制回答",
+        onclick: () => this._copyAnswer(bubble, copyBtn),
+      });
+      bubble.appendChild(HA.el("div", { class: "answer-actions" }, copyBtn));
     } else {
-      bubble.appendChild(HA.el("pre", { class: "ws-tool-result", text: content }));
+      bubble.appendChild(HA.el("pre", { class: "bubble-text", text: content }));
     }
     return bubble;
+  }
+
+  async _copyAnswer(bubble, button) {
+    const text = bubble.dataset.copyText || bubble.querySelector(".bubble-text")?.innerText || "";
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (e) {
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.focus();
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    }
+    const original = button.textContent;
+    button.textContent = "已复制";
+    setTimeout(() => { if (button.isConnected) button.textContent = original; }, 1400);
   }
 };
 

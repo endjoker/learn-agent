@@ -1792,9 +1792,15 @@ def create_agent(
         workspace=_project_root,
         extra_workspaces=_extra_workspace_roots,
     ) if permission else None
-    if checker and _permission_mode and _permission_mode in ("allow", "unreviewed", "readonly"):
+    if checker:
+        # Apply the selected session mode before the first tool call. In
+        # unreviewed mode ordinary tools and paths are allowed, while sensitive
+        # paths and high-risk commands still return ASK for explicit approval.
+        checker.set_permission_mode(_permission_mode or "ask")
         if _permission_mode == "allow":
             checker.allow_workspace()
+        if sandbox_executor:
+            sandbox_executor.set_unreviewed_mode(_permission_mode == "unreviewed")
     # 长驻子进程管理器（依赖沙箱的 max_output/idle 配置）
     process_manager = None
     if sandbox_executor and checker:

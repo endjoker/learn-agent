@@ -427,10 +427,44 @@ window.PageChat = class {
     const body = role === "user"
       ? HA.el("div", { class: "bubble-text", text })
       : HA.el("div", { class: "bubble-text md", html: HA.renderMd(text) });
-    return HA.el("div", { class: `bubble ${role}` },
+    const bubble = HA.el("div", { class: `bubble ${role}` },
       HA.el("div", { class: "bubble-role",
         text: role === "user" ? "👤 我" : (role === "assistant" ? "🤖 助手" : "ℹ️") }),
       body);
+    if (role === "assistant") {
+      bubble.dataset.copyText = text;
+      let copyBtn;
+      copyBtn = HA.el("button", {
+        class: "answer-action",
+        type: "button",
+        text: "复制",
+        title: "复制回答",
+        onclick: () => this._copyAnswer(bubble, copyBtn),
+      });
+      bubble.appendChild(HA.el("div", { class: "answer-actions" }, copyBtn));
+    }
+    return bubble;
+  }
+
+  async _copyAnswer(bubble, button) {
+    const text = bubble.dataset.copyText || bubble.querySelector(".bubble-text")?.innerText || "";
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (e) {
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.focus();
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    }
+    const original = button.textContent;
+    button.textContent = "已复制";
+    setTimeout(() => { if (button.isConnected) button.textContent = original; }, 1400);
   }
 
   _toolCard(c, pending) {
@@ -629,6 +663,7 @@ window.PageChat = class {
     if (!text) return;
     this._startStream(messageId);
     this._streamText += text;
+    this._streamBubble.dataset.copyText = this._streamText;
     const body = this._streamBubble.querySelector(".bubble-text");
     body.innerHTML = HA.renderMd(this._streamText);
     this._scrollBottom();
@@ -652,6 +687,7 @@ window.PageChat = class {
     let answerBubble = null;
     if (this._streamBubble) {
       this._streamText = answer;
+      this._streamBubble.dataset.copyText = answer;
       const body = this._streamBubble.querySelector(".bubble-text");
       body.innerHTML = HA.renderMd(answer);
       answerBubble = this._streamBubble;

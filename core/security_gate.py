@@ -57,6 +57,11 @@ class SecurityGate:
         name = tool_name or (tool.name if tool else "") or ""
         caps = self._resolve_caps(tool, params)
 
+        # unreviewed 先走 L1 例外判定：高危命令、敏感文件/目录会返回
+        # ASK 并进入审批桥；其他操作明确跳过普通 L2 内容/路径规则。
+        if self.permission.is_unreviewed_mode():
+            return self._policy(name, params, caps, tool)
+
         # ---- L2 内容硬拦（按 capability + 参数形状）----
         if self._l2_active():
             l2 = self._l2_check(caps, params, name)

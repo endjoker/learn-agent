@@ -229,6 +229,9 @@ class SandboxExecutor:
 
         # 临时绕过标志（下一条命令绕过，执行后自动复位）
         self._bypass_once: bool = False
+        # Session-level switch set by PermissionChecker/Glue for unreviewed mode.
+        # Central SecurityGate has already requested approval for its exceptions.
+        self._unreviewed_mode: bool = False
 
         logger.info(
             "沙箱执行器初始化: enabled=%s, profile=%s",
@@ -307,6 +310,14 @@ class SandboxExecutor:
     def is_bypass_active(self) -> bool:
         return self._bypass_once
 
+    def set_unreviewed_mode(self, enabled: bool) -> None:
+        """Skip ordinary L2 checks for a session in unreviewed mode.
+
+        The Agent's central SecurityGate remains responsible for routing high-risk
+        commands and sensitive paths through explicit user approval.
+        """
+        self._unreviewed_mode = bool(enabled)
+
     # ================================================================
     # 核心执行
     # ================================================================
@@ -331,8 +342,8 @@ class SandboxExecutor:
         """
         full_cmd = f"{command} {' '.join(args or [])}"
 
-        # ===== 沙箱关闭 or 临时绕过 =====
-        if not self.enabled or self._bypass_once:
+        # ===== 沙箱关闭、unreviewed 或临时绕过 =====
+        if not self.enabled or self._unreviewed_mode or self._bypass_once:
             if self._bypass_once:
                 self._bypass_once = False
                 log_bypass(tool_name, "bypass_once")
@@ -466,6 +477,9 @@ class SandboxExecutor:
         委托 guard.check_write_content 做敏感文件 / 系统路径 / 内容注入扫描，
         再补充工作区边界检查（guard 不感知 workspace）。
         """
+        if self._unreviewed_mode:
+            return True, ""
+
         is_safe, reason = check_write_content(file_path, content)
         if not is_safe:
             log_interception("write", file_path, reason)

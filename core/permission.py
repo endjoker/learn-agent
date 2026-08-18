@@ -60,7 +60,7 @@ WRITE_COMMANDS = [
 ]
 
 # 危险命令检测 —— 统一从 guard.py 获取，避免重复定义
-from core.sandbox.guard import _match_dangerous
+from core.sandbox.guard import SENSITIVE_FILES, _match_dangerous, _check_command_for_paths
 
 
 def classify_bash_command(command: str) -> str:
@@ -188,6 +188,9 @@ class PermissionChecker:
 
         # 工作区信任标志
         self._workspace_trusted = False
+        # unreviewed：普通工具和路径不受白名单/常规规则限制；高危命令和
+        # 敏感路径仍返回 ASK，由上层审批桥确认。
+        self._permission_mode = "ask"
 
         # 加载默认规则（从 config 或硬编码）
         self._init_default_rules(config)
@@ -446,6 +449,51 @@ class PermissionChecker:
                 return params[key]
         return None
 
+    def set_permission_mode(self, mode: str) -> None:
+        """设置会话权限档位；仅接受已知档位，非法值回退为 ask。"""
+        self._permission_mode = mode if mode in ("readonly", "ask", "allow", "unreviewed") else "ask"
+
+    def is_unreviewed_mode(self) -> bool:
+        """当前是否为“普通操作免审，敏感/高危例外审批”模式。"""
+        return self._permission_mode == "unreviewed"
+
+    def _is_sensitive_path(self, path: Path) -> bool:
+        """判断路径是否为配置的敏感文件，或 .git 这类敏感目录。"""
+        norm = os.path.normpath(str(path)).lower()
+        for sensitive in SENSITIVE_FILES:
+            item = os.path.normpath(str(sensitive)).lower()
+            if norm == item or norm.endswith(os.sep + item):
+                return True
+            # .git/config 的整个 .git 目录都应视为敏感；其他带目录的
+            # 关键文件仍仅匹配自身，避免把整个 core/ 误判为敏感目录。
+            if item == os.path.normpath(".git/config"):
+                # Treat the entire .git directory as sensitive, including nested
+                # paths such as /project/.git/HEAD.
+                if ".git" in {part.lower() for part in path.parts}:
+                    return True
+        return False
+
+    def _unreviewed_exception(self, tool_name: str, params: dict) -> str:
+        """返回 unreviewed 下仍需人工审批的风险说明，空字符串表示普通操作。"""
+        if tool_name == "bash":
+            command = str(params.get("command") or "")
+            dangerous = _match_dangerous(command.lower())
+            if dangerous:
+                return f"高危命令需审批: {dangerous}"
+            blocked, reason = _check_command_for_paths(command)
+            if blocked:
+                return f"敏感路径操作需审批: {reason}"
+        for key in ("file_path", "path", "dest"):
+            value = params.get(key)
+            if value and self._is_sensitive_path(self._resolve(str(value))):
+                return f"敏感路径操作需审批: {value}"
+        values = params.get("paths")
+        if isinstance(values, list):
+            for value in values:
+                if value and self._is_sensitive_path(self._resolve(str(value))):
+                    return f"敏感路径操作需审批: {value}"
+        return ""
+
     def allow_workspace(self):
         """
         本会话内工作区全部放行（A 选项）
@@ -494,6 +542,12 @@ class PermissionChecker:
         """
         if params is None:
             params = {}
+
+        # unreviewed 不做普通工具规则、工作区边界或额外根检查；仅将
+        # 高危 shell 命令和敏感文件/目录操作转交审批桥。
+        if self.is_unreviewed_mode():
+            exception = self._unreviewed_exception(tool_name, params)
+            return (ASK if exception else ALLOW)
 
         rule = self._rules.get(tool_name)
 

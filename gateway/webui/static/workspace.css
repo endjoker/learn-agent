@@ -223,7 +223,15 @@
   padding: 22px clamp(16px, 3vw, 34px);
   scrollbar-color: var(--border) transparent;
 }
-.ws-chat-timeline .bubble { max-width: min(88%, 760px); box-shadow: 0 7px 18px rgba(0,0,0,.12); }
+.ws-chat-timeline .bubble {
+  width: min(100%, 860px);
+  max-width: min(86%, 920px);
+  box-shadow: none;
+}
+.ws-chat-timeline .bubble.user {
+  width: auto;
+  max-width: min(86%, 720px);
+}
 .ws-chat-timeline .tool-card, .ws-chat-timeline .ws-tool-card,
 .ws-chat-timeline .ws-approval-card, .ws-chat-timeline .ws-plan-card { max-width: min(94%, 820px); }
 .ws-chat-empty {
