@@ -181,9 +181,12 @@ select, textarea.chat-input {
 .bubble-role { display: none; }
 .bubble-text { min-width: 0; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; line-height: 1.55; }
 .bubble-text.md { font-size: 15px; line-height: 1.75; }
-.bubble-text.md p { margin: .8em 0; }
+.bubble-text.md p { margin: .45em 0; }
 .bubble-text.md > :first-child { margin-top: 0; }
 .bubble-text.md > :last-child { margin-bottom: 0; }
+/* Keep vertical rhythm tight inside a single assistant reply: a trailing
+   paragraph before the copy/actions row should not add a large gap. */
+.bubble-text.md p:last-child { margin-bottom: 0; }
 /* The global CSS reset removes browser list padding.  Restore it inside a
    Markdown reply so list markers remain inside the bubble instead of hanging
    over its left border. */
