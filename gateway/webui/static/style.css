@@ -180,8 +180,8 @@ select, textarea.chat-input {
 .bubble.system { align-self: center; color: var(--text-dim); font-size: 12px; background: transparent; border: none; }
 .bubble-role { display: none; }
 .bubble-text { min-width: 0; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; line-height: 1.55; }
-.bubble-text.md { font-size: 15px; line-height: 1.75; }
-.bubble-text.md p { margin: .35em 0; }
+.bubble-text.md { font-size: 15px; line-height: 1.55; }
+.bubble-text.md p { margin: .2em 0; }
 .bubble-text.md > :first-child { margin-top: 0; }
 .bubble-text.md > :last-child { margin-bottom: 0; }
 /* Keep vertical rhythm tight inside a single assistant reply: a trailing
@@ -190,10 +190,10 @@ select, textarea.chat-input {
 /* The global CSS reset removes browser list padding.  Restore it inside a
    Markdown reply so list markers remain inside the bubble instead of hanging
    over its left border. */
-.bubble-text.md :is(ul, ol) { margin: 6px 0; padding-inline-start: 1.5rem; }
-.bubble-text.md li + li { margin-top: 4px; }
+.bubble-text.md :is(ul, ol) { margin: .3em 0; padding-inline-start: 1.5rem; }
+.bubble-text.md li + li { margin-top: .15em; }
 .bubble-text.md :is(pre, code) { max-width: 100%; }
-.bubble-text.md pre { background: var(--code-bg); border: 1px solid var(--border); padding: 12px 14px; border-radius: 9px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+.bubble-text.md pre { margin: .4em 0; background: var(--code-bg); border: 1px solid var(--border); padding: 10px 14px; border-radius: 9px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
 .bubble-text.md code { background: var(--code-bg); padding: 2px 5px; border-radius: 5px; }
 .bubble-text.md table { display: block; width: 100%; max-width: 100%; overflow-x: auto; table-layout: fixed; }
 .bubble-text.md :is(th, td) { min-width: 0; overflow-wrap: anywhere; word-break: break-word; vertical-align: top; }
