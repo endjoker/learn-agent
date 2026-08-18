@@ -181,7 +181,7 @@ select, textarea.chat-input {
 .bubble-role { display: none; }
 .bubble-text { min-width: 0; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; line-height: 1.55; }
 .bubble-text.md { font-size: 15px; line-height: 1.75; }
-.bubble-text.md p { margin: .45em 0; }
+.bubble-text.md p { margin: .35em 0; }
 .bubble-text.md > :first-child { margin-top: 0; }
 .bubble-text.md > :last-child { margin-bottom: 0; }
 /* Keep vertical rhythm tight inside a single assistant reply: a trailing
