@@ -102,7 +102,6 @@ jkagent-gateway run --port 9200    # 指定端口
 其他命令：
 
 ```bash
-jkagent-gateway login weixin       # 微信渠道扫码登录
 jkagent-gateway doctor             # 配置体检
 jkagent-gateway migrate-sessions [--dry-run]   # 旧 JSON 转录迁移到统一会话库
 ```
@@ -166,4 +165,3 @@ CI：`.github/workflows/ci.yml`（push/PR 自动运行后端 pytest+ruff、前�
 ## 文档
 
 - **[CHANGELOG.md](CHANGELOG.md)**：版本记录与功能清单
-- `GUIDE.md`：智能体运行时读取的配置手册（LLM 按需自取，无需人工查阅）
