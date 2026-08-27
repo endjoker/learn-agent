@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -25,6 +26,18 @@ logger = logging.getLogger("jk_agent")
 
 # 技能名允许的字符
 _VALID_NAME_RE = re.compile(r"^[a-zA-Z0-9\-_]+$")
+
+# ============================================================
+# B8 类级 mtime 签名缓存
+#   key   : str(resolved skills_dir)
+#   value : (聚合签名, {name: Skill} 快照)
+#   磁盘上 {skill.json / instruction.md} 的 (mtime_ns, size) 聚合签名
+#   未变化时，load_all 直接复用内存解析快照，跳过读盘 + JSON 解析（快速路径）。
+#   线程安全：所有缓存读写均在 _SKILL_LOAD_LOCK 内完成（简单 Lock）。
+# ============================================================
+_SIG_DIR_MISSING = ("missing",)
+_SKILL_LOAD_CACHE: dict = {}
+_SKILL_LOAD_LOCK = threading.Lock()
 
 
 class SkillManager:
@@ -43,11 +56,67 @@ class SkillManager:
     # ============================================================
 
     def load_all(self) -> List[Skill]:
-        """扫描 SKILLS/ 目录，加载所有技能"""
-        self._skills = {}
-        if not self._skills_dir.exists():
+        """扫描 SKILLS/ 目录，加载所有技能。
+
+        B8 快速路径：{skill.json / instruction.md} 的 mtime_ns+size 聚合签名
+        未变化时，直接复用类级缓存中的内存解析快照（免读盘 + 免 JSON 解析）。
+        """
+        # 目录不存在时保持原语义：创建目录（签名按缺失处理，必然走慢路径）
+        if self._compute_signature() == _SIG_DIR_MISSING:
             self._skills_dir.mkdir(parents=True, exist_ok=True)
-            return []
+
+        signature = self._compute_signature()
+        key = str(self._skills_dir)
+
+        with _SKILL_LOAD_LOCK:
+            cached = _SKILL_LOAD_CACHE.get(key)
+            if cached is not None and cached[0] == signature:
+                # 快速路径：磁盘未变化，复用快照（浅拷贝，实例级变更不外泄）
+                self._skills = dict(cached[1])
+                return list(self._skills.values())
+
+            # 慢路径：磁盘发生变化（或首次加载），全量解析并重建缓存
+            skills = self._parse_all()
+            _SKILL_LOAD_CACHE[key] = (signature, dict(skills))
+            self._skills = skills
+            return list(self._skills.values())
+
+    def _compute_signature(self) -> tuple:
+        """聚合签名：目录存在性 + 每个候选技能子目录下
+        {skill.json / instruction.md} 的 (mtime_ns, size)。
+
+        任一文件被修改/增删、目录增删都会改变签名 → 缓存失效。
+        """
+        if not self._skills_dir.exists():
+            return _SIG_DIR_MISSING
+        parts = ["dir"]
+        try:
+            folders = sorted(f for f in self._skills_dir.iterdir() if f.is_dir())
+        except OSError:
+            # 目录不可读时按缺失处理：走慢路径并让原有异常语义上抛
+            return _SIG_DIR_MISSING
+        for folder in folders:
+            parts.append(folder.name)
+            for fname in ("skill.json", "instruction.md"):
+                try:
+                    st = (folder / fname).stat()
+                    parts.append((fname, st.st_mtime_ns, st.st_size))
+                except OSError:
+                    parts.append((fname, None))
+        return tuple(parts)
+
+    def _parse_all(self) -> dict:
+        """从磁盘全量解析技能（B8 慢路径）。返回 {name: Skill}。"""
+        skills: dict = {}
+        if not self._skills_dir.exists():
+            return skills
+
+        # 内置工具名（与技能工具注册进同一注册表，重名会冲突）
+        try:
+            from tools.builtin_tools import BUILTIN_TOOLS
+            builtin_names = {t.name for t in BUILTIN_TOOLS}
+        except Exception:
+            builtin_names = set()
 
         for folder in sorted(self._skills_dir.iterdir()):
             if not folder.is_dir():
@@ -63,12 +132,22 @@ class SkillManager:
                 instruction = instr_path.read_text(encoding="utf-8")
                 data["instruction"] = instruction
                 skill = Skill.from_dict(data, source_dir=str(folder))
-                self._skills[skill.name] = skill
+                # 技能名合法性校验（与 create_skill 的 _VALID_NAME_RE 一致）
+                if not _VALID_NAME_RE.match(skill.name):
+                    logger.warning(
+                        f"跳过技能 '{skill.name}': 名称不合法（仅允许字母、数字、-、_）")
+                    continue
+                # 与内置工具重名冲突校验
+                if skill.name in builtin_names:
+                    logger.warning(
+                        f"跳过技能 '{skill.name}': 与内置工具重名冲突，无法注册")
+                    continue
+                skills[skill.name] = skill
             except (json.JSONDecodeError, OSError, KeyError) as e:
                 logger.warning(f"加载技能失败 '{folder.name}': {e}")
                 continue
 
-        return list(self._skills.values())
+        return skills
 
     # ============================================================
     # 查询

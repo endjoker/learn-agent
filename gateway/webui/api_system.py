@@ -12,7 +12,7 @@ import logging
 
 from aiohttp import web
 
-from core.config_writer import mask_key
+from core.config_writer import is_masked_placeholder, mask_key
 
 logger = logging.getLogger("jk_agent.gateway")
 
@@ -88,35 +88,29 @@ def _live_mcp(module) -> dict:
     return live
 
 
-# ---- 网关级 MCP 状态管理器（#2：常驻连接，不再每次探针后 close） ----
-_probe_cache = {"at": 0.0, "data": {}}
-_PROBE_TTL = 30.0
+# ---- 网关级 MCP 状态（L6#13：不再维护独立常驻连接） ----
+# 状态页只聚合各会话 agent.mcp_manager 的实时连接（_live_mcp）。原
+# _mcp_status_mgr 常驻探针会为每个 server 额外建立一套连接（stdio 还要多起
+# 一个子进程），与会话内连接重复且互不相干；配合 create_gateway_agent 的
+# 后台预热（B6/L6#1），每个活跃会话都持有自己的已初始化 mcp_manager，
+# 状态页据此即可反映真实连通性，无需独立探针连接。
 
 
-def _status_mgr(module, servers: list):
-    """返回常驻 MCPClientManager；配置服务器集合变化时重建。"""
-    from core.mcp_client import MCPClientManager, run_in_mcp_loop
-    names = tuple(sorted((s.get("name") or "") for s in servers))
-    mgr = getattr(module, "_mcp_status_mgr", None)
-    if mgr is None or getattr(module, "_mcp_status_names", None) != names:
-        if mgr is not None:
-            try:
-                run_in_mcp_loop(mgr.close_all(), timeout=10)
-            except Exception:
-                pass
-        mgr = MCPClientManager()
-        for s in servers:
-            try:
-                mgr.add_server(s)
-            except Exception:
-                pass
-        module._mcp_status_mgr = mgr
-        module._mcp_status_names = names
-    return mgr
+async def _mcp_probe(module, servers: list) -> dict:
+    """兼容旧预热/探针入口（gateway/webui/__init__._mcp_warm 仍调用）。
+
+    常驻状态连接已移除（L6#13），本函数不再建立任何 MCP 连接，恒返回空
+    状态；调用方已 try/except 包裹，行为退化为 no-op。
+    """
+    return {}
 
 
 def close_status_mgr(module):
-    """WebUI 停机时关闭常驻 MCP 状态连接（由 WebUIModule.stop 调用）。"""
+    """WebUI 停机收尾：兜底关闭历史遗留的常驻状态连接（如有）。
+
+    新代码不再创建 module._mcp_status_mgr（L6#13）；保留本函数以兼容
+    gateway/webui/__init__.WebUIModule.stop 的调用点。
+    """
     mgr = getattr(module, "_mcp_status_mgr", None)
     if mgr is not None:
         try:
@@ -127,43 +121,6 @@ def close_status_mgr(module):
         module._mcp_status_mgr = None
 
 
-def _probe_mcp_sync(module, servers: list) -> dict:
-    from core.mcp_client import run_in_mcp_loop
-    mgr = _status_mgr(module, servers)
-    out = {}
-    try:
-        run_in_mcp_loop(mgr.initialize_all(timeout=10), timeout=30)
-        for name in mgr.list_connections():
-            conn = mgr.get_connection(name)
-            out[name] = {"initialized": bool(conn and conn.is_initialized),
-                         "tools": 0}
-        if any(v["initialized"] for v in out.values()):
-            try:
-                tools = run_in_mcp_loop(mgr.discover_all_tools(), timeout=15)
-                for name, tl in (tools or {}).items():
-                    if name in out:
-                        out[name]["tools"] = len(tl)
-            except Exception:
-                pass
-    except Exception as e:
-        # 连接被服务端重置（Cannot write to closing transport 等）：
-        # 丢弃坏会话，下次探针重建，避免反复对 closing transport 写入
-        logger.warning("MCP 状态探针连接异常，将重建连接: %s", type(e).__name__)
-        module._mcp_status_mgr = None
-        return {}
-    return out  # 不 close —— 连接保持常驻
-
-
-async def _mcp_probe(module, servers: list) -> dict:
-    import time as _t
-    loop = asyncio.get_event_loop()
-    if _t.time() - _probe_cache["at"] > _PROBE_TTL and servers:
-        data = await loop.run_in_executor(None, _probe_mcp_sync, module, servers)
-        _probe_cache["at"] = _t.time()
-        _probe_cache["data"] = data
-    return _probe_cache["data"]
-
-
 def _make_mcp(module):
     async def handler(request):
         from core.config_writer import read_raw_config
@@ -171,16 +128,9 @@ def _make_mcp(module):
         servers = []
         if status != "corrupt":
             servers = data.get("mcp", {}).get("servers", []) or []
+        # L6#13：只聚合活跃会话 agent.mcp_manager 的实时连接，不再用独立
+        # 常驻连接探针补充状态（无活跃会话时 live 为空是诚实结果）。
         live = _live_mcp(module)
-        # 无活跃会话连接时，用探针反映真实连通性（#2）
-        if not any(v.get("initialized") for v in live.values()):
-            probe = await _mcp_probe(module, servers)
-            for s in servers:
-                name = s.get("name")
-                if name and name not in live and name in probe:
-                    live[name] = {"sessions": 0,
-                                  "initialized": probe[name]["initialized"],
-                                  "tools": probe[name]["tools"]}
         return web.json_response({
             "servers": [_mask_server(s) for s in servers],
             "live": live,
@@ -212,13 +162,22 @@ def _make_mcp_write(module):
             new_list = []
             for s in servers:
                 if s.get("name") == name:
-                    # env/headers 空值 = 保留原值
+                    # env/headers 空值 = 保留原值；掩码占位符（**** 等）也保留原值
                     merged = dict(s)
                     merged.update(body)
                     for field in ("env", "headers"):
                         nv = body.get(field)
                         if not nv and isinstance(s.get(field), dict):
                             merged[field] = s[field]
+                        elif isinstance(nv, dict) and isinstance(s.get(field), dict):
+                            out = dict(s[field])
+                            for k, v in nv.items():
+                                if isinstance(v, str) and is_masked_placeholder(v):
+                                    # 掩码占位符 → 保留该键的原值（与 ConfigService._merge 一致）
+                                    out[k] = s[field].get(k, v)
+                                else:
+                                    out[k] = v
+                            merged[field] = out
                     new_list.append(merged)
                     found = True
                 else:
@@ -272,7 +231,6 @@ def _broadcast(module, text: str) -> int:
 def _make_mcp_apply(module):
     async def handler(request):
         n = _broadcast(module, "/mcp reload")
-        _probe_cache["at"] = 0.0
         return web.json_response({"queued": n})
     return handler
 
@@ -281,10 +239,9 @@ def _make_mcp_reconnect(module):
     async def handler(request):
         name = request.match_info["name"]
         n = _broadcast(module, f"/mcp reconnect {name}")
-        _probe_cache["at"] = 0.0  # 立即重探，状态随之刷新（#2）
         if n == 0:
             return web.json_response({"queued": 0,
-                                      "note": "无活跃会话，已刷新连接探针"})
+                                      "note": "无活跃会话，状态页仅反映会话内连接"})
         return web.json_response({"queued": n})
     return handler
 
@@ -551,8 +508,7 @@ def _make_main_session_put(module):
         except ValueError as exc:
             return _err(str(exc), 400)
 
-        from core.config_writer import read_raw_config, backup_file, write_config
-        from core.config_loader import load_config
+        from core.config_writer import read_raw_config
 
         data, status = read_raw_config()
         if status == "corrupt":
@@ -577,9 +533,8 @@ def _make_main_session_put(module):
             "mcp_servers": mcp_servers,
         }
         try:
-            backup_file()
-            write_config(None, data)
-            load_config(force_reload=True)
+            # 配置写盘统一走 ConfigService 持锁管线（backup + write + force_reload）
+            await module.config_service.write_full(data)
         except OSError as exc:
             return _err(str(exc), 500)
 

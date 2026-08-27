@@ -6,6 +6,9 @@ import time
 from pathlib import Path
 
 _AGENT_OUTPUT_PREFIX = "agent-output-"
+# B4 spill 落盘（沙箱关路径）产生的转录文件前缀
+_BASH_SPILL_PREFIX = "jk-bash-"
+_BASH_SPILL_DIR = "jk-tool-spill"
 
 
 def _safe_remove(path: Path) -> None:
@@ -52,7 +55,17 @@ def cleanup_agent_output_logs(tmp_root, max_age_seconds: int) -> int:
     removed = 0
     try:
         for child in tmp_root.iterdir():
-            if child.name.startswith(_AGENT_OUTPUT_PREFIX):
+            # 同时覆盖 bash spill 转录文件（jk-bash-*.log）与 jk-tool-spill/ 目录
+            if child.name.startswith(_AGENT_OUTPUT_PREFIX) or child.name.startswith(_BASH_SPILL_PREFIX):
+                try:
+                    if child.stat().st_mtime < cutoff:
+                        _safe_remove(child)
+                        removed += 1
+                except OSError:
+                    continue
+        spill_dir = tmp_root / _BASH_SPILL_DIR
+        if spill_dir.is_dir():
+            for child in spill_dir.iterdir():
                 try:
                     if child.stat().st_mtime < cutoff:
                         _safe_remove(child)

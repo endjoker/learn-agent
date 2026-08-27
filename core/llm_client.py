@@ -10,11 +10,14 @@ LLM 客户端模块 —— 与各种大语言模型 API 通信的核心组件
     model_id / timeout / models（各模型的 api_key、base_url、protocol 等）
 """
 
+import email.utils
+import inspect
 import json
+import logging
 import os
 import re
 import time
-import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Optional, Callable
 
@@ -152,6 +155,56 @@ def detect_context_length(model_name: Optional[str], default: int = 32768) -> in
             return ctx_len
 
     return default
+
+
+# ============================================================
+# 流式读空闲超时（推理模型长思考保护）
+# ============================================================
+#
+# 标量 timeout 同时约束 connect 与 read（chunk 间隔）：推理模型首帧前长
+# 思考超过 60s 即 ReadTimeout 整轮作废。流式请求改用 httpx.Timeout 细分：
+# connect/write/pool 仍取标量 req_timeout，read 放宽为
+# max(req_timeout, JKAGENT_STREAM_READ_TIMEOUT，默认 300s)——与 MCP 侧
+# total=None + sock_read 细分（core/mcp_client.py）同一思路。
+# 仅作用于流式方法（generate_stream_with_tools）；非流式路径不动。
+
+_STREAM_READ_TIMEOUT_ENV = "JKAGENT_STREAM_READ_TIMEOUT"
+_STREAM_READ_IDLE_DEFAULT = 300
+
+
+def _stream_read_idle_seconds(req_timeout) -> int:
+    """流式 read（chunk 间隔）空闲上限秒数。
+
+    JKAGENT_STREAM_READ_TIMEOUT 解析失败（非整数等）一律回退默认 300。
+    """
+    try:
+        env_idle = int(os.getenv(
+            _STREAM_READ_TIMEOUT_ENV, str(_STREAM_READ_IDLE_DEFAULT)))
+    except (TypeError, ValueError):
+        env_idle = _STREAM_READ_IDLE_DEFAULT
+    try:
+        base = int(req_timeout)
+    except (TypeError, ValueError):
+        base = 0
+    return max(base, env_idle, 1)
+
+
+def stream_httpx_timeout(req_timeout):
+    """标量超时 → httpx.Timeout(connect/write/pool=标量, read=空闲上限)。
+
+    httpx 缺失或构造异常时退回原标量，保证调用方永远拿到可用超时值。
+    """
+    idle = _stream_read_idle_seconds(req_timeout)
+    try:
+        import httpx
+        try:
+            base = max(int(req_timeout), 1)
+        except (TypeError, ValueError):
+            base = idle
+        return httpx.Timeout(connect=base, read=idle,
+                             write=base, pool=base)
+    except ImportError:
+        return req_timeout
 
 
 # ============================================================
@@ -318,7 +371,8 @@ class JKAgentLLM:
                 f"   支持: {', '.join(LOCAL_PROVIDERS.keys())}"
             )
         elif not self.base_url and _need_base_url:
-            missing.append("LLM_BASE_URL（API服务地址）")
+            # cloud + OpenAI 协议未显式配置 base_url → 默认官方端点，不再报缺配置
+            self.base_url = "https://api.openai.com/v1"
 
         if missing:
             raise ValueError(
@@ -391,6 +445,49 @@ class JKAgentLLM:
                 return True
         return False
 
+    # 统一的重试参数（think / complete / stream_with_tools 共享）
+    _MAX_RETRIES = 3
+    _RETRY_DELAYS = [1, 2, 4]
+
+    @classmethod
+    def _retry_delay(cls, attempt: int, exception: Exception) -> float:
+        """指数退避；若异常携带 Retry-After 头则优先采用（P2-7）。
+
+        Retry-After 支持两种格式（RFC 7231）：
+          - 秒数（整数/浮点）：如 ``Retry-After: 120``
+          - HTTP-date：如 ``Retry-After: Fri, 31 Dec 1999 23:59:59 GMT``
+        """
+        retry_after = getattr(exception, "retry_after", None)
+        if retry_after is None:
+            response = getattr(exception, "response", None)
+            headers = getattr(response, "headers", None)
+            if headers is not None:
+                try:
+                    retry_after = headers.get("Retry-After")
+                except Exception:
+                    retry_after = None
+        if retry_after is not None:
+            delay = cls._parse_retry_after(retry_after)
+            if delay is not None:
+                return min(max(0.0, delay), 60.0)
+        return float(cls._RETRY_DELAYS[min(attempt - 1, len(cls._RETRY_DELAYS) - 1)])
+
+    @staticmethod
+    def _parse_retry_after(value) -> Optional[float]:
+        """解析 Retry-After 头：秒数或 HTTP-date，返回等待秒数；无法解析返回 None。"""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, str):
+            try:
+                when = email.utils.parsedate_to_datetime(value)
+                if when is not None:
+                    return (when - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return None
+
     def think(
         self,
         messages: List[Dict[str, str]],
@@ -399,15 +496,21 @@ class JKAgentLLM:
         silent: bool = False,
         timeout: Optional[int] = None,
         on_chunk: Optional[Callable[[str], None]] = None,
-    ) -> Optional[str]:
+    ) -> str:
         """
         让 LLM 思考并返回响应（带重试逻辑）
 
         重试策略：
         - 网络类错误（RemoteProtocolError/Timeout/ConnectionError 等）自动重试
-        - 最多重试 3 次，退避 1s -> 2s -> 4s
-        - 流式失败后降级为非流式重试（更可靠）
+        - 最多重试 3 次，指数退避（尊重 Retry-After 头）
+        - 流式首帧前失败 → 降级为非流式重试（更可靠）
+        - 流式已转发内容后失败 → 不再重试，直接抛原异常由上层收口
+          （重试会重复已输出的内容）
         - plan 模式（silent=True）同样重试，仅写日志不打印
+
+        契约（P3-4）：成功返回文本；最终失败抛出最后一次异常，与 complete()
+        的错误语义一致——不再返回 None。当前全部调用方（compressor 全量/增量
+        摘要）均以 try/except 收口。
 
         参数:
             messages:   对话消息列表
@@ -415,17 +518,15 @@ class JKAgentLLM:
             stream:      是否流式输出
             silent:      静默模式（不输出模式标签，供内部压缩等场景使用）
         """
-        MAX_RETRIES = 3
-        RETRY_DELAYS = [1, 2, 4]
-
         if not silent:
             mode_tag = "🏠 本地" if self.llm_type == "local" else "☁️ 云端"
-            print(f"  ▶ {mode_tag} {self.model}（{self.base_url}）")
+            logger.info(f"  ▶ {mode_tag} {self.model}（{self.base_url}）")
 
         self.last_usage = None
 
-        for attempt in range(1, MAX_RETRIES + 1):
+        for attempt in range(1, self._MAX_RETRIES + 1):
             use_stream = stream if attempt == 1 else False
+            forwarded_any = False
 
             # ---- 超时（参数 > 配置 > 环境变量 > 60s） ----
             req_timeout = timeout or self._config_timeout or int(os.getenv("LLM_TIMEOUT", "60"))
@@ -436,6 +537,7 @@ class JKAgentLLM:
                     for chunk in self._adapter.generate_stream(
                         self.model, messages, temperature, req_timeout
                     ):
+                        forwarded_any = True  # 收到 chunk 即视为已转发，防止重试重复输出
                         if not silent:
                             print(chunk, end="", flush=True)
                         if on_chunk:
@@ -453,41 +555,51 @@ class JKAgentLLM:
                     )
                     self.last_usage = resp.usage
                     if stream and attempt > 1 and not silent:
-                        print(resp.text)
+                        # 降级非流式重试成功：整段文本在返回中交付，不再 print 复读
+                        logger.warning(f"LLM 降级非流式重试成功（第 {attempt} 次）")
                     return resp.text
 
             except Exception as e:
+                # 流式已转发内容后失败：重试会重复已输出的内容，直接抛原异常
+                # 由上层收口（不再降级非流式重试）。
+                if forwarded_any:
+                    raise
+
                 should_retry = self._is_retryable(e)
 
-                if not should_retry or attempt >= MAX_RETRIES:
-                    if not silent:
-                        print(f"\n  ❌ LLM 调用失败: {type(e).__name__}: {e}")
+                if not should_retry or attempt >= self._MAX_RETRIES:
                     logger.error(
-                        f"LLM 调用失败（第 {attempt}/{MAX_RETRIES} 次）: "
+                        f"LLM 调用失败（第 {attempt}/{self._MAX_RETRIES} 次）: "
                         f"{type(e).__name__}: {e}",
                         exc_info=True,
                     )
-                    return None
+                    # P3-4：与 complete() 一致，最终失败抛出最后一次异常，
+                    # 不再返回 None（调用方均已 try/except 收口）。
+                    raise
 
-                delay = RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
-                if not silent:
-                    fallback = "，降级为非流式" if stream else ""
-                    print(f"\n  ⚠️ 第 {attempt}/{MAX_RETRIES} 次失败: "
-                          f"{type(e).__name__}，{delay}s 后重试{fallback}…")
-                else:
-                    logger.warning(
-                        f"LLM 调用第 {attempt}/{MAX_RETRIES} 次失败: "
-                        f"{type(e).__name__}，{delay}s 后重试…"
-                    )
+                delay = self._retry_delay(attempt, e)
+                fallback = "，降级为非流式" if stream and attempt == 1 else ""
+                logger.warning(
+                    f"LLM 调用第 {attempt}/{self._MAX_RETRIES} 次失败: "
+                    f"{type(e).__name__}，{delay}s 后重试{fallback}…"
+                )
 
                 time.sleep(delay)
 
-        return None
+        # 不可达防御：重试耗尽必然在上方 raise；保留显式兜底避免静默返回。
+        raise RuntimeError("LLM 调用重试循环异常退出")
 
     def complete(self, messages: List[Dict], *, tools: Optional[List[Dict]] = None,
-                 temperature: float = 0, timeout: Optional[int] = None):
-        """Return a structured non-streaming response when the adapter supports it."""
+                 temperature: float = 0, timeout: Optional[int] = None,
+                 tool_choice=None):
+        """Return a structured non-streaming response when the adapter supports it.
+
+        P2-7：非流式调用（含原生工具调用 complete(..., tools=...)）共享统一重试：
+        可重试网络错误/429/5xx 时指数退避（尊重 Retry-After），非重试错误（4xx、
+        参数校验等）原样抛出，不重试。
+        """
         req_timeout = timeout or self._config_timeout
+        supports_tool_choice = False
         if tools:
             generate_with_tools = getattr(self._adapter, "generate_with_tools", None)
             if not callable(generate_with_tools):
@@ -495,12 +607,41 @@ class JKAgentLLM:
                     f"协议适配器 '{self._protocol}' 不支持原生工具调用；"
                     "请使用支持 function calling 的模型/适配器，或切换到 OpenAI 兼容协议。"
                 )
-            response = generate_with_tools(
-                self.model, messages, tools, temperature, req_timeout)
-        else:
-            response = self._adapter.generate(self.model, messages, temperature, req_timeout)
-        self.last_usage = response.usage
-        return response
+            # 调用前用签名探测第三方适配器是否接受 tool_choice，替代旧的
+            # TypeError 事后重放——重放会把已执行一半的调用再发一次。
+            try:
+                params = inspect.signature(generate_with_tools).parameters
+                supports_tool_choice = (
+                    "tool_choice" in params
+                    or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                           for p in params.values()))
+            except (TypeError, ValueError):
+                supports_tool_choice = False
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self._MAX_RETRIES + 1):
+            try:
+                if tools:
+                    if supports_tool_choice:
+                        response = generate_with_tools(
+                            self.model, messages, tools, temperature, req_timeout,
+                            tool_choice=tool_choice)
+                    else:
+                        # Third-party adapters may still expose the legacy signature.
+                        response = generate_with_tools(
+                            self.model, messages, tools, temperature, req_timeout)
+                else:
+                    response = self._adapter.generate(self.model, messages, temperature, req_timeout)
+                self.last_usage = response.usage
+                return response
+            except Exception as exc:
+                if not self._is_retryable(exc) or attempt >= self._MAX_RETRIES:
+                    raise
+                last_exc = exc
+                time.sleep(self._retry_delay(attempt, exc))
+        # 理论不可达：最后一次重试失败已在循环内 raise。
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("unreachable: complete() retry loop exhausted")
 
     def stream_with_tools(self, messages: List[Dict], tools: List[Dict], *,
                           temperature: float = 0, timeout: Optional[int] = None,
@@ -509,44 +650,70 @@ class JKAgentLLM:
 
         No textual command grammar is used as a fallback.  Providers without
         tool streaming still use native non-streaming function calls.
+
+        P2-7：与 complete 共用重试；但仅在尚未向 on_event 转发任何事件时重试
+        （一旦开始流式输出，重试会重复已发送的内容）。
         """
         req_timeout = timeout or self._config_timeout
-        try:
-            events = self._adapter.generate_stream_with_tools(
-                self.model, messages, tools, temperature, req_timeout)
-            text_parts: List[str] = []
-            calls: List[ProviderToolCall] = []
-            for event in events:
-                payload = {
-                    "type": event.type, "text": event.text, "call_id": event.call_id,
-                    "name": event.name, "arguments_delta": event.arguments_delta,
-                    "arguments": event.arguments, "order": event.order,
-                }
-                if on_event:
-                    on_event(payload)
-                if event.type == "text_delta":
-                    text_parts.append(event.text)
-                elif event.type == "tool_call_end":
-                    raw = json.dumps(event.arguments or {}, ensure_ascii=False)
-                    calls.append(ProviderToolCall(event.call_id, event.name,
-                                                  event.arguments or {}, raw, event.order))
-        except (AttributeError, NotImplementedError):
-            # The base adapter exposes a generator-shaped method that raises
-            # only when iterated, so the fallback must cover the whole loop.
-            # Keep ordinary chat usable for adapters without function calling;
-            # explicit structured callers such as plan generation still use
-            # complete(..., tools=...) and receive the intentional fail-fast
-            # NotImplementedError above.
-            response = self._adapter.generate(
-                self.model, messages, temperature, req_timeout)
-            if response.text and on_event:
-                on_event({"type": "text_delta", "text": response.text})
-            return response
-        response = ChatResponse(text="".join(text_parts), tool_calls=calls,
-                                finish_reason="tool_calls" if calls else "stop",
-                                usage=self._adapter.last_usage)
-        self.last_usage = response.usage
-        return response
+        # 流式专用：标量升级为 httpx.Timeout（read 空闲上限放宽，见模块头
+        # 说明）；NotImplementedError 降级后的非流式 generate() 仍用原标量。
+        stream_timeout = stream_httpx_timeout(req_timeout)
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self._MAX_RETRIES + 1):
+            forwarded_any = False
+            try:
+                events = self._adapter.generate_stream_with_tools(
+                    self.model, messages, tools, temperature, stream_timeout)
+                text_parts: List[str] = []
+                calls: List[ProviderToolCall] = []
+                for event in events:
+                    payload = {
+                        "type": event.type, "text": event.text, "call_id": event.call_id,
+                        "name": event.name, "arguments_delta": event.arguments_delta,
+                        "arguments": event.arguments, "order": event.order,
+                    }
+                    if on_event:
+                        on_event(payload)
+                        forwarded_any = True
+                    if event.type == "text_delta":
+                        text_parts.append(event.text)
+                    elif event.type == "tool_call_end":
+                        raw = json.dumps(event.arguments or {}, ensure_ascii=False)
+                        calls.append(ProviderToolCall(event.call_id, event.name,
+                                                      event.arguments or {}, raw, event.order))
+                response = ChatResponse(text="".join(text_parts), tool_calls=calls,
+                                        finish_reason="tool_calls" if calls else "stop",
+                                        usage=self._adapter.last_usage)
+                self.last_usage = response.usage
+                return response
+            except NotImplementedError:
+                # P1-1 修复：仅「适配器未实现原生流式工具调用」才允许降级。
+                # 基类的 generate_stream_with_tools 是普通方法，调用即抛
+                # NotImplementedError；子类以生成器实现时异常在迭代首帧抛出，
+                # 同样落在该 except 内。其余任何异常（网络/鉴权/参数错等）
+                # 一律走下方重试逻辑或原样抛出——此前把 AttributeError 等任意
+                # 异常也静默降级为不带 tools 的 generate()，导致 Agent 表面
+                # 正常但永远不执行工具。
+                logger.warning(
+                    "协议适配器 '%s' 未实现原生流式工具调用（NotImplementedError），"
+                    "已降级为不带 tools 的普通生成：本轮模型无法执行任何工具"
+                    "（model=%s）。请改用支持 function calling 的适配器。",
+                    self._protocol, self.model)
+                response = self._adapter.generate(
+                    self.model, messages, temperature, req_timeout)
+                if response.text and on_event:
+                    on_event({"type": "text_delta", "text": response.text})
+                return response
+            except Exception as exc:
+                # 已开始输出就不再重试，避免重复已转发的流式内容。
+                if forwarded_any or not self._is_retryable(exc) \
+                        or attempt >= self._MAX_RETRIES:
+                    raise
+                last_exc = exc
+                time.sleep(self._retry_delay(attempt, exc))
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("unreachable: stream_with_tools() retry loop exhausted")
 
     # ============================================================
     # 辅助方法

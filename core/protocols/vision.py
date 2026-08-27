@@ -6,15 +6,16 @@
     {"type": "text", "text": "..."}
     {"type": "image", "source": "base64", "media_type": "image/png", "data": "..."}
     {"type": "image", "source": "file", "path": "workspace/tmp/img.png"}
+    # file 源需位于允许根内（set_allowed_image_roots，P1 安全）；越界降级为文本占位
 """
 
 import base64
-import hashlib
 import logging
 import os
+import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 logger = logging.getLogger("jk_agent")
 
@@ -42,6 +43,128 @@ _REJECT_SIZE = 20 * 1024 * 1024     # 20MB — 硬拒绝
 _MAX_DIM_FIRST = 1536    # 第一轮压缩最长边
 _MAX_DIM_SECOND = 1024   # 第二轮压缩最长边
 _JPEG_QUALITY = 85
+
+# 像素尺寸上限（最长边）：防解压炸弹（小文件 + 超大像素尺寸）
+_MAX_PIXEL_DIM = 8192
+
+
+# ================================================================
+# 图片文件源路径白名单（P1 安全）
+# ================================================================
+# source="file" 的图片在读取前必须位于任一允许根内（realpath 归属判断）。
+# 未调用 set_allowed_image_roots 时保持旧行为（独立使用向后兼容），仅
+# logger.warning 提醒一次；create_agent 装配处与工具边界同源注入。
+_allowed_image_roots: set = set()
+_image_roots_configured: bool = False
+_image_roots_warned: bool = False
+_image_policy_generation: int = 0
+_image_roots_lock = threading.Lock()
+# 四档权限感知（2026-08-26 对齐决策）：注入 PermissionChecker 后，图片 file 源
+# 路径白名单在 ask/allow/unreviewed 模式下交还四档裁决（放开），readonly 保持
+# 白名单（纵深）。未注入（无裁决层的直调路径）时白名单照旧。
+_vision_permission = None
+
+# 四档权限模式集合（与 tools/builtin_tools._PERMISSION_LADDER_MODES 同义；
+# 不直接 import 以免 core→tools 反向依赖）
+_VISION_LADDER_MODES = {"ask", "allow", "unreviewed"}
+
+# 越界降级占位：不抛异常，返回文本块保证对话不中断
+_OUT_OF_BOUNDS_PLACEHOLDER = {
+    "type": "text",
+    "text": "[图片不可访问: 路径超出允许范围]",
+}
+
+
+def set_allowed_image_roots(roots: Sequence[str | Path]) -> None:
+    """设置图片文件源（source="file"）路径白名单根（线程安全，锁保护）。
+
+    roots: 可迭代的允许根（str 或 Path），内部统一 expanduser + resolve 为
+    realpath 后存储；resolve_image_block 对 file 源同样按 realpath 判断归属，
+    与工具读路径边界（create_agent 的 _boundary_roots）语义一致。
+
+    配置后，file 源图片仅允许读取位于任一允许根内的文件；越界路径不抛异常，
+    降级为文本占位块，对话继续。每次调用使白名单代次（_image_policy_generation）
+    递增，旧策略下缓存的解析结果自动失效（fail-closed，避免跨会话串策略）。
+    未调用过本函数时保持旧行为，仅 logger.warning 提醒一次。
+    """
+    global _allowed_image_roots, _image_roots_configured
+    global _image_roots_warned, _image_policy_generation
+    resolved = set()
+    for r in roots or ():
+        resolved.add(Path(r).expanduser().resolve())
+    with _image_roots_lock:
+        _allowed_image_roots = resolved
+        _image_roots_configured = True
+        _image_roots_warned = False
+        _image_policy_generation += 1
+
+
+def set_vision_permission(permission) -> None:
+    """注入 PermissionChecker（线程安全）：图片 file 源白名单四档权限感知。
+
+    ask/allow/unreviewed 模式下白名单交还四档裁决（放开路径限制，与工具读
+    边界的对齐方向一致）；readonly 保持白名单（纵深）。未注入（无裁决层的
+    直调路径）时白名单照旧生效。工具持有同一 checker 引用，/perm 切换即时生效。
+    """
+    global _vision_permission
+    with _image_roots_lock:
+        _vision_permission = permission
+
+
+def _vision_defers_to_ladder() -> bool:
+    """当前权限模式是否应放开图片白名单（四档感知）。"""
+    permission = _vision_permission
+    if permission is None:
+        return False
+    mode = str(getattr(permission, "permission_mode", "") or "")
+    return mode in _VISION_LADDER_MODES
+
+
+def _warn_no_image_roots_once() -> None:
+    """未配置白名单时提醒一次（线程安全）。"""
+    global _image_roots_warned
+    with _image_roots_lock:
+        if _image_roots_warned:
+            return
+        _image_roots_warned = True
+    logger.warning(
+        "未调用 set_allowed_image_roots：图片 file 源未启用路径白名单校验，"
+        "保持旧行为（向后兼容独立使用）。建议在 create_agent 装配处注入允许根。"
+    )
+
+
+def _image_policy_generation_value() -> int:
+    """当前白名单代次（set_allowed_image_roots 每次调用 +1）。"""
+    with _image_roots_lock:
+        return _image_policy_generation
+
+
+def _image_path_allowed(p: Path) -> bool:
+    """file 源路径是否允许读取（realpath 归属任一允许根，双保险）。
+
+    - p.resolve()：解析符号链接/..，防止经 symlink 逃逸出允许根；
+    - real.relative_to(root)：按路径分量判断归属，防止 /data/root2 被误判为
+      /data/root 之内（纯字符串前缀比较的经典漏洞）。
+
+    未调用 set_allowed_image_roots 时视为允许（保持旧行为），仅提醒一次。
+    """
+    with _image_roots_lock:
+        configured = _image_roots_configured
+        roots = _allowed_image_roots
+        defer = _vision_defers_to_ladder()
+    if defer:
+        return True
+    if not configured:
+        _warn_no_image_roots_once()
+        return True
+    real = p.resolve()
+    for root in roots:
+        try:
+            real.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 def is_image_file(path: str) -> bool:
@@ -117,6 +240,14 @@ def _try_pillow_compress(
     try:
         img = Image.open(io.BytesIO(raw_bytes))
 
+        # 防解压炸弹：像素尺寸超限直接硬错误上抛（不被下面的通用 except 吞掉）
+        w, h = img.size
+        if max(w, h) > _MAX_PIXEL_DIM:
+            raise ValueError(
+                f"图片像素过大（{w}x{h}，最长边 {max(w, h)}px），"
+                f"超过 {_MAX_PIXEL_DIM}px 限制。请压缩后重试或发送更小的图片。"
+            )
+
         # RGBA/P 模式转 RGB（JPEG 不支持透明通道）
         if img.mode in ("RGBA", "P", "LA"):
             img = img.convert("RGB")
@@ -147,6 +278,8 @@ def _try_pillow_compress(
         # 两轮压缩后仍超 5MB — 返回最后结果（比原始小就行）
         return result, out_type
 
+    except ValueError:
+        raise  # 像素尺寸超限等硬错误必须上抛，不降级为“压缩失败”
     except Exception as e:
         logger.warning(f"Pillow 压缩失败: {e}")
         return None, media_type
@@ -157,7 +290,10 @@ def _try_pillow_compress(
 # ================================================================
 
 # 解析结果缓存 —— 图片块写入历史后内容不再变化，缓存可避免每轮 LLM 调用
-# 都重新读盘/压缩/编码。file 源以 (路径, mtime) 为键，文件更新后自动失效。
+# 都重新读盘/压缩/编码。缓存键（A3，去掉每轮 7MB 级 md5）：
+#   source=file   → (绝对路径, mtime, size, 白名单代次)；文件更新或
+#                   set_allowed_image_roots 变更（代次递增）后自动失效；
+#   其余场景      → 数据本身身份（base64 直接以 data 字符串为键，零哈希开销）。
 _resolve_cache: OrderedDict = OrderedDict()
 _CACHE_MAX_ENTRIES = 8   # 每项为压缩后的 base64（≤~7MB），限制条目数控制内存
 
@@ -185,11 +321,18 @@ def resolve_image_block(block: dict) -> dict:
     异常（由 _iter_content_blocks 统一降级处理）：
         FileNotFoundError: 文件缺失
         ValueError:        图片超过 20MB / 未知 source
+
+    P1 安全（source="file"）：已配置 set_allowed_image_roots 时，文件 realpath
+    必须位于任一允许根内；越界不抛异常，直接返回文本占位块
+    {"type":"text","text":"[图片不可访问: 路径超出允许范围]"}，对话不中断。
+    未配置白名单时保持旧行为（向后兼容），仅 logger.warning 提醒一次。
     """
     source = block.get("source", "")
 
     if source == "base64":
-        key = ("b64", hashlib.md5(block.get("data", "").encode("ascii")).hexdigest())
+        # A3：直接以 base64 数据本身为键（身份即键），去掉每轮对 7MB 级
+        # 数据做 md5 的 CPU 开销；同一字符串对象跨轮复用，无额外拷贝。
+        key = ("b64", block.get("data", ""))
         cached = _cache_lookup(key)
         if cached is not None:
             return cached
@@ -203,7 +346,13 @@ def resolve_image_block(block: dict) -> dict:
             p = Path(__file__).resolve().parent.parent.parent / file_path
         if not p.exists():
             raise FileNotFoundError(f"图片文件不存在: {file_path}")
-        key = ("file", str(p), p.stat().st_mtime)
+        # P1 安全：realpath 必须位于任一允许根内（_image_path_allowed 双保险）。
+        # 越界不抛异常，降级为文本占位块，保证对话继续不中断；占位不入缓存。
+        if not _image_path_allowed(p):
+            return dict(_OUT_OF_BOUNDS_PLACEHOLDER)
+        st = p.stat()
+        # 缓存键含白名单代次：set_allowed_image_roots 变更后旧策略缓存自动失效
+        key = ("file", str(p), st.st_mtime, st.st_size, _image_policy_generation_value())
         cached = _cache_lookup(key)
         if cached is not None:
             return cached
@@ -244,7 +393,15 @@ def _iter_content_blocks(content: Any):
                 yield "text", text
         elif item_type == "image":
             try:
-                yield "image", resolve_image_block(item)
+                resolved = resolve_image_block(item)
+                if resolved.get("type") == "text":
+                    # 路径越界等降级：resolve_image_block 直接返回文本占位块，
+                    # 按文本块继续流转（空白块跳过）
+                    text = resolved.get("text", "")
+                    if text.strip():
+                        yield "text", text
+                else:
+                    yield "image", resolved
             except Exception as e:
                 logger.warning(f"图片块不可用，降级为文本占位: {e}")
                 yield "text", f"[图片不可用: {e}]"

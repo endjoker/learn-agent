@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -30,6 +31,86 @@ logger = logging.getLogger("jk_agent.gateway")
 SYSTEM_INTERNAL_TOOLS = frozenset({
     "create_skill", "notes", "memory_search", "memory_update",
 })
+
+
+# ============================================================
+# L5-P0-2：模块级缓存实例 —— ToolRegistry / SkillManager 复用
+#
+# 原实现每次 build_prompt / build_snapshot 都全量重建 ToolRegistry
+# （register_all_tools 注册百余工具并生成描述）并 SkillManager.load_all()
+# （读盘解析每个 SKILLS/*/skill.json + instruction.md），属 L5 链路热点。
+# 改为模块级单例：
+#   - ToolRegistry：工具注册来自代码，进程内恒定，只建一次；
+#   - SkillManager：按 SKILLS 目录内容 mtime 指纹变化重建（skill.json /
+#     instruction.md 任一文件 mtime 变化即重建，覆盖新增/编辑/删除）。
+# 并发创建由 _registry_lock 串行化（多线程懒初始化安全）。
+# ============================================================
+_tool_registry_cache = None
+_skill_manager_cache = None
+_skill_mtime_fingerprint = None
+_registry_lock = threading.Lock()
+
+
+def _skills_fingerprint(skills_dir: str) -> float:
+    """SKILLS 目录内容指纹：所有 skill.json / instruction.md 的最大 mtime。
+
+    新增/删除技能目录会改变目录自身 mtime，内容编辑改变文件 mtime；
+    任一变化都会让指纹改变，从而触发 SkillManager 重建。"""
+    try:
+        base = Path(skills_dir)
+        if not base.is_dir():
+            return 0.0
+        latest = 0.0
+        for folder in base.iterdir():
+            if not folder.is_dir():
+                continue
+            for name in ("skill.json", "instruction.md"):
+                try:
+                    latest = max(latest, (folder / name).stat().st_mtime)
+                except OSError:
+                    pass
+        return latest
+    except OSError:
+        return 0.0
+
+
+def get_cached_tool_registry():
+    """模块级 ToolRegistry 单例（工具注册来自代码，进程内恒定）。"""
+    global _tool_registry_cache
+    if _tool_registry_cache is None:
+        with _registry_lock:
+            if _tool_registry_cache is None:
+                from tools import ToolRegistry
+                from tools.builtin_tools import register_all_tools
+                from tools.web_tools import register_web_tools
+                reg = ToolRegistry()
+                register_all_tools(reg, memory_manager=None, sandbox=None,
+                                   process_manager=None)
+                register_web_tools(reg)
+                _tool_registry_cache = reg
+    return _tool_registry_cache
+
+
+def get_cached_skill_manager():
+    """模块级 SkillManager 单例；SKILLS 目录内容 mtime 指纹变化时重建。"""
+    global _skill_manager_cache, _skill_mtime_fingerprint
+    from skills.manager import SkillManager
+    from core.config_loader import _find_project_root
+    skills_dir = str(_find_project_root() / "SKILLS")
+    fingerprint = _skills_fingerprint(skills_dir)
+    if (_skill_manager_cache is None
+            or fingerprint != _skill_mtime_fingerprint):
+        with _registry_lock:
+            if (_skill_manager_cache is None
+                    or fingerprint != _skill_mtime_fingerprint):
+                mgr = SkillManager(skills_dir=skills_dir)
+                try:
+                    mgr.load_all()
+                except Exception:
+                    pass
+                _skill_manager_cache = mgr
+                _skill_mtime_fingerprint = fingerprint
+    return _skill_manager_cache
 
 
 @dataclass
@@ -211,21 +292,14 @@ class WorkspaceRuntimeService:
         self.gateway_config = gateway_config or {}
         self.framework_root = framework_root or str(Path(__file__).resolve().parent.parent.parent)
         if available_tools is None:
-            from tools import ToolRegistry
-            from tools.builtin_tools import register_all_tools
-            from tools.web_tools import register_web_tools
-            reg = ToolRegistry()
-            register_all_tools(reg, memory_manager=None, sandbox=None, process_manager=None)
-            register_web_tools(reg)
+            # L5-P0-2：复用模块级缓存实例（避免每次构造 Service 时全量注册）
+            reg = get_cached_tool_registry()
             available_tools = set(reg.get_catalog_names()) if hasattr(reg, "get_catalog_names") \
                 else {t["name"] for t in reg.get_catalog()}
         self.available_tools = available_tools
         if available_skills is None:
-            from skills.manager import SkillManager
-            from core.config_loader import _find_project_root
-            mgr = SkillManager(skills_dir=str(_find_project_root() / "SKILLS"))
             try:
-                mgr.load_all()
+                mgr = get_cached_skill_manager()
                 available_skills = {s.name for s in mgr.get_all_skills()}
             except Exception:
                 available_skills = set()
@@ -259,7 +333,11 @@ class WorkspaceRuntimeService:
 
     def build_snapshot(self, workspace_id: str, session_id: str,
                        reuse: bool = True) -> RuntimeSnapshot:
-        """组装并（可选）去重复用 RuntimeSnapshot。"""
+        """组装并（可选）去重复用 RuntimeSnapshot。
+
+        L5-P0-2：先按 dedup_key 查快照命中即返回，再做昂贵的 prompt 组装
+        （ToolRegistry 全量工具描述 + Skill 描述），未命中才走到 build_prompt。
+        """
         workspace = self.load_workspace(workspace_id)
         session = self.load_session(workspace_id, session_id)
         profile_id = session.agent_profile_id or workspace.default_agent_profile_id
@@ -268,20 +346,15 @@ class WorkspaceRuntimeService:
 
         # dedup_key：能力 hash + Profile 版本/内容 + Workspace/Session 版本，
         # 保证改 Prompt/版本后必然产生新快照。
-        import hashlib as _hl
-        _extra = {
-            "profile_id": profile_id,
-            "profile_version": profile.version if profile else 0,
-            "profile_prompt_hash": _hl.sha256(
-                (profile.system_prompt or "").encode("utf-8")).hexdigest()
-                if profile else "",
-            "workspace_version": workspace.version,
-            "session_client_config_version": session.client_config_version,
-        }
-        _dedup = "snap:" + _hl.sha256(json.dumps(
-            {"cap": config.capability_hash, **_extra},
-            ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")).hexdigest()
+        _dedup = self._snapshot_dedup_key(config, profile, profile_id,
+                                          workspace, session)
+
+        # L5-P0-2：dedup_key 命中直接复用已落库快照，跳过 build_prompt /
+        # hash_prompt（原实现在 get_or_create 内部才去重，prompt 组装白做）。
+        if reuse and self.snap_store is not None:
+            existing = self.snap_store.get_by_dedup_key(_dedup)
+            if existing is not None:
+                return existing
 
         snapshot = RuntimeSnapshot(
             snapshot_id="",
@@ -314,6 +387,25 @@ class WorkspaceRuntimeService:
             return self.snap_store.get_or_create(snapshot)
         return snapshot
 
+    @staticmethod
+    def _snapshot_dedup_key(config: EffectiveConfig, profile, profile_id: str,
+                            workspace: Workspace, session: WorkspaceSession) -> str:
+        """dedup_key：能力 hash + Profile 版本/内容 + Workspace/Session 版本。"""
+        import hashlib as _hl
+        _extra = {
+            "profile_id": profile_id,
+            "profile_version": profile.version if profile else 0,
+            "profile_prompt_hash": _hl.sha256(
+                (profile.system_prompt or "").encode("utf-8")).hexdigest()
+                if profile else "",
+            "workspace_version": workspace.version,
+            "session_client_config_version": session.client_config_version,
+        }
+        return "snap:" + _hl.sha256(json.dumps(
+            {"cap": config.capability_hash, **_extra},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
     def build_prompt(self, snapshot: RuntimeSnapshot,
                      config: Optional[EffectiveConfig] = None) -> str:
         """按快照组装 System Prompt（与 PromptAssembler 一致）。"""
@@ -340,12 +432,8 @@ class WorkspaceRuntimeService:
                 memory_path=str(workspace_memory_dir(snapshot.workspace_id)),
                 instruction="当用户询问与当前项目相关的问题时，优先调用 memory_search 检索本工作区长期记忆，再作答。",
             )
-        from tools import ToolRegistry
-        from tools.builtin_tools import register_all_tools
-        from tools.web_tools import register_web_tools
-        reg = ToolRegistry()
-        register_all_tools(reg, memory_manager=None, sandbox=None, process_manager=None)
-        register_web_tools(reg)
+        # L5-P0-2：复用模块级 ToolRegistry 单例（原实现每次全量重建）
+        reg = get_cached_tool_registry()
         tool_descs = reg.get_descriptions_for(snapshot.tools)
         skill_descs = self._build_skill_descs(snapshot.skills)
         mcp_descs = self._build_mcp_descs(snapshot.mcp_servers)
@@ -353,11 +441,9 @@ class WorkspaceRuntimeService:
                              mcp_descs=mcp_descs)
 
     def _build_skill_descs(self, skill_names: List[str]) -> str:
-        from skills.manager import SkillManager
-        from core.config_loader import _find_project_root
-        mgr = SkillManager(skills_dir=str(_find_project_root() / "SKILLS"))
+        # L5-P0-2：复用模块级 SkillManager 单例（SKILLS 目录 mtime 变化才重建）
         try:
-            mgr.load_all()
+            mgr = get_cached_skill_manager()
             skills = {s.name: s for s in mgr.get_all_skills()}
         except Exception:
             skills = {}

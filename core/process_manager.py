@@ -7,7 +7,7 @@
 
 设计见 code/learn/AIsubwey/design.md。要点：
 - 子进程经 SecurityGate 的 exec:shell 过 check_command_safety（含 DANGEROUS）后才启动
-- env 不脱敏（继承 os.environ，与 MCP stdio 一致；受信工作区模型）
+- env 统一经 sanitize_env 脱敏（与 bash 路径一致）
 - 输出用 ring buffer（deque(maxlen)）内存有界，不因输出量 kill；病态 spam 由 idle 兜底
 - read 用 per-session 消费模型（读后 clear），ring 驱丢未读 → truncated 标志
 - idle watchdog：无 read/send 超时 → kill；并检测自然退出
@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .sandbox.guard import sanitize_output
+from .sandbox.guard import sanitize_env, sanitize_output
 from .shell import shell_command
 from .sandbox.executor import OutputDrainer
 
@@ -64,9 +64,15 @@ class ProcessSession:
 class ProcessManager:
     """管理多个长驻子进程会话。"""
 
-    def __init__(self, sandbox, workspace: str):
+    # 四档权限模式：这些模式下 cwd 边界交还 PolicyEngine 裁决
+    # （_PATH_KEYS 含 "cwd"，proc_start 的界外 cwd 在 allow 档会 ASK、
+    # unreviewed 放行、ask 全量 ASK——授权确认后的执行必须可达）
+    _LADDER_MODES = {"ask", "allow", "unreviewed"}
+
+    def __init__(self, sandbox, workspace: str, permission=None):
         self._sandbox = sandbox
         self._workspace = Path(workspace).resolve()
+        self._permission = permission
         self._sessions: dict[int, ProcessSession] = {}
         self._next_id = 1
         prof = sandbox.get_current_profile() or {}
@@ -133,7 +139,13 @@ class ProcessManager:
         失败返回 (-1, 错误信息)。
         """
         cwd_path = Path(cwd).resolve() if cwd else self._workspace
-        if not self._is_within_workspace(cwd_path):
+        # cwd 边界四档权限感知：PolicyEngine _PATH_KEYS 含 "cwd"，proc_start
+        # 的界外 cwd 在授权层已按档位裁决（ask 全量 ASK / allow 界外 ASK /
+        # unreviewed 放行）——确认后的执行必须可达，不得在此一票否决。
+        # readonly（与 DENY 一致）与未注入权限（无裁决层的直调路径，硬边界
+        # 是唯一防线）保持硬拒绝。
+        permission_mode = str(getattr(self._permission, "permission_mode", "") or "")
+        if permission_mode not in self._LADDER_MODES and not self._is_within_workspace(cwd_path):
             return -1, f"❌ 区外 cwd 不允许: {cwd_path}（请用工作区内路径）"
 
         with self._lock:
@@ -151,7 +163,7 @@ class ProcessManager:
             stderr=subprocess.PIPE,
             stdin=subprocess.PIPE,
             cwd=str(cwd_path),
-            env=os.environ.copy(),          # 不脱敏，与 MCP stdio 一致
+            env=sanitize_env(os.environ.copy()),  # 与 bash 路径一致统一脱敏
         )
         if _IS_WINDOWS:
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -272,7 +284,10 @@ class ProcessManager:
     def list_sessions(self) -> list[dict]:
         now = time.time()
         out = []
-        for s in sorted(self._sessions.values(), key=lambda x: x.id):
+        # 持锁遍历：与 proc_start 的并发插入互斥，避免 "dict changed size"
+        with self._lock:
+            sessions = sorted(self._sessions.values(), key=lambda x: x.id)
+        for s in sessions:
             out.append({
                 "id": s.id,
                 "name": s.name,
@@ -346,11 +361,14 @@ class ProcessManager:
                         s.exit_code = s.proc.returncode
                         s.exited_at = now
                     continue
-                # idle 超时
+                # idle 超时：杀整个进程树（start_new_session + killpg，
+                # 回退逐个 kill 子进程；见 executor._kill_process_tree），
+                # 避免只杀 shell 留下持有管道的孤儿子进程。
                 if now - s.last_active > self._idle_timeout:
+                    _kill_tree(s.proc)
                     try:
-                        s.proc.kill()
-                    except (ProcessLookupError, OSError):
+                        s.proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
                         pass
                     with s.lock:
                         s.status = "idle_killed"

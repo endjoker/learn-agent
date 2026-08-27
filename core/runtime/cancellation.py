@@ -50,7 +50,11 @@ class CancellationToken:
                 self._callbacks.append(callback)
                 return
             reason = self._reason
-        callback(reason)
+        try:
+            # 已取消时的同步派发在锁外执行，保持 best-effort，不向调用方传播异常。
+            callback(reason)
+        except Exception:
+            pass
 
     @property
     def is_cancelled(self) -> bool:

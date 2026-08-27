@@ -1,0 +1,27 @@
+{
+  "name": "design-review",
+  "description": "视觉设计质量审查（来自 jezweb/claude-skills）：评估应用界面的视觉质量，逐屏审查布局、间距、对齐、视觉层次、色彩对比度、排版与一致性，输出结构化改进建议。用于界面走查与设计评审。触发词：does this look good、review my design、UI review。",
+  "version": 1,
+  "created_at": "2026-08-23T23:54:53",
+  "source": "https://github.com/jezweb/claude-skills",
+  "tags": [
+    "design",
+    "ui",
+    "review",
+    "frontend"
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "要审查的页面/界面/代码范围"
+      },
+      "output_dir": {
+        "type": "string",
+        "description": "审查报告输出目录，默认 output/"
+      }
+    },
+    "required": []
+  }
+}

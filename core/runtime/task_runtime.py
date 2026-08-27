@@ -7,7 +7,10 @@ import inspect
 import itertools
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+
+from core.debug import logger
 
 from .cancellation import CancellationToken, TaskCancelled
 from .models import RuntimeEvent, TaskEnvelope, TaskResult, TaskStatus, utc_now
@@ -35,7 +38,12 @@ class TaskRuntime:
                  max_global_concurrency: int = 4, worker_id: str = "runtime",
                  max_attempts: int = 2, retry_backoff_seconds: float = 1.0,
                  cancel_grace_seconds: float = 10.0,
-                 zombie_max_seconds: float = 300.0):
+                 zombie_max_seconds: float = 300.0,
+                 lease_ttl_seconds: float = 7200.0):
+        # 任务租约 TTL（秒）：多实例下「崩溃恢复延迟」= lease TTL。必须大于
+        # 最长任务执行时长（hard_timeout_seconds，默认 1200s，config 示例 6000s），
+        # 否则存活实例的长时间任务会被新实例误认领造成双跑。默认 2h 保守安全。
+        lease_ttl_seconds = max(1.0, float(lease_ttl_seconds))
         if max_global_concurrency <= 0:
             raise ValueError("max_global_concurrency must be positive")
         self.store = store
@@ -46,6 +54,7 @@ class TaskRuntime:
         self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
         self.cancel_grace_seconds = max(0.0, float(cancel_grace_seconds))
         self.zombie_max_seconds = max(0.0, float(zombie_max_seconds))
+        self.lease_ttl_seconds = lease_ttl_seconds
         self._queue: asyncio.PriorityQueue[_QueuedTask] = asyncio.PriorityQueue()
         self._workers: list[asyncio.Task] = []
         self._sequence = itertools.count()
@@ -70,7 +79,8 @@ class TaskRuntime:
         self._started = True
         self._stopping = False
         if recover_interrupted:
-            self.store.recover_interrupted(requeue=True)
+            # 只恢复租约过期或本进程（同一 worker_id 前缀）的滞留任务。
+            self.store.recover_interrupted(requeue=True, owner=self.worker_id)
         self._workers = [
             asyncio.create_task(self._worker(index), name=f"task-runtime-{index}")
             for index in range(self.max_global_concurrency)
@@ -84,8 +94,10 @@ class TaskRuntime:
             raise RuntimeError("TaskRuntime.start() must be called before enqueue_persisted()")
         for snapshot in self.store.list_tasks(statuses={TaskStatus.QUEUED}):
             await self._enqueue(snapshot.envelope)
-        for snapshot in self.store.list_tasks(statuses={TaskStatus.RETRY_WAIT}):
-            self.store.transition_task(snapshot.envelope.task_id, TaskStatus.QUEUED)
+        # RETRY_WAIT 任务经原子认领（只认领本实例所有或租约已过期的行），
+        # 防止多实例各自把同一重试任务入队一次造成双跑；其余由持有实例的
+        # _retry_after 定时器负责回队。
+        for snapshot in self.store.claim_retry_wait(owner=self.worker_id):
             await self._enqueue(snapshot.envelope)
 
     async def stop(self) -> None:
@@ -104,6 +116,12 @@ class TaskRuntime:
             except asyncio.CancelledError:
                 pass
         self._workers.clear()
+        # 优雅停机：把本实例仍在 LEASED（极短窗口）/未及收尾的任务租约置为
+        # 立即过期，重启后 recover 可按「过期租约」快速认领（崩溃则等 TTL）。
+        try:
+            self.store.release_leases(owner=self.worker_id)
+        except Exception:
+            logger.debug("release leases on stop failed", exc_info=True)
         self._started = False
 
     async def submit(self, envelope: TaskEnvelope) -> str:
@@ -128,9 +146,12 @@ class TaskRuntime:
             result = TaskResult(task_id=task_id, status=TaskStatus.CANCELLED,
                                 summary=reason, error_code="TASK_CANCELLED",
                                 error_message=reason, finished_at=utc_now())
-            self.store.transition_task(task_id, TaskStatus.CANCELLED, result=result,
-                                       error_code=result.error_code, error_message=result.error_message)
-            self._complete(task_id, result)
+            # 终态上的重复迁移幂等短路，不当作失败抛出。
+            self._transition(task_id, TaskStatus.CANCELLED, result=result,
+                             error_code=result.error_code, error_message=result.error_message)
+            snapshot = self.store.get_task(task_id)
+            self._complete(task_id, result,
+                           session_id=snapshot.envelope.session_id if snapshot else None)
 
     async def wait(self, task_id: str, timeout: Optional[float] = None) -> TaskResult:
         snapshot = self.store.get_task(task_id)
@@ -161,8 +182,18 @@ class TaskRuntime:
             queued = await self._queue.get()
             try:
                 await self._run_queued(queued.envelope, index)
+            except Exception as exc:
+                # 单个任务上的异常绝不能杀死 worker 协程：记日志后继续下一轮。
+                # asyncio.CancelledError 是 BaseException，不受此保护，会正常上抛。
+                logger.error("task worker %d crashed while processing %s: %s",
+                             index, queued.envelope.task_id, exc, exc_info=True)
             finally:
                 self._queue.task_done()
+
+    def _lease_expires_at(self) -> str:
+        """当前租约到期时间（now + lease_ttl_seconds，毫秒 ISO UTC）。"""
+        return (datetime.now(timezone.utc) + timedelta(seconds=self.lease_ttl_seconds)
+                ).isoformat(timespec="milliseconds")
 
     async def _run_queued(self, envelope: TaskEnvelope, index: int) -> None:
         snapshot = self.store.get_task(envelope.task_id)
@@ -180,13 +211,21 @@ class TaskRuntime:
             if snapshot is None or snapshot.record.is_terminal:
                 return
             if snapshot.record.cancel_requested:
-                self.store.transition_task(envelope.task_id, TaskStatus.CANCELLED,
-                                           error_code="TASK_CANCELLED", error_message="cancel requested")
+                # 并发 cancel 可能已把任务推到 CANCELLED：重复迁移幂等短路。
+                self._transition(envelope.task_id, TaskStatus.CANCELLED,
+                                 error_code="TASK_CANCELLED", error_message="cancel requested")
                 return
 
-            self.store.transition_task(envelope.task_id, TaskStatus.LEASED,
-                                       lease_owner=f"{self.worker_id}-{index}")
-            self.store.transition_task(envelope.task_id, TaskStatus.RUNNING)
+            # 队列出队到加锁之间可能被并发 cancel 置为终态：非法迁移短路放弃本轮。
+            # expected_status=QUEUED + 事务内状态校验：多实例下若任务已被其他
+            # 实例租走（QUEUED→LEASED），本 worker 放弃执行，防双跑。
+            if not self._transition(envelope.task_id, TaskStatus.LEASED,
+                                    lease_owner=f"{self.worker_id}-{index}",
+                                    lease_expires_at=self._lease_expires_at(),
+                                    expected_status=TaskStatus.QUEUED):
+                return
+            if not self._transition(envelope.task_id, TaskStatus.RUNNING):
+                return
             self.store.increment_attempt(envelope.task_id)
             token = CancellationToken()
             self._tokens[envelope.task_id] = token
@@ -196,30 +235,39 @@ class TaskRuntime:
                 result = await self._execute(envelope, token)
                 if result.task_id != envelope.task_id:
                     raise RuntimeError("executor returned a result for a different task")
-                if result.status is TaskStatus.FAILED and await self._schedule_retry(envelope, result):
-                    return
-                self.store.transition_task(envelope.task_id, result.status, result=result,
-                                           error_code=result.error_code,
-                                           error_message=result.error_message)
-                self._complete(envelope.task_id, result)
+                if result.status is TaskStatus.FAILED:
+                    try:
+                        if await self._schedule_retry(envelope, result):
+                            return
+                    except ValueError:
+                        # 并发终态已推进：放弃重试，直接落终态。
+                        pass
+                self._transition(envelope.task_id, result.status, result=result,
+                                 error_code=result.error_code,
+                                 error_message=result.error_message)
+                self._complete(envelope.task_id, result, session_id=envelope.session_id)
             except TaskCancelled as exc:
                 result = TaskResult(task_id=envelope.task_id, status=TaskStatus.CANCELLED,
                                     summary=str(exc), error_code="TASK_CANCELLED",
                                     error_message=str(exc), finished_at=utc_now())
-                self.store.transition_task(envelope.task_id, TaskStatus.CANCELLED, result=result,
-                                           error_code=result.error_code, error_message=result.error_message)
-                self._complete(envelope.task_id, result)
+                self._transition(envelope.task_id, TaskStatus.CANCELLED, result=result,
+                                 error_code=result.error_code, error_message=result.error_message)
+                self._complete(envelope.task_id, result, session_id=envelope.session_id)
             except asyncio.TimeoutError:
                 await self._handle_timeout(envelope, token)
             except Exception as exc:
                 result = TaskResult(task_id=envelope.task_id, status=TaskStatus.FAILED,
                                      summary=str(exc), error_code="TASK_EXECUTION_ERROR",
                                      error_message=str(exc), finished_at=utc_now())
-                if await self._schedule_retry(envelope, result):
-                    return
-                self.store.transition_task(envelope.task_id, TaskStatus.FAILED, result=result,
-                                           error_code=result.error_code, error_message=result.error_message)
-                self._complete(envelope.task_id, result)
+                try:
+                    if await self._schedule_retry(envelope, result):
+                        return
+                except ValueError:
+                    # 二次异常：并发终态已推进时放弃重试，不再向 worker 抛出。
+                    pass
+                self._transition(envelope.task_id, TaskStatus.FAILED, result=result,
+                                 error_code=result.error_code, error_message=result.error_message)
+                self._complete(envelope.task_id, result, session_id=envelope.session_id)
             finally:
                 self._tokens.pop(envelope.task_id, None)
 
@@ -245,7 +293,15 @@ class TaskRuntime:
             snapshot = self.store.get_task(envelope.task_id)
             if snapshot is None or snapshot.record.is_terminal or snapshot.record.cancel_requested:
                 return
-            self.store.transition_task(envelope.task_id, TaskStatus.QUEUED)
+            try:
+                # expected_status=RETRY_WAIT：若任务已被其他实例认领回队
+                # （claim_retry_wait，仅当本实例租约过期时才会发生），放弃
+                # 本次入队，防双实例把同一重试任务各入队一次造成双跑。
+                self.store.transition_task(
+                    envelope.task_id, TaskStatus.QUEUED,
+                    expected_status=TaskStatus.RETRY_WAIT)
+            except ValueError:
+                return
             self.store.append_event(RuntimeEvent.create("task.queued", session_id=envelope.session_id,
                                                         task_id=envelope.task_id,
                                                         data={"reason": "retry"}))
@@ -255,8 +311,15 @@ class TaskRuntime:
 
     async def _execute(self, envelope: TaskEnvelope, token: CancellationToken) -> TaskResult:
         if inspect.iscoroutinefunction(self.executor):
-            return await asyncio.wait_for(
-                self.executor(envelope, token), timeout=envelope.timeout_seconds)
+            # 与线程 executor 一致：shield 保护协程不被 wait_for 取消，超时后
+            # 登记为 zombie，交给隔离/回收流程处理，避免任务永久滞留。
+            work = asyncio.create_task(self.executor(envelope, token))
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(work), timeout=envelope.timeout_seconds)
+            except asyncio.TimeoutError:
+                self._zombies[envelope.task_id] = work
+                raise
 
         work = asyncio.create_task(asyncio.to_thread(self.executor, envelope, token))
         try:
@@ -274,9 +337,9 @@ class TaskRuntime:
                             summary=f"task exceeded {envelope.timeout_seconds}s",
                             error_code="TASK_TIMEOUT", error_message="execution timeout",
                             finished_at=utc_now())
-        self.store.transition_task(envelope.task_id, TaskStatus.TIMED_OUT, result=result,
-                                   error_code=result.error_code, error_message=result.error_message)
-        self._complete(envelope.task_id, result)
+        self._transition(envelope.task_id, TaskStatus.TIMED_OUT, result=result,
+                         error_code=result.error_code, error_message=result.error_message)
+        self._complete(envelope.task_id, result, session_id=envelope.session_id)
 
         zombie = self._zombies.get(envelope.task_id)
         if zombie is not None:
@@ -308,7 +371,40 @@ class TaskRuntime:
                 "session.quarantine_released", session_id=session_id, task_id=task_id,
             ))
 
-    def _complete(self, task_id: str, result: TaskResult) -> None:
-        future = self._completion.get(task_id)
+    def _transition(self, task_id: str, target: TaskStatus, *, lease_owner: Optional[str] = None,
+                    lease_expires_at: Optional[str] = None,
+                    expected_status: Optional[TaskStatus] = None,
+                    error_code: Optional[str] = None, error_message: Optional[str] = None,
+                    result: Optional[TaskResult] = None) -> bool:
+        """执行状态迁移；终态上的非法迁移（并发 cancel 等已推进状态）幂等短路。"""
+        try:
+            self.store.transition_task(task_id, target, lease_owner=lease_owner,
+                                       lease_expires_at=lease_expires_at,
+                                       expected_status=expected_status,
+                                       error_code=error_code, error_message=error_message,
+                                       result=result)
+            return True
+        except ValueError:
+            # 任务已被并发路径置为终态（或已被其他实例租走）：视为已满足，
+            # 不当作失败抛出。
+            return False
+
+    def _prune_session_state(self, session_id: str) -> None:
+        """任务终结后清理会话级状态，避免 _session_locks/_session_available 无限增长。"""
+        active = {TaskStatus.CREATED, TaskStatus.QUEUED, TaskStatus.LEASED,
+                  TaskStatus.RUNNING, TaskStatus.WAITING_APPROVAL,
+                  TaskStatus.WAITING_DEPENDENCY, TaskStatus.RETRY_WAIT}
+        if self.store.list_tasks(session_id=session_id, statuses=active):
+            return
+        self._session_locks.pop(session_id, None)
+        self._session_available.pop(session_id, None)
+
+    def _complete(self, task_id: str, result: TaskResult, *,
+                  session_id: Optional[str] = None) -> None:
+        # 完成后从 _completion 中清理，防止 per-task future 无限堆积；
+        # 后续 wait() 会直接命中持久化的终态 result。
+        future = self._completion.pop(task_id, None)
         if future and not future.done():
             future.set_result(result)
+        if session_id:
+            self._prune_session_state(session_id)

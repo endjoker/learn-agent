@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # ============================================================
 
 VALID_PERMISSION_MODES = ("readonly", "ask", "allow", "unreviewed")
-VALID_CHAT_MODES = ("chat", "plan")
+VALID_CHAT_MODES = ("chat",)
 # ``inherit`` means: follow the selected model / provider reasoning configuration.
 VALID_REASONING_LEVELS = ("inherit", "provider_default", "none", "minimal", "low", "medium", "high", "xhigh", "max")
 VALID_WORKSPACE_STATUSES = ("active", "archived", "deleted")
@@ -114,10 +114,6 @@ class WorkspaceRuntimeContext:
             _is_relative_to(self.working_directory, root)
             for root in self.extra_workspace_roots
         )
-
-    def allowed_roots(self) -> Tuple[Path, ...]:
-        """返回 (project_root, *extra_workspace_roots)。"""
-        return (self.project_root, *self.extra_workspace_roots)
 
     def to_dict(self) -> dict:
         """序列化 —— 不含任何密钥。"""

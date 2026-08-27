@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import subprocess
+import time
 from typing import Callable
 
 from .events import HookContext, HookResult, Decision, _coerce
@@ -48,12 +50,23 @@ class PythonHook(BaseHook):
         super().__init__()
         self.fn = fn
         self.name = name or getattr(fn, "__name__", "python_hook")
+        self.consecutive_errors: int = 0   # 连续异常次数（成功即清零）
+        self.last_error: str = ""          # 最近一次异常信息
+        self.last_error_at: float = 0.0    # 最近一次异常时间戳
 
     def run(self, ctx: HookContext) -> HookResult:
         try:
-            return _coerce(self.fn(ctx))
-        except Exception:
-            logger.error(f"PythonHook '{self.name}' 执行异常", exc_info=True)
+            result = _coerce(self.fn(ctx))
+            self.consecutive_errors = 0
+            return result
+        except Exception as exc:
+            self.consecutive_errors += 1
+            self.last_error = str(exc)
+            self.last_error_at = time.time()
+            logger.error(
+                f"PythonHook '{self.name}' 执行异常（连续 {self.consecutive_errors} 次）",
+                exc_info=True,
+            )
             return HookResult(Decision.CONTINUE, reason="hook 内部异常")
 
 
@@ -84,6 +97,17 @@ def _parse_stdout(text: str) -> HookResult:
     )
 
 
+# 需要 shell 解释的操作符/元字符（P3 加固判定依据）：
+# 管道 | 后台 & 顺序 ; 重定向 < > 命令替换 $ ` 子shell ( ) 及换行。
+# 注意：空格与引号不在列——shlex.split 能正确拆分含空格/引号的简单命令。
+_SHELL_METACHARS = "|&;<>()$`\n\r"
+
+
+def _contains_shell_metachars(command: str) -> bool:
+    """命令是否包含必须经 shell 解释的操作符/元字符。"""
+    return any(ch in _SHELL_METACHARS for ch in command)
+
+
 class CommandHook(BaseHook):
     """进程外命令 hook（对标 Claude Code hooks 协议）。
 
@@ -101,6 +125,9 @@ class CommandHook(BaseHook):
         self.timeout = timeout
         self.cwd = cwd
         self.name = name or command[:60]
+        self.consecutive_errors: int = 0   # 连续异常次数（成功即清零）
+        self.last_error: str = ""          # 最近一次异常信息
+        self.last_error_at: float = 0.0    # 最近一次异常时间戳
 
     @classmethod
     def from_config(cls, cfg: dict) -> "CommandHook":
@@ -125,19 +152,45 @@ class CommandHook(BaseHook):
         )
 
     def run(self, ctx: HookContext) -> HookResult:
+        # P3 加固（shell=True → 元字符感知执行）：
+        # - 命令含 shell 操作符（| & ; < > $ ` ( ) 及换行）时保留 shell=True，
+        #   这些命令依赖管道/重定向/变量展开语义，强行拆分会改变既有 hooks
+        #   配置的行为；
+        # - 否则 shlex.split 拆成 argv 列表直接 execvp，命令不再经 /bin/sh
+        #   二次解析，消除注入面；拆分结果为空或解析失败（引号不成对等
+        #   shlex.ValueError）时回退 shell=True，保持旧行为不崩溃。
+        if _contains_shell_metachars(self.command):
+            argv: str | list[str] = self.command
+            use_shell = True
+        else:
+            try:
+                parts = shlex.split(self.command)
+            except ValueError:
+                parts = []
+            if parts:
+                argv, use_shell = parts, False
+            else:
+                argv, use_shell = self.command, True
         try:
             proc = subprocess.run(
-                self.command, shell=True, input=ctx.to_json(),
+                argv, shell=use_shell, input=ctx.to_json(),
                 capture_output=True, text=True, timeout=self.timeout,
                 cwd=self.cwd, encoding="utf-8", errors="replace",
             )
         except subprocess.TimeoutExpired:
-            logger.warning(f"CommandHook 超时({self.timeout}s): {self.command[:120]}")
+            logger.warning(f"CommandHook '{self.name}' 超时({self.timeout}s): {self.command[:120]}")
             return HookResult(Decision.CONTINUE, reason="hook 超时")
-        except Exception:
-            logger.error(f"CommandHook 启动失败: {self.command[:120]}", exc_info=True)
+        except Exception as exc:
+            self.consecutive_errors += 1
+            self.last_error = str(exc)
+            self.last_error_at = time.time()
+            logger.error(
+                f"CommandHook '{self.name}' 启动失败（连续 {self.consecutive_errors} 次）: {self.command[:120]}",
+                exc_info=True,
+            )
             return HookResult(Decision.CONTINUE, reason="hook 启动失败")
 
+        self.consecutive_errors = 0
         if proc.returncode == 2:
             reason = (proc.stderr or "").strip() or "hook 拦截"
             return HookResult(Decision.BLOCK, reason=reason)

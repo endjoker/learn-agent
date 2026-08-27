@@ -11,25 +11,23 @@ L2-A 内容安全拦截 —— 在命令/文件操作执行前做内容层面安
     6. 输出脱敏（API Key / 私钥 / 密码）
     7. 安全操作白名单（跳过 L2-A 检查）
     8. 网络域名黑名单检查（外发过滤）
+    9. L2 规则热更（config.json 的 sandbox 段 mtime 校验，WebUI 保存后自动重载）
 """
 
 import ast
 import os
 import re
+import shlex
 from pathlib import Path
+from functools import lru_cache
 
 # ================================================================
 # 敏感文件列表（禁止写入 / 编辑）
 # ================================================================
 
-SENSITIVE_FILES = [
-    ".env",
-    ".git/config",
-    "core/permission.py",
-    "core/llm_client.py",
-    "agent.py",
-    "requirements.txt",
-]
+# Legacy compatibility symbol. Ordinary project files are not permission-sensitive;
+# the unified PolicyEngine only treats SYSTEM_PATHS_* as approval-sensitive paths.
+SENSITIVE_FILES: list[str] = []
 
 # ================================================================
 # 系统关键路径（各平台）
@@ -49,22 +47,46 @@ SYSTEM_PATHS_MAC = [
 ]
 
 
+def _path_prefix_hit(s: str, sys_paths: list) -> bool:
+    """路径串是否命中系统路径前缀（段边界匹配）。"""
+    for sp in sys_paths:
+        sp = sp.replace("\\", "/").rstrip("/")
+        if s == sp or s.startswith(sp + "/"):
+            return True
+    return False
+
+
 def _is_system_path(path: str | Path) -> bool:
     """检查路径是否在系统关键路径下（路径段边界匹配）。
 
-    对 POSIX 绝对路径（以 / 开头）直接用字符串前缀匹配，避免 Windows 上
-    Path.resolve() 把 /etc 解析成 D:\\etc 导致的漏检。Windows 绝对路径
+    对 POSIX 绝对路径（以 / 开头）先做字面前缀匹配（避免 Windows 上
+    Path.resolve() 把 /etc 解析成 D:\\etc 导致的漏检），再做 normpath
+    规范化（/./etc、/a/../etc、//etc）与 $VAR 展开（$PWD/../etc）复检，
+    最后做符号链接展开（realpath）复检，防规范化绕过。Windows 绝对路径
     （以盘符开头）走 resolve + normpath 比较。
     """
-    s = str(path).replace("\\", "/")
-    # POSIX 绝对路径：直接前缀匹配
-    if s.startswith("/"):
-        for sys_path in SYSTEM_PATHS_LINUX + SYSTEM_PATHS_MAC:
-            sp = sys_path.replace("\\", "/").rstrip("/")
-            if s == sp or s.startswith(sp + "/"):
-                return True
+    raw = str(path)
+    s = raw.replace("\\", "/")
+    posix_sys = SYSTEM_PATHS_LINUX + SYSTEM_PATHS_MAC
+    # POSIX 绝对路径（含 $VAR 前缀，如 $PWD/../etc）
+    if s.startswith("/") or raw.startswith("$"):
+        if _path_prefix_hit(s, posix_sys):
+            return True
+        # 规范化复检：/./etc、/a/../etc、//etc、$PWD/../etc
+        expanded = os.path.expandvars(raw)
+        norm = os.path.normpath(expanded.replace("\\", "/"))
+        if norm.startswith("/") and _path_prefix_hit(norm, posix_sys):
+            return True
+        # 符号链接展开复检（失败静默，依赖前两轮）
+        try:
+            resolved = os.path.realpath(expanded).replace("\\", "/")
+        except Exception:
+            resolved = ""
+        if resolved.startswith("/") and _path_prefix_hit(resolved, posix_sys):
+            return True
         return False
-    # Windows 绝对路径（盘符开头）
+    # Windows 绝对路径（盘符开头）或相对路径：resolve 后同时比较
+    # Windows 系统路径与 POSIX 系统路径（../../etc 之类相对路径逃逸）
     try:
         p_norm = os.path.normpath(str(Path(path).resolve())).lower()
     except Exception:
@@ -73,6 +95,8 @@ def _is_system_path(path: str | Path) -> bool:
         sp = os.path.normpath(sys_path).lower()
         if p_norm == sp or p_norm.startswith(sp + os.sep):
             return True
+    if _path_prefix_hit(p_norm.replace("\\", "/"), posix_sys):
+        return True
     return False
 
 
@@ -114,21 +138,18 @@ DATA_LEAK_PATTERNS = [
 # 不依赖 L1 规则是否设了 ALLOW。permission 的 DANGEROUS 保留作 L1 二级防线。
 # ================================================================
 
-# 单词型危险命令：必须作为独立令牌（前后空白/行首行尾）才命中
-# 避免 "format" 误伤 PowerShell 的 "format-table"
-# 限制在行首、空白后或命令分隔符后（; / && / || / |），防止参数中的误匹配（如 ls --format）
+# 单词型危险命令：作为剥离 env/sudo 前缀后的首令牌才命中
+# 避免 "format" 误伤 PowerShell 的 "format-table"、参数误匹配（如 grep format）
 DANGEROUS_WORDS = ["format", "shutdown", "reboot", "halt"]
 
+# 破坏性命令：目标命中关键系统目录即拦（P0-2）
+DESTRUCTIVE_COMMANDS = ("rm", "chmod", "chown", "dd", "mkfs")
 
-def _compile_words_re(words: list) -> re.Pattern:
-    """从危险词列表编译正则（模块级定义和配置热更新共用）"""
-    return re.compile(
-        r"(?:^|\s|;\s*|\|\|\s*|&&\s*|\|\s*)(" + "|".join(words) + r")(?=\s|$)",
-        re.IGNORECASE,
-    )
-
-
-_DANGEROUS_WORDS_RE = _compile_words_re(DANGEROUS_WORDS)
+# 关键系统目录（rm/chmod/chown/dd/mkfs 目标命中即拦；~ 与 $HOME 本体视为关键）
+CRITICAL_DIRS = (
+    "/bin", "/sbin", "/boot", "/etc", "/usr", "/var", "/lib",
+    "/root", "/dev", "/sys", "/proc",
+)
 
 
 _DANGEROUS_COMMAND_PATTERNS: list[tuple[str, re.Pattern]] = [
@@ -153,18 +174,150 @@ _DANGEROUS_COMMAND_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("mkfs", re.compile(r"(?:^|[;&|]\s*)mkfs(?:\.[A-Za-z0-9_+-]+)?(?:\s|$)", re.IGNORECASE)),
     ("dd if=", re.compile(r"(?:^|[;&|]\s*)dd\s+[^\r\n]*\bif=", re.IGNORECASE)),
     (":(){ :|:& };:", re.compile(re.escape(":(){ :|:& };:"))),
+    # 变体（无空格/不同空白）：:(){:|:&};: 等
+    ("fork bomb", re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|?\s*:?\s*&\s*\}")),
     ("> /dev/sda", re.compile(r">\s*/dev/(?:sda|mmcblk\d+)(?:\d+)?(?=\s|$|[;&|])", re.IGNORECASE)),
 ]
 
 
+def _tokenize_command(command: str) -> list[str]:
+    """shlex 分词；引号不闭合等异常时回退到空白切分。"""
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return re.findall(r"[^\s]+", command)
+
+
+def _split_subcommands(command: str) -> list[str]:
+    """按 ;  &&  ||  |  及换行拆分子命令（空段丢弃）。
+
+    逐段检测避免整串正则对复合命令的粘合误判，也让 env/sudo 前缀剥离
+    和首令牌判定按段独立进行。
+    """
+    return [seg for seg in re.split(r"[;&|\n]+", command) if seg.strip()]
+
+
+def _strip_privilege_prefix(tokens: list[str]) -> list[str]:
+    """剥离 env 前缀赋值（FOO=bar ...）与 sudo / sudo -u USER / sudo -g GROUP。
+
+    返回新列表，不修改入参。'env FOO=1 cmd' 形式的 env 命令一并剥离。
+    """
+    tokens = list(tokens)
+    while tokens and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0])
+                      or tokens[0] == "env"):
+        tokens.pop(0)
+    while tokens and tokens[0] == "sudo":
+        tokens.pop(0)
+        while tokens and tokens[0] in ("-u", "-g", "--user", "--group"):
+            tokens.pop(0)
+            if tokens and not tokens[0].startswith("-"):
+                tokens.pop(0)
+    return tokens
+
+
+# rm 全量删除目标（-rf 变体：/ . .. ./* /* 等）
+_RM_WIPE_TARGETS = frozenset({".", "..", "/*", "./*", "../*", "*"})
+
+
+def _is_critical_target(token: str) -> bool:
+    """令牌是否命中关键系统目录（含 /、~ 与 $HOME 本体）。"""
+    t = token.strip("'\"")
+    if t == "/":
+        return True
+    norm = t.rstrip("/")
+    if norm in ("~", "$home", "${home}"):
+        return True
+    for d in CRITICAL_DIRS:
+        if norm == d or norm.startswith(d + "/"):
+            return True
+    return False
+
+
+def _destructive_target_hit(tokens: list[str]) -> str | None:
+    """破坏性命令目标命中关键目录时返回命中的目标令牌（None 表示安全）。"""
+    cmd = tokens[0].strip("'\"")
+    args = tokens[1:]
+    # rm：直接检查全部非选项目标（覆盖 . .. ./* /* 及关键目录）
+    if cmd == "rm":
+        for a in args:
+            if a == "--" or a.startswith("-"):
+                continue
+            t = a.strip("'\"")
+            norm = t.rstrip("/") if t != "/" else t
+            if norm in _RM_WIPE_TARGETS or _is_critical_target(t):
+                return t
+        return None
+    # chmod / chown：跳过选项与权限/属主说明符，检查路径型参数
+    if cmd in ("chmod", "chown"):
+        for a in args:
+            if a == "--" or a.startswith("-"):
+                continue
+            t = a.strip("'\"")
+            if not t.startswith(("/", "~", "$", ".")):
+                continue  # 777 / a+x / user:group 等非路径参数
+            if _is_critical_target(t):
+                return t
+        return None
+    # dd：of= 写入目标
+    if cmd == "dd":
+        for a in args:
+            m = re.match(r"of=(.+)$", a)
+            if m and _is_critical_target(m.group(1)):
+                return a
+        return None
+    # mkfs / mkfs.ext4 ...
+    if cmd.startswith("mkfs"):
+        for a in args:
+            if a.startswith("-"):
+                continue
+            if _is_critical_target(a.strip("'\"")):
+                return a
+        return None
+    return None
+
+
+@lru_cache(maxsize=512)
 def _match_dangerous(command_lower: str) -> str | None:
-    """返回命中的危险模式（None 表示安全）。供 L2 硬拦使用。"""
+    """返回命中的危险模式（None 表示安全）。供 L2 硬拦使用。
+
+    三层检测（对 command.lower() 之后的文本）：
+      1. 整串正则模式 —— fork bomb / Windows 命令 / 设备重定向等，避免被切碎漏检
+      2. 按 ;  &&  ||  |  及换行拆分子命令，逐段剥离 env/sudo 前缀后做令牌级检测
+         —— 单词型危险命令（format/shutdown/reboot/halt）与
+            rm/chmod/chown/dd/mkfs 关键目录目标
+
+    模块级 verdict LRU（key=lower(command)，maxsize 512）：permission.py /
+    policy_engine.py / builtin_tools.py / check_command_safety 多闸门共用同一判定
+    缓存（多闸门去重，L3 配合项）。DANGEROUS_WORDS 等配置变化（apply_guard_config
+    调用或 mtime 热更）时整体 cache_clear()；仅在缓存未命中时校验 config.json
+    mtime（命中路径零额外开销）。
+    """
+    # L2 规则热更：缓存未命中才校验 config.json mtime（命中直接返回）
+    _maybe_reload_guard_config()
     for label, pattern in _DANGEROUS_COMMAND_PATTERNS:
         if pattern.search(command_lower):
             return label
-    m = _DANGEROUS_WORDS_RE.search(command_lower)
-    if m:
-        return m.group(1)
+    words = {w.lower() for w in DANGEROUS_WORDS}
+    for segment in _split_subcommands(command_lower):
+        tokens = _strip_privilege_prefix(_tokenize_command(segment))
+        if not tokens:
+            continue
+        cmd = tokens[0].strip("'\"")
+        # bash/sh -c '嵌套命令'：递归检测内层，堵住引号包裹绕过（P0-2）
+        if cmd in ("bash", "sh", "dash", "zsh", "ksh") and "-c" in tokens:
+            idx = tokens.index("-c")
+            if idx + 1 < len(tokens):
+                inner = tokens[idx + 1].strip("'\"")
+                if inner:
+                    inner_hit = _match_dangerous(inner)
+                    if inner_hit is not None:
+                        return "bash -c 嵌套: " + inner_hit
+        if cmd.lower() in words:
+            return cmd
+        if cmd in DESTRUCTIVE_COMMANDS or cmd.startswith("mkfs"):
+            hit = _destructive_target_hit(tokens)
+            if hit is not None:
+                return f"{cmd} 目标命中关键目录: {hit}"
     return None
 
 
@@ -264,43 +417,136 @@ SAFE_PATTERNS = [
 # Python 代码 AST 检查（配置化）
 # ================================================================
 
-# 硬编码兜底默认值（config.json 不可用时使用）
-_DEFAULT_FORBIDDEN_IMPORTS = {"subprocess", "ctypes", "socket"}
-_DEFAULT_FORBIDDEN_CALLS = {"eval", "exec", "__import__"}
+# 硬编码兜底默认值：仅当 config.json 未提供对应键时使用；
+# config.json 一旦提供某键（如 forbidden_calls），以配置为准（整体替换，
+# 不与默认集叠加——否则配置放宽的项会被默认集悄悄加回，形成"残留"）。
+_DEFAULT_FORBIDDEN_IMPORTS = {"subprocess", "ctypes", "socket", "importlib"}
+_DEFAULT_FORBIDDEN_CALLS = {"eval", "exec", "__import__", "compile", "open", "getattr", "setattr"}
 _DEFAULT_FORBIDDEN_QUALIFIED = {
     "os.system", "os.popen",
     "os.execv", "os.execve", "os.execvp", "os.execvpe",
     "os.remove", "os.unlink", "os.rmdir",
     "os.kill", "os.killpg",
     "shutil.rmtree",
+    "builtins.open", "builtins.eval", "builtins.exec",
+    "builtins.compile", "builtins.__import__",
+    "builtins.getattr", "builtins.setattr",
 }
-
-# 运行时缓存（load_config 只读一次）
+# 运行时缓存（带 config.json mtime 校验，热更自动重载）
 _python_rules: dict | None = None
+
+# 最近一次生效的 config.json mtime_ns；None 表示尚未加载/文件缺失。
+# mtime 变化时自动重载模块级安全参数与 python_rules，
+# WebUI 保存配置后下一次检查自动生效（L2 规则热更）。
+_guard_config_mtime_ns: int | None = None
+
+# config.json 路径缓存（基于 core.config_loader._find_project_root，进程内稳定）
+_guard_config_path: Path | None = None
+
+
+def _config_file_mtime_ns() -> int | None:
+    """config.json 的 mtime_ns；文件缺失/不可读返回 None。"""
+    global _guard_config_path
+    if _guard_config_path is None:
+        try:
+            from core.config_loader import _find_project_root
+            _guard_config_path = _find_project_root() / "config.json"
+        except Exception:
+            # 兜底：guard.py 位于 <根>/core/sandbox/，向上三级即项目根
+            _guard_config_path = Path(__file__).resolve().parents[2] / "config.json"
+    try:
+        return _guard_config_path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _invalidate_guard_caches() -> None:
+    """整体失效 verdict LRU 与 python_rules 缓存（配置可能变化，旧判定作废）。
+
+    DANGEROUS_WORDS 等模块级参数变化会改变 _match_dangerous 判定结果，
+    因此 apply_guard_config 调用 / mtime 热更重载时必须整体 cache_clear()。
+    """
+    global _python_rules
+    _python_rules = None
+    _match_dangerous.cache_clear()
+
+
+def _apply_sandbox_config(config: dict) -> None:
+    """把 sandbox 段配置应用到模块级安全参数（列表整体替换，保持引用不变）。"""
+    if "sensitive_files" in config:
+        SENSITIVE_FILES[:] = config["sensitive_files"]
+
+    sp = config.get("system_paths", {})
+    if isinstance(sp, dict):
+        if "windows" in sp:
+            SYSTEM_PATHS_WIN[:] = sp["windows"]
+        if "linux" in sp:
+            SYSTEM_PATHS_LINUX[:] = sp["linux"]
+        if "mac" in sp:
+            SYSTEM_PATHS_MAC[:] = sp["mac"]
+
+    if "dangerous_words" in config:
+        DANGEROUS_WORDS[:] = config["dangerous_words"]
+
+
+def _maybe_reload_guard_config() -> bool:
+    """config.json mtime 变化时自动重载模块级安全参数与 python_rules。
+
+    WebUI 保存配置后下一次检查自动生效；返回是否发生重载。
+    mtime 不可得（config.json 缺失）时不重载，沿用已生效配置（fail-safe）。
+    """
+    global _guard_config_mtime_ns
+    mtime = _config_file_mtime_ns()
+    if mtime is None or mtime == _guard_config_mtime_ns:
+        return False
+    _guard_config_mtime_ns = mtime
+    try:
+        # force_reload：config_loader 的进程内缓存也必须同步到磁盘最新内容
+        from core.config_loader import load_config
+        config = load_config(force_reload=True).get("sandbox", {})
+    except Exception:
+        return False
+    _invalidate_guard_caches()
+    _apply_sandbox_config(config)
+    return True
 
 
 def _get_python_rules() -> dict:
-    """从 config.json 读取 python 安全规则，失败则用默认值"""
+    """从 config.json 读取 python 安全规则，失败则用默认值
+
+    规则缓存带 config.json mtime 校验：mtime 变化自动重载
+    （WebUI 保存配置后下一次检查自动生效）。
+    """
     global _python_rules
+    _maybe_reload_guard_config()
     if _python_rules is not None:
         return _python_rules
     try:
         from core.config_loader import load_config
         cfg = load_config()
         rules = cfg.get("sandbox", {}).get("python", {})
-        _python_rules = {
-            "forbidden_imports": set(rules.get("forbidden_imports", list(_DEFAULT_FORBIDDEN_IMPORTS))),
-            "forbidden_calls": set(rules.get("forbidden_calls", list(_DEFAULT_FORBIDDEN_CALLS))),
-            "forbidden_qualified": set(rules.get("forbidden_qualified_calls", list(_DEFAULT_FORBIDDEN_QUALIFIED))),
-        }
+        _python_rules = _merge_python_rules(rules)
     except Exception:
-        _python_rules = {
-            "forbidden_imports": _DEFAULT_FORBIDDEN_IMPORTS,
-            "forbidden_calls": _DEFAULT_FORBIDDEN_CALLS,
-            "forbidden_qualified": _DEFAULT_FORBIDDEN_QUALIFIED,
-        }
+        _python_rules = _merge_python_rules({})
     return _python_rules
 
+
+def _merge_python_rules(rules: dict) -> dict:
+    """config 的 sandbox.python 段 → 运行时黑名单。
+
+    语义：config.json 提供了某键（含显式空列表）→ 以配置为准（整体替换）；
+    未提供该键 → 用硬编码兜底默认。修复"配置放宽后默认集叠加回来说明残留"
+    的问题（如配置移除 open，运行时却仍拦截）。
+    """
+    merged: dict = {}
+    for key, default, source_key in (
+        ("forbidden_imports", _DEFAULT_FORBIDDEN_IMPORTS, "forbidden_imports"),
+        ("forbidden_calls", _DEFAULT_FORBIDDEN_CALLS, "forbidden_calls"),
+        ("forbidden_qualified", _DEFAULT_FORBIDDEN_QUALIFIED, "forbidden_qualified_calls"),
+    ):
+        value = rules.get(source_key)
+        merged[key] = set(value) if value is not None else set(default)
+    return merged
 
 def _top_module(dotted: str | None) -> str:
     """取点分模块名的顶层模块（os.path → os），用于拦截子模块导入。"""
@@ -388,7 +634,34 @@ SECRET_PATTERNS = [
         ),
         r"\1: ****",
     ),
+    # AWS Access Key ID（AKIA + 16 位大写字母数字）
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AKIA****"),
+    # GCP API Key（AIza + 35 位）
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "AIza****"),
+    # GitHub classic PAT（ghp_ + 36 位）与 fine-grained PAT（github_pat_ + 82 位）
+    (re.compile(r"\bghp_[0-9A-Za-z]{36}\b"), "ghp_****"),
+    (re.compile(r"\bgithub_pat_[0-9A-Za-z_]{82}\b"), "github_pat_****"),
+    # Slack bot/user token（xoxb- / xoxp- / xoxa- / xoxr- / xoxs-）
+    (re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b"), "xox*-****"),
+    # Google OAuth access token
+    (re.compile(r"\bya29\.[0-9A-Za-z_-]+\b"), "ya29.****"),
 ]
+
+
+# 凭据泄漏检测正则（供 DLP 复用：POST 数据 / 命令内容中的密钥泄漏）。
+# 覆盖 OpenAI/Anthropic sk-、AWS AKIA、GCP AIza、GitHub ghp_/github_pat_、
+# Slack xox*-、Google OAuth ya29. 及私钥块。
+_CREDENTIAL_LEAK_RE = re.compile(
+    r"(?:sk-[a-zA-Z0-9]{20,}"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|AIza[0-9A-Za-z_-]{35}"
+    r"|ghp_[0-9A-Za-z]{36}"
+    r"|github_pat_[0-9A-Za-z_]{82}"
+    r"|xox[baprs]-[0-9A-Za-z-]{10,}"
+    r"|ya29\.[0-9A-Za-z_-]+"
+    r"|-----BEGIN\s+(?:RSA |EC |DSA )?PRIVATE KEY-----)",
+    re.DOTALL,
+)
 
 
 def sanitize_output(text: str) -> str:
@@ -408,8 +681,13 @@ def sanitize_output(text: str) -> str:
 SECRET_ENV_MARKERS = (
     "API_KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL",
 )
+# 组合式密钥变量名（段匹配抓不到的命名，如 AWS_ACCESS_KEY_ID / MYSQL_PWD）
+_SECRET_ENV_COMPOUND = (
+    "ACCESS_KEY_ID", "SECRET_ACCESS_KEY", "MYSQL_PWD",
+)
 _SECRET_ENV_RE = re.compile(
     r"(?:^|[_\-])(" + "|".join(SECRET_ENV_MARKERS) + r")(?:$|[_\-])"
+    r"|(?:^|[_\-])(?:[A-Za-z0-9_]+_)?(" + "|".join(_SECRET_ENV_COMPOUND) + r")(?:$|[_\-])"
 )
 
 
@@ -428,7 +706,8 @@ def sanitize_env(env: dict) -> dict:
 # ================================================================
 
 
-def check_write_content(file_path: str, content: str) -> tuple[bool, str]:
+def check_write_content(file_path: str, content: str, *,
+                        check_policy_paths: bool = True) -> tuple[bool, str]:
     """
     检查写入文件的内容是否安全
 
@@ -439,15 +718,19 @@ def check_write_content(file_path: str, content: str) -> tuple[bool, str]:
     返回:
         (is_safe, reason_or_None)
     """
+    # L2 规则热更：config.json mtime 变化时自动重载（sensitive_files / 系统路径等）
+    _maybe_reload_guard_config()
+
     # 1. 敏感路径检查（按路径段边界匹配，避免 endswith 误伤 subagent.py）
     p_norm = os.path.normpath(file_path).lower()
-    for sensitive in SENSITIVE_FILES:
-        s_norm = os.path.normpath(sensitive).lower()
-        if p_norm == s_norm or p_norm.endswith(os.sep + s_norm):
-            return False, f"禁止修改关键文件: {sensitive}"
+    if check_policy_paths:
+        for sensitive in SENSITIVE_FILES:
+            s_norm = os.path.normpath(sensitive).lower()
+            if p_norm == s_norm or p_norm.endswith(os.sep + s_norm):
+                return False, f"禁止修改关键文件: {sensitive}"
 
-    # 2. 系统路径检查
-    if _is_system_path(file_path):
+    # System paths are classified by PolicyEngine as ASK, not hard-denied here.
+    if check_policy_paths and _is_system_path(file_path):
         return False, f"禁止写入系统路径: {file_path}"
 
     # 3. 可执行注入检查
@@ -502,6 +785,8 @@ def check_command_safety(
     command: str,
     tool_name: str = "bash",
     workspace: str | None = None,
+    *,
+    check_policy_paths: bool = True,
 ) -> tuple[bool, str]:
     """
     检查命令内容安全性
@@ -514,20 +799,34 @@ def check_command_safety(
     返回:
         (is_safe, reason) — True 表示安全，False 表示被拦截
     """
+    # L2 规则热更：config.json mtime 变化时自动重载（危险词 / 敏感文件 / 系统路径）
+    _maybe_reload_guard_config()
+
     # ===== 0. 危险命令（OS 级，最后硬拦——最先检查，不可被白名单绕过）=====
     dangerous = _match_dangerous(command.lower())
     if dangerous:
         return False, f"检测到危险命令，已拦截: {dangerous}"
 
-    # ===== 0.5. 系统路径 & 敏感文件检测（在白名单之前，ls /etc 也需拦截）=====
-    blocked, reason = _check_command_for_paths(command)
-    if blocked:
-        return False, reason
+    # Shell path policy may be handled by PolicyEngine; sensitive-file
+    # references are hard L2 only when the configured list is active.
+    if check_policy_paths:
+        blocked, reason = _check_command_for_paths(command)
+        if blocked:
+            return False, reason
+    else:
+        # Preserve hard system-path detection, but do not reject ordinary
+        # project files merely because their basename is listed as sensitive.
+        for match in _CMD_ABS_PATH_RE.finditer(command):
+            if _is_system_path(match.group(1)):
+                return False, f"检测到系统路径操作，已拦截: {match.group(1)}"
 
     # ===== 1. 白名单检查 =====
-    for pattern in SAFE_PATTERNS:
-        if pattern.search(command):
-            return True, ""
+    # 仅对无分隔符/换行的简单命令允许前缀早退；多行/复合命令必须继续对
+    # 全文做 DLP 与注入扫描，防止 `git status; curl -d @/x …` 被前缀白名单跳过。
+    if not re.search(r"[;&|\n]", command):
+        for pattern in SAFE_PATTERNS:
+            if pattern.search(command):
+                return True, ""
 
     # ===== 2. 防外发数据检测 =====
     for pattern in DATA_LEAK_PATTERNS:
@@ -617,58 +916,42 @@ def check_network_target(
     return True, ""
 
 
+# 从统一配置加载安全参数（mtime 热更缓存）
 # ================================================================
-# 从统一配置加载安全参数
-# ================================================================
-
-_guard_config_loaded = False
 
 
 def apply_guard_config(config: dict = None):
     """
     从统一配置（config.json 的 sandbox section）更新模块级安全参数。
 
-    调用时机：模块导入后、Agent 初始化前。
+    调用时机：模块导入后、Agent 初始化前；也可在运行期调用以强制刷新。
     未提供的 key 保留硬编码默认值。
+
+    每次调用都会整体失效 verdict LRU 与 python_rules 缓存（L3 配合项：
+    配置可能变化，旧判定一律作废）。config=None 时强制从磁盘重新加载
+    （load_config(force_reload=True)），传 sandbox dict 时直接应用。
 
     参数:
         config: sandbox section 的 dict。None 时自动从 config_loader 加载。
     """
-    global SENSITIVE_FILES, SYSTEM_PATHS_WIN, SYSTEM_PATHS_LINUX, SYSTEM_PATHS_MAC
-    global DANGEROUS_WORDS, _DANGEROUS_WORDS_RE
-    global _guard_config_loaded
+    global _guard_config_mtime_ns
+
+    _invalidate_guard_caches()
 
     if config is None:
         try:
             from core.config_loader import load_config
-            config = load_config().get("sandbox", {})
+            cfg = load_config(force_reload=True)
+            config = cfg.get("sandbox", {})
         except Exception:
             return
 
-    if not config or _guard_config_loaded:
+    _guard_config_mtime_ns = _config_file_mtime_ns()
+
+    if not config:
         return
 
-    # --- sensitive_files ---
-    if "sensitive_files" in config:
-        SENSITIVE_FILES[:] = config["sensitive_files"]
-
-    # --- system_paths ---
-    sp = config.get("system_paths", {})
-    if isinstance(sp, dict):
-        if "windows" in sp:
-            SYSTEM_PATHS_WIN[:] = sp["windows"]
-        if "linux" in sp:
-            SYSTEM_PATHS_LINUX[:] = sp["linux"]
-        if "mac" in sp:
-            SYSTEM_PATHS_MAC[:] = sp["mac"]
-
-
-    # --- dangerous_words（需要重建正则） ---
-    if "dangerous_words" in config:
-        DANGEROUS_WORDS[:] = config["dangerous_words"]
-        _DANGEROUS_WORDS_RE = _compile_words_re(DANGEROUS_WORDS)
-
-    _guard_config_loaded = True
+    _apply_sandbox_config(config)
 
 
 # 模块导入时自动加载

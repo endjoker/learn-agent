@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-会话管理器 —— Agent 实例池 + FIFO 队列 + 过期清理
+会话管理器 —— Agent 实例池 + 过期清理
+
+（历史 FIFO worker 漏斗已由统一 runner / TaskRuntime 接管，队列字段退役。）
 """
 
 import asyncio
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -18,20 +21,18 @@ class SessionEntry:
     """单个会话条目"""
     session_key: str
     agent: object = None           # Agent 实例（延迟创建）
-    queue: asyncio.Queue = None    # 消息 FIFO 队列
-    worker_task: asyncio.Task = None  # worker 协程
     created_at: float = 0.0
     last_active: float = 0.0
     is_busy: bool = False          # 是否正在执行 agent.run()
+    # P1-2：跨路径执行互斥（runner 与 TaskRuntime/dispatcher 共享同一 entry）。
+    # 非阻塞 try-acquire：拿不到锁说明该会话正在另一路径执行，直接拒绝重入。
+    exec_lock: threading.Lock = field(default_factory=threading.Lock)
     # ---- Phase 0/4：工作区运行上下文（预留字段，必须有默认值）----
     runtime_context: object = None         # WorkspaceRuntimeContext（工作区会话）
     runtime_snapshot_id: str = ""          # 当前消息使用的 RuntimeSnapshot id
     config_stale: bool = False             # Profile/Workspace 更新后标记 stale
-    agent_config_hash: str = ""            # 已加载 Agent 的配置指纹（重建判定）
 
     def __post_init__(self):
-        if self.queue is None:
-            self.queue = asyncio.Queue()
         if self.created_at == 0.0:
             self.created_at = time.time()
         self.last_active = self.created_at
@@ -40,8 +41,9 @@ class SessionEntry:
 class SessionManager:
     """
     管理 gateway 的所有 Agent 会话。
-    - 每会话独立 Agent 实例
-    - 同 session_key 通过 asyncio.Queue FIFO 串行
+    - 每会话独立 Agent 实例（同 session_key 全局唯一）
+    - 执行串行由 entry.exec_lock / 统一 runner 保证（旧 asyncio.Queue
+      FIFO worker 已退役）
     - janitor 定期清理过期会话
     """
 
@@ -66,6 +68,10 @@ class SessionManager:
         # 会话生命周期回调（WebUI session.created/.evicted 事件用）
         self.on_created: list = []
         self.on_evicted: list = []
+        # 驱逐豁免谓词（P2：armed Goal 所在会话豁免 janitor 空闲回收——Goal 轮
+        # 间隙/pause 期间 last_active 不更新，回收会丢掉 proc 子进程会话等纯
+        # 内存态。装配方注入：session_key -> True 表示本轮跳过回收）。
+        self.evict_guard = None
 
     async def start(self):
         """启动 janitor 定时任务"""
@@ -158,14 +164,29 @@ class SessionManager:
                 1 for e in self._sessions.values() if e.is_busy),
         }
 
-    async def evict(self, session_key: str, save: bool = False) -> bool:
+    async def evict(self, session_key: str, save: bool = False,
+                    force: bool = False) -> bool:
         """从内存移除会话（可选保存）。返回是否移除成功。
 
         供 WebUI DELETE / 定时任务 isolated 会话投递后清理使用。
+        防护：entry 正忙（is_busy）时拒绝驱逐，避免运行中清掉进程/MCP
+        资源造成半死会话；确属"卡死自愈"场景请显式传 force=True
+        （heartbeat 连续 busy 自愈是唯一预期调用方）。
         """
-        entry = self._sessions.pop(session_key, None)
+        entry = self._sessions.get(session_key)
         if entry is None:
             return False
+        if entry.is_busy and not force:
+            logger.warning("拒绝驱逐正忙会话（如确认卡死请 force=True）: %s",
+                           session_key)
+            return False
+        # P2：armed Goal 豁免（非 force 时）——Goal 轮间隙的会话被回收会丢失
+        # proc 子进程会话等纯内存态，下一轮重建实例后无法恢复。
+        if not force and self.evict_guard and self.evict_guard(session_key):
+            logger.info("跳过驱逐（驱逐豁免谓词命中，如 armed Goal 所在会话）: %s",
+                        session_key)
+            return False
+        self._sessions.pop(session_key, None)
         await self._cleanup_entry(session_key, entry, save=save)
         self._notify(self.on_evicted, session_key, "evict")
         return True
@@ -176,17 +197,40 @@ class SessionManager:
             await asyncio.sleep(60)
             try:
                 now = time.time()
-                expired = [
-                    key for key, entry in self._sessions.items()
+                # P1-1：先收集过期 key 快照再统一弹出。此前在 items() 迭代中
+                # 直接 pop 会触发 RuntimeError（dictionary changed size），
+                # 被下方 except 吞掉后，已摘出条目既不 save_session 也不释放
+                # MCP 连接/进程池（永久泄漏）。
+                expired_keys = [
+                    key
+                    for key, entry in self._sessions.items()
                     if not entry.is_busy and (now - entry.last_active) > self.idle_timeout
+                    and not (self.evict_guard and self.evict_guard(key))
                 ]
-                for key in expired:
+                pairs = []
+                for key in expired_keys:
                     entry = self._sessions.pop(key, None)
-                    if entry:
-                        logger.info("回收过期会话: %s (空闲 %.0fs)",
-                                   key, now - entry.last_active)
-                        await self._cleanup_entry(key, entry, save=self.persist)
-                        self._notify(self.on_evicted, key, "idle_timeout")
+                    if entry is not None:
+                        pairs.append((key, entry))
+                for key, entry in pairs:
+                    logger.info("回收过期会话: %s (空闲 %.0fs)",
+                                key, now - entry.last_active)
+                    self._notify(self.on_evicted, key, "idle_timeout")
+
+                # 并发化清理：gather + 单条目超时 30s，避免慢会话阻塞整轮
+                async def _cleanup(key, entry):
+                    try:
+                        await asyncio.wait_for(
+                            self._cleanup_entry(key, entry, save=self.persist),
+                            timeout=30)
+                    except asyncio.TimeoutError:
+                        logger.warning("清理会话超时(30s): %s", key)
+                    except Exception as e:
+                        logger.error("清理会话失败 %s: %s", key, e)
+
+                if pairs:
+                    await asyncio.gather(*(
+                        _cleanup(key, entry) for key, entry in pairs))
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -208,20 +252,34 @@ class SessionManager:
     async def _cleanup_entry(self, key: str, entry: SessionEntry, save: bool = True):
         """清理单个会话：保存 → 释放资源"""
         if entry.agent and save:
+            # 持久化退役：save_session 为 no-op，保留调用仅为兼容自定义 store；
+            # 提交到本管理器的 executor，不用默认池（无界，易被慢清理占满）。
             try:
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, entry.agent.store.save_session)
+                await loop.run_in_executor(
+                    self._executor, entry.agent.store.save_session)
             except Exception as e:
                 logger.error("保存会话失败 %s: %s", key, e)
-        # 清理 MCP / 进程
+        # 清理 MCP / 进程（移入线程执行，避免阻塞事件循环）
         if entry.agent:
             try:
-                if getattr(entry.agent, 'process_manager', None):
-                    entry.agent.process_manager.cleanup_all()
-                if getattr(entry.agent, 'mcp_manager', None):
-                    from core.mcp_client import run_in_mcp_loop
-                    run_in_mcp_loop(entry.agent.mcp_manager.close_all(), timeout=10)
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    self._executor, self._cleanup_agent_resources, entry.agent)
             except Exception as e:
                 logger.error("清理资源失败 %s: %s", key, e)
-        if entry.worker_task and not entry.worker_task.done():
-            entry.worker_task.cancel()
+
+    @staticmethod
+    def _cleanup_agent_resources(agent) -> None:
+        """同步清理 Agent 的进程/MCP 资源（线程中执行）。"""
+        try:
+            if getattr(agent, 'process_manager', None):
+                agent.process_manager.cleanup_all()
+        except Exception as e:
+            logger.warning("清理进程资源失败: %s", e)
+        try:
+            if getattr(agent, 'mcp_manager', None):
+                from core.mcp_client import run_in_mcp_loop
+                run_in_mcp_loop(agent.mcp_manager.close_all(), timeout=10)
+        except Exception as e:
+            logger.warning("清理 MCP 资源失败: %s", e)

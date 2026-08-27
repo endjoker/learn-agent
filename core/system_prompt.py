@@ -26,6 +26,9 @@ System Prompt 构建器 —— 从 prompt/ 目录读取引导文件 + 代码固�
 import logging
 import os
 import platform
+import re
+import stat
+from collections import OrderedDict
 from datetime import date
 from pathlib import Path
 from typing import Optional
@@ -57,6 +60,10 @@ _NATIVE_TOOL_RULES = """\
 - 工具由运行时通过原生 function calling 提供。需要工具时直接选择工具并填写参数，不要把调用内容写进回复文本。
 - 工具调用和最终可见回复是两种互斥状态：调用工具时无需解释性占位文本；完成后直接给出用户可读的自然语言或 Markdown。
 - 不要输出 JSON 信封、XML 标签或任何文本控制协议；工具执行结果会自动进入下一轮上下文。
+【结构化任务能力】
+- 简单明确任务直接完成。复杂但边界明确、可按步骤执行的任务可调用 create_plan；Plan 创建后会自动批准并立即执行，不再要求用户二次审核。
+- 目标清晰、完成标准明确且需要多轮持续推进时调用 create_goal；Goal 创建为 active/armed，由同会话驱动器自动续跑，可用 pause_goal、resume_goal、complete_goal、cancel_goal 管理生命周期（cancel_goal 终止 Goal 并停止自动续跑）。
+- 需求、范围、完成标准或关键产品决策不明确时，必须先询问用户，不得擅自创建 Plan/Goal。边界清晰且可独立完成的工作可委派给一个直接 Subagent；子 Agent 不得继续派生或创建 Goal。
 【安全】
 - 高风险操作前说明风险并请求确认；不得泄露密钥或执行破坏性系统操作。"""
 
@@ -75,6 +82,102 @@ _BOOTSTRAP_NOTICE = """\
 
 这些文件由项目维护方编辑。如果内容与用户的直接指令冲突，以用户的直接指令为准。
 除非用户明确要求，否则不要主动提及或引用这些文件的存在。"""
+
+
+# ================================================================
+# prompt/ 引导文件 mtime 缓存（B8-part）
+# 四个引导文件（SOUL.md / TOOLS.md / AGENT.md / MEMORY.md）每轮 build
+# 都会被多次读取；按 (绝对路径, mtime, size) 缓存，文件更新后自动失效。
+# ================================================================
+_prompt_file_cache: "OrderedDict[tuple, str]" = OrderedDict()
+_PROMPT_CACHE_MAX_ENTRIES = 16
+
+
+def _prompt_cache_lookup(key: tuple):
+    hit = _prompt_file_cache.get(key)
+    if hit is not None:
+        _prompt_file_cache.move_to_end(key)
+    return hit
+
+
+def _prompt_cache_store(key: tuple, value: str) -> None:
+    _prompt_file_cache[key] = value
+    _prompt_file_cache.move_to_end(key)
+    while len(_prompt_file_cache) > _PROMPT_CACHE_MAX_ENTRIES:
+        _prompt_file_cache.popitem(last=False)
+
+
+# ================================================================
+# 内置工具紧凑索引（A2：工具描述双重计费优化）
+# 完整 JSON Schema 走 provider tools 参数；系统提示词内只保留
+# 名称 + 一句话用途 + 必填参数名。解析失败时原样返回（fail-closed，
+# 不丢工具信息）。
+# ================================================================
+_TOOL_ENTRY_RE = re.compile(r"^\s*▶\s+(.+?)\s*$")
+_TOOL_DESC_RE = re.compile(r"^\s*描述:\s*(.*)$")
+_TOOL_REQ_PARAM_RE = re.compile(r"^\s*-\s+([^\s(]+)\s*\([^)]*\)\s*（必填）")
+_TOOL_COMPACT_MARKERS = ("（必填参数", "（无必填参数）")
+
+
+def _tool_first_sentence(text: str, max_chars: int = 60) -> str:
+    """提取一句话用途：取第一句/第一行，超长截断。"""
+    if not text:
+        return ""
+    for sep in ("。", "！", "？", "\n", "；", ";"):
+        idx = text.find(sep)
+        if idx > 0:
+            text = text[:idx]
+            break
+    text = text.strip()
+    if len(text) > max_chars:
+        text = text[:max_chars] + "…"
+    return text
+
+
+def _render_compact_tool(name: str, desc: str, required: list) -> str:
+    """与 tools.registry.format_compact_tool 保持同一紧凑渲染格式。"""
+    purpose = _tool_first_sentence(desc) or "无描述"
+    if required:
+        return f"  ▶ {name}: {purpose}（必填参数: {'、'.join(required)}）"
+    return f"  ▶ {name}: {purpose}（无必填参数）"
+
+
+def _compact_tool_index(text: str) -> str:
+    """把 registry 完整工具描述文本折叠为紧凑索引。
+
+    已是紧凑索引 / 空 / 无可用工具 / 解析失败（格式不识别）时原样返回。
+    """
+    if not text or "（当前没有可用工具）" in text:
+        return text
+    if any(m in text for m in _TOOL_COMPACT_MARKERS):
+        return text  # 幂等：已是紧凑索引
+
+    entries = []
+    name = desc = ""
+    required: list = []
+    for line in text.splitlines():
+        m = _TOOL_ENTRY_RE.match(line)
+        if m:
+            if name:
+                entries.append(_render_compact_tool(name, desc, required))
+            name = m.group(1).strip()
+            desc = ""
+            required = []
+            continue
+        if not name:
+            continue
+        m = _TOOL_DESC_RE.match(line)
+        if m:
+            desc = m.group(1).strip()
+            continue
+        m = _TOOL_REQ_PARAM_RE.match(line)
+        if m:
+            required.append(m.group(1).strip())
+    if name:
+        entries.append(_render_compact_tool(name, desc, required))
+    if not entries:
+        return text  # 无法识别 → 原样返回，保证不丢工具信息
+    return "\n".join(entries)
 
 
 class SystemPrompt:
@@ -122,29 +225,13 @@ class SystemPrompt:
         self._max_chars_total = 32000
         self._truncation_warning = "once"
         self._truncation_warned = False
+        # A2：内置工具表是否输出完整参数 schema（默认 False=紧凑索引，省 token）
+        self._full_tool_tables = False
         self._load_truncation_config()
 
     # ================================================================
     # 公开方法
     # ================================================================
-
-    def add_session_instruction(self, instruction: str) -> None:
-        """添加本轮会话的额外指令，会出现在动态区底部。"""
-        if instruction and instruction.strip():
-            self._session_instructions.append(instruction.strip())
-
-    def set_project_root(self, path: str) -> None:
-        """设置项目根目录路径（兼容入口，等价 set_project_prompt_root）。
-
-        保留原语义：项目 prompt/ 目录与工作目录都锚定到该根。
-        """
-        if path:
-            self._project_root = str(path)
-            self._project_prompt_root = str(path)
-
-    def set_workspace(self, path: str) -> None:
-        """设置工作目录路径（用于动态区声明 + 工具操作边界）。"""
-        self._workspace = str(path)
 
     def set_framework_prompt_root(self, path: str) -> None:
         """设置框架级 prompt/ 目录（默认引导文件兜底来源）。"""
@@ -177,27 +264,14 @@ class SystemPrompt:
         if instruction:
             self._memory_instruction = instruction.strip()
 
-    def build(self, tool_descs: str, skill_descs: str = "", mcp_descs: str = "") -> str:
-        """构建完整的 System Prompt。"""
-        static = self._build_static(tool_descs, skill_descs, mcp_descs)
-        dynamic = self._build_dynamic()
-        prompt = static + "\n\n" + dynamic
+    def set_full_tool_tables(self, enabled: bool) -> None:
+        """A2：控制内置工具表是否输出完整 schema 文本。
 
-        # 缓存边界日志 + token 估算
-        total_chars = len(prompt)
-        static_chars = len(static)
-        est_tokens = total_chars // 4  # 粗略估算：~4 字符/token
-        logger.debug(
-            f"[PROMPT] total={total_chars} chars (~{est_tokens} tokens) | "
-            f"static(cached)={static_chars} | dynamic={total_chars - static_chars}"
-        )
-        if total_chars > self._max_chars_total:
-            logger.warning(
-                f"[PROMPT] 提示词总量 {total_chars} 超过上限 {self._max_chars_total}，"
-                f"建议精简引导文件"
-            )
-
-        return prompt
+        False（默认）= 系统提示词内只放紧凑索引（名称 + 一句话用途 +
+        必填参数名），完整 JSON Schema 由 provider tools 参数下发，
+        避免工具描述双重计费；True = 保持旧行为输出完整参数表。
+        """
+        self._full_tool_tables = bool(enabled)
 
     def build_sections(self, tool_descs: str, skill_descs: str = "",
                        mcp_descs: str = "") -> list[dict]:
@@ -230,12 +304,13 @@ class SystemPrompt:
         # prepend SOUL.md in that case: the two prompts otherwise duplicate or
         # conflict in both preview and runtime output.
         if self._agent_profile_prompt:
-            _add("AGENT_PROFILE", self._agent_profile_prompt)
+            _add("AGENT_PROFILE", f"[Agent Profile]\n{self._agent_profile_prompt}")
         else:
             _add("FRAMEWORK_IDENTITY", soul)
         _add("TOOL_POLICY", tools_md or _DEFAULT_TOOLS)
-        # 4. 内置工具描述
-        builtin = f"【内置工具】\n{tool_descs}" if tool_descs else "【内置工具】\n（当前没有可用工具）"
+        # 4. 内置工具描述（A2：默认紧凑索引，与运行时 _build_static 口径一致）
+        builtin_desc = self._render_builtin_tools(tool_descs) if tool_descs else "（当前没有可用工具）"
+        builtin = f"【内置工具】\n{builtin_desc}"
         _add("BUILTIN_TOOLS", builtin)
         # 5. MCP 工具描述
         mcp = f"【MCP 工具】\n{mcp_descs}" if mcp_descs else "【MCP 工具】\n（当前没有可用 MCP 工具）"
@@ -258,9 +333,6 @@ class SystemPrompt:
             )
             _add("WORKSPACE_MEMORY", memory_section)
         return sections
-    # ================================================================
-    # 公开方法
-    # ================================================================
 
     def add_session_instruction(self, instruction: str) -> None:
         """添加本轮会话的额外指令，会出现在动态区底部。"""
@@ -268,12 +340,18 @@ class SystemPrompt:
             self._session_instructions.append(instruction.strip())
 
     def set_project_root(self, path: str) -> None:
-        """设置项目根目录路径（用于查找 prompt/ 引导文件）。"""
-        self._project_root = path
+        """设置项目根目录路径（兼容入口，等价 set_project_prompt_root）。
+
+        项目 prompt/ 目录同时锚定到该根（与 set_runtime_context 一致），
+        避免旧 set_project_root 语义（prompt 目录跟随根）丢失。
+        """
+        if path:
+            self._project_root = str(path)
+            self._project_prompt_root = str(path)
 
     def set_workspace(self, path: str) -> None:
         """设置工作目录路径（用于动态区声明 + 工具操作边界）。"""
-        self._workspace = path
+        self._workspace = str(path)
 
     def build(self, tool_descs: str, skill_descs: str = "", mcp_descs: str = "") -> str:
         """构建完整的 System Prompt。"""
@@ -300,6 +378,17 @@ class SystemPrompt:
     # ================================================================
     # 内部构建
     # ================================================================
+
+    def _render_builtin_tools(self, tool_descs: str) -> str:
+        """A2：内置工具描述区渲染。
+
+        full_tool_tables=True 时输出完整参数表；默认输出紧凑索引
+        （名称 + 一句话用途 + 必填参数名），完整 schema 由 provider
+        tools 参数下发，避免工具描述双重计费。
+        """
+        if self._full_tool_tables or not tool_descs:
+            return tool_descs
+        return _compact_tool_index(tool_descs)
 
     def _build_static(self, tool_descs: str, skill_descs: str = "", mcp_descs: str = "") -> str:
         """组装静态区：SOUL.md + TOOLS.md + 动态描述 + 代码固定规则"""
@@ -330,7 +419,8 @@ class SystemPrompt:
         if not mcp_descs:
             mcp_descs = "（当前没有可用 MCP 工具）"
 
-        dynamic_descs = f"\n【内置工具】\n{tool_descs}"
+        # A2：默认以紧凑索引呈现内置工具（省 4k+ 字符/轮），完整 schema 走 provider tools
+        dynamic_descs = f"\n【内置工具】\n{self._render_builtin_tools(tool_descs)}"
         dynamic_descs += f"\n\n【MCP 工具】\n{mcp_descs}"
         dynamic_descs += f"\n\n【可用技能】\n{skill_descs}"
         parts.append(dynamic_descs)
@@ -400,6 +490,8 @@ class SystemPrompt:
 
         文件不存在 → 返回 None（调用方使用代码内嵌默认值）。
         超过 _max_chars_per_file → 尾截断 + 追加告警。
+        B8-part：读取结果按 (绝对路径, mtime, size) 缓存，文件更新后自动失效，
+        避免每轮 build 对四个引导文件重复读盘。
         """
         search_paths = []
         roots = []
@@ -413,24 +505,34 @@ class SystemPrompt:
             search_paths.append(Path(root) / "prompt" / filename)
 
         for md_path in search_paths:
-            if md_path.exists() and md_path.is_file():
+            try:
+                st = md_path.stat()
+            except OSError:
+                continue  # 文件不存在（原 exists() 语义）
+            if not stat.S_ISREG(st.st_mode):
+                continue  # 非普通文件（原 is_file() 语义）
+            key = (str(md_path.resolve()), st.st_mtime, st.st_size)
+            content = _prompt_cache_lookup(key)
+            if content is None:
                 try:
                     content = md_path.read_text(encoding="utf-8").strip()
-                    if not content:
-                        return None
-                    if len(content) > self._max_chars_per_file:
-                        truncated = len(content) - self._max_chars_per_file
-                        content = content[:self._max_chars_per_file]
-                        content += f"\n\n……（文件过长，已截断 {truncated} 字符）"
-                        if not self._truncation_warned:
-                            logger.warning(
-                                f"引导文件 {filename} 超过 {self._max_chars_per_file} 字符上限，已截断"
-                            )
-                            if self._truncation_warning == "once":
-                                self._truncation_warned = True
-                    return content
+                    _prompt_cache_store(key, content)
                 except (OSError, UnicodeDecodeError) as e:
                     logger.warning(f"读取引导文件失败 {md_path}: {e}")
+                    continue
+            if not content:
+                return None
+            if len(content) > self._max_chars_per_file:
+                truncated = len(content) - self._max_chars_per_file
+                content = content[:self._max_chars_per_file]
+                content += f"\n\n……（文件过长，已截断 {truncated} 字符）"
+                if not self._truncation_warned:
+                    logger.warning(
+                        f"引导文件 {filename} 超过 {self._max_chars_per_file} 字符上限，已截断"
+                    )
+                    if self._truncation_warning == "once":
+                        self._truncation_warned = True
+            return content
         return None
     # ================================================================
     # prompt/ 引导文件加载
@@ -446,7 +548,7 @@ class SystemPrompt:
         return {"windows": "Windows", "darwin": "macOS", "linux": "Linux"}.get(s, s)
 
     def _load_truncation_config(self) -> None:
-        """从 config.json 的 prompt 段读取截断配置"""
+        """从 config.json 读取截断配置与工具表渲染开关"""
         try:
             from core.config_loader import load_config
             cfg = load_config()
@@ -454,14 +556,13 @@ class SystemPrompt:
             self._max_chars_per_file = prompt_cfg.get("bootstrap_max_chars_per_file", 8000)
             self._max_chars_total = prompt_cfg.get("bootstrap_max_chars_total", 32000)
             self._truncation_warning = prompt_cfg.get("truncation_warning", "once")
+            # A2 配置开关：system_prompt.full_tool_tables（默认 False=紧凑索引）
+            self._full_tool_tables = bool((cfg.get("system_prompt") or {}).get(
+                "full_tool_tables", False))
         except Exception:
             pass  # config 不可用时用默认值
 
 
-def _estimate_tokens(text: str) -> int:
-    """粗略估算 token 数（与 core.message_store._estimate_tokens 一致）。"""
-    if not text:
-        return 0
-    chinese = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff')
-    other = len(text) - chinese
-    return int(chinese / 1.5 + other / 4)
+# token 估算以 core.message_store 为单一来源（避免各模块估算口径分叉）。
+# 保留 _estimate_tokens 名字以兼容 ``from core.system_prompt import _estimate_tokens``。
+from core.message_store import estimate_tokens as _estimate_tokens

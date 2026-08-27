@@ -30,6 +30,7 @@ def detect_protocol(base_url: str) -> str:
     根据 base_url 自动检测协议类型（唯一真相源）。
 
     检测规则（按优先级）：
+      - 含 /v1beta/openai（Gemini 的 OpenAI 兼容端点）→ openai
       - 含 api.anthropic.com  → anthropic
       - 含 generativelanguage.googleapis.com  → gemini
       - 含 googleapis + gemini → gemini
@@ -38,6 +39,10 @@ def detect_protocol(base_url: str) -> str:
     if not base_url:
         return "openai"
     url_lower = base_url.lower()
+    # Gemini 的 OpenAI 兼容端点（/v1beta/openai）走 OpenAI 协议，
+    # 必须优先于 gemini 规则（该 URL 同时含 googleapis 与 gemini）。
+    if "/v1beta/openai" in url_lower:
+        return "openai"
     if "api.anthropic.com" in url_lower:
         return "anthropic"
     if "generativelanguage.googleapis.com" in url_lower:

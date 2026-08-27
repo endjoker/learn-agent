@@ -5,6 +5,7 @@ from .cancellation import CancellationToken, TaskCancelled
 from .models import Budget, RuntimeEvent, TaskEnvelope, TaskRecord, TaskResult, TaskStatus
 from .sqlite_store import RuntimeStore, RuntimeStoreError, TaskSnapshot
 from .task_runtime import TaskRuntime
+from .retention import RetentionManager
 from .tool_runtime import ToolRuntime
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "RuntimeEvent",
     "RuntimeStore",
     "RuntimeStoreError",
+    "RetentionManager",
     "TaskCancelled",
     "TaskEnvelope",
     "TaskRecord",

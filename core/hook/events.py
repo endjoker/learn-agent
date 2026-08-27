@@ -3,7 +3,7 @@
 Hook 事件定义 — 生命周期事件枚举 + 上下文数据类 + 裁决模型
 
 与设计文档 code/learn/HOOK/design.md 一致：
-- 12 个生命周期事件（Phase 1 接 6 个，其余后续）
+- 8 个生命周期事件
 - HookContext 承载事件上下文（payload 按事件类型约定）
 - Decision / HookResult 承载裁决结果
 """

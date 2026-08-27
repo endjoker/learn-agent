@@ -1,0 +1,23 @@
+{
+  "name": "project-docs",
+  "description": "从代码库生成项目文档（来自 jezweb/claude-skills）：分析代码库结构生成 ARCHITECTURE.md、API_ENDPOINTS.md、DATABASE_SCHEMA.md 等文档，强调基于真实代码不虚构。用于文档沉淀、代码库理解、新人 onboarding。",
+  "version": 1,
+  "created_at": "2026-08-23T23:54:53",
+  "source": "https://github.com/jezweb/claude-skills",
+  "tags": [
+    "documentation",
+    "architecture",
+    "codebase",
+    "onboarding"
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "output_dir": {
+        "type": "string",
+        "description": "文档输出目录，默认 output/"
+      }
+    },
+    "required": []
+  }
+}

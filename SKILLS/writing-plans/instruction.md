@@ -8,7 +8,7 @@ Assume they are a skilled developer, but know almost nothing about our toolset o
 
 **Announce at start:** "I'm using the writing-plans skill to create the implementation plan."
 
-**Context:** If working in an isolated worktree, it should have been created via the `superpowers:using-git-worktrees` skill at execution time.
+**Runtime context:** A Plan is a structured execution artifact in JKagent. When `create_plan` is available, creation automatically approves and starts execution; there is no separate user-review gate. Therefore ask about any material ambiguity before calling it. Do not assume an external CLI, isolated worktree, or fresh-agent-per-task runtime.
 
 **Save plans to:** `docs/superpowers/plans/YYYY-MM-DD-<feature-name>.md`
 - (User preferences for plan location override this default)
@@ -53,7 +53,7 @@ independently testable deliverable.
 ```markdown
 # [Feature Name] Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For JKagent execution:** Creating a Plan automatically starts it. Resolve material ambiguities before creation, then execute through the current session; use `create_subagent` only for a bounded independent subtask and never create a second child layer. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** [One sentence describing what this builds]
 
@@ -147,20 +147,12 @@ If you find issues, fix them inline. No need to re-review — just fix and move 
 
 ## Execution Handoff
 
-After saving the plan, offer execution choice:
+After saving or presenting the plan:
 
-**"Plan complete and saved to `docs/superpowers/plans/<filename>.md`. Two execution options:**
+1. State the scope, acceptance criteria, risks, and verification commands.
+2. Resolve every material ambiguity before invoking `create_plan`, because creation starts execution immediately.
+3. Execute tasks sequentially in the current session and report a checkpoint after each independently testable deliverable.
+4. For one bounded task that can be completed independently, you may use `create_subagent` with an explicit prompt, expected output, and no authority to create child agents. Do not create one Subagent per task by default.
+5. If the work is long-running across multiple milestones, use a durable Goal; it is active/armed on creation and advances through autonomous same-session rounds with pause/resume/recovery.
 
-**1. Subagent-Driven (recommended)** - I dispatch a fresh subagent per task, review between tasks, fast iteration
-
-**2. Inline Execution** - Execute tasks in this session using executing-plans, batch execution with checkpoints
-
-**Which approach?"**
-
-**If Subagent-Driven chosen:**
-- **REQUIRED SUB-SKILL:** Use superpowers:subagent-driven-development
-- Fresh subagent per task + two-stage review
-
-**If Inline Execution chosen:**
-- **REQUIRED SUB-SKILL:** Use superpowers:executing-plans
-- Batch execution with checkpoints for review
+Never create a Plan merely to show a draft: presenting a draft is ordinary Markdown, while `create_plan` means execute now.

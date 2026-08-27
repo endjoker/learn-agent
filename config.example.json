@@ -1,7 +1,37 @@
 {
   "agent_runtime": {
     "native_tool_streaming": true,
-    "max_tool_result_chars": 10000
+    "max_tool_result_chars": 12000,
+    "max_tool_calls": 600,
+    "max_parallel_tools": 4,
+    "bash_output_cap_kb": 1024,
+    "max_wall_seconds": 1100,
+    "http_allow_loopback": false
+  },
+  "system_prompt": {
+    "full_tool_tables": false
+  },
+  "goal": {
+    "enabled": true,
+    "max_active_per_session": 1,
+    "inject_keep_last": 3,
+    "round_wait_seconds": 1300
+  },
+  "subagent": {
+    "enabled": true,
+    "max_children": 4,
+    "one_level_only": true
+  },
+  "retention": {
+    "enabled": true,
+    "terminal_days": 30,
+    "artifact_days": 30,
+    "interval_seconds": 3600
+  },
+  "conversation": {
+    "retention": {
+      "system_days": 7
+    }
   },
   "runtime_store": {
     "backend": "sqlite",
@@ -15,7 +45,8 @@
     "default_timeout_seconds": 1200,
     "cancel_grace_seconds": 10,
     "zombie_max_seconds": 300,
-    "max_attempts": 2
+    "max_attempts": 2,
+    "channel_replay_max_attempts": 3
   },
   "artifacts": {
     "root": "./workspace/.agent/artifacts",
@@ -51,85 +82,7 @@
     "extra_workspaces": [
       "."
     ],
-    "default_mode": "ask",
-    "tool_rules": {
-      "grep": "allow",
-      "datetime": "allow",
-      "calculate": "allow",
-      "notes": "allow",
-      "memory_search": "allow",
-      "memory_update": "allow",
-      "search": "allow",
-      "web_fetch": "allow",
-      "create_skill": "allow",
-      "python": "ask",
-      "http": "ask"
-    },
-    "bash_commands": {
-      "readonly": [
-        "ls",
-        "dir",
-        "pwd",
-        "echo",
-        "cat",
-        "type",
-        "more",
-        "less",
-        "head",
-        "tail",
-        "findstr",
-        "where",
-        "which",
-        "git status",
-        "git log",
-        "git diff",
-        "git show",
-        "git branch",
-        "git stash list",
-        "git remote -v",
-        "git config",
-        "pip list",
-        "pip show",
-        "python --version",
-        "python3 --version",
-        "node --version",
-        "npm --version"
-      ],
-      "write": [
-        "rm",
-        "del",
-        "rd",
-        "rmdir",
-        "mv",
-        "move",
-        "rename",
-        "cp",
-        "copy",
-        "xcopy",
-        "robocopy",
-        "mkdir",
-        "md",
-        "git add",
-        "git commit",
-        "git push",
-        "git pull",
-        "git merge",
-        "git rebase",
-        "git reset",
-        "git checkout -b",
-        "git branch -d",
-        "git tag",
-        "pip install",
-        "pip uninstall",
-        "pip update",
-        "npm install",
-        "npm uninstall",
-        "chmod",
-        "chown",
-        "taskkill",
-        "kill -9"
-      ]
-    }
+    "default_mode": "ask"
   },
   "hooks": {
     "enabled": true,
@@ -194,17 +147,28 @@
       "max_steps": 100,
       "permission_mode": "allow",
       "auto_approve_plan": true,
-      "quiet": true
+      "quiet": true,
+      "max_turns_concurrency": 4
+    },
+    "long_task_pool_size": 2,
+    "plan": {
+      "require_approval": false,
+      "_comment": "Plan 两阶段审批开关：false（默认）保持 create_preview 后自动批准执行；true 时创建后进入 awaiting_approval，等待用户经 /api/plan/{plan_id}/approve|reject 确认后才启动执行"
     },
     "channels": {
       "webui": {
         "enabled": true
+      },
+      "debug": {
+        "enabled": false,
+        "_comment": "调试通道 POST /debug/chat。P1 加固后默认关闭（false）；需要端到端调试时显式改为 true。门禁：若配置了 gateway.webui.auth_token，则所有请求（含本机环回）一律要求 Bearer token；未配置 token 时仅允许环回来源访问。校验失败统一返回 404 以避免端点探测。"
       }
     },
     "webui": {
       "allow_non_loopback": false,
       "allowed_ips": [],
       "auth_token": "",
+      "_comment": "远程访问门禁（P2 修复后为 AND 语义）：allowed_ips 与 auth_token 都配置时，非环回请求必须同时命中 IP 白名单且携带正确 Bearer；只配置其一时按所配置项校验。环回来源（127.0.0.1/::1/localhost）不受影响。",
       "main_session": {
         "tools": null,
         "skills": null,
@@ -213,16 +177,9 @@
     }
   },
   "sandbox": {
-    "enabled": true,
+    "enabled": false,
+    "spill_threshold_kb": 256,
     "idle_timeout_seconds": 300,
-    "sensitive_files": [
-      ".env",
-      ".git/config",
-      "core/permission.py",
-      "core/llm_client.py",
-      "agent.py",
-      "requirements.txt"
-    ],
     "dangerous_commands": [
       "rm -rf /",
       "rm -rf ~",

@@ -18,6 +18,15 @@ from gateway.textutil import split_text, md_to_plain
 logger = logging.getLogger("jk_agent.gateway.weixin")
 
 
+def _log_inbound_future(future) -> None:
+    """run_coroutine_threadsafe 返回 future 的 done 回调：
+    统一记录未观察到的异常，避免静默吞掉入站处理错误。"""
+    try:
+        future.result()
+    except Exception as e:
+        logger.error("微信入站消息处理异常: %s", e, exc_info=True)
+
+
 class WeixinChannel(Channel):
     """微信消息通道（iLink 协议长轮询）"""
 
@@ -29,7 +38,10 @@ class WeixinChannel(Channel):
         self.credentials_file = config.get(
             "credentials_file", "gateway/creds/weixin.json"
         )
-        self.allow_from = config.get("allow_from", [])
+        # 强制 list：字符串配置会被成员判断误判为子串匹配，必须精确匹配
+        raw_allow = config.get("allow_from", [])
+        self.allow_from = ([raw_allow] if isinstance(raw_allow, str)
+                           else list(raw_allow or []))
         self.reply_format = config.get("reply_format", "markdown")
         self._thread: Optional[threading.Thread] = None
         self._bot = None
@@ -65,9 +77,9 @@ class WeixinChannel(Channel):
     async def send_reply(self, msg: InboundMessage, text: str):
         """通过微信发送回复"""
         if not self._bot:
-            return
+            return False
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._do_send, msg, text)
+        return await loop.run_in_executor(None, self._do_send, msg, text)
 
     def status(self) -> dict:
         return {
@@ -151,24 +163,25 @@ class WeixinChannel(Channel):
                 message_id=msg_id,
                 raw=msg,
                 is_group=False,  # iLink 不支持群聊
+                metadata={"route_user_id": from_user},
             )
 
-            # 桥接回主循环
+            # 桥接回主循环（future 统一登记 done 回调，记录未观察到的异常）
             if self._loop and self._loop.is_running():
-                asyncio.run_coroutine_threadsafe(
-                    self.dispatcher.on_inbound(inbound), self._loop
-                )
+                fut = asyncio.run_coroutine_threadsafe(
+                    self.dispatcher.on_inbound(inbound), self._loop)
+                fut.add_done_callback(_log_inbound_future)
         except Exception as e:
             logger.error("微信消息处理异常: %s", e, exc_info=True)
 
     def _do_send(self, msg: InboundMessage, text: str):
         """同步发送（在线程池中执行）"""
         if not self._bot:
-            return
+            return False
         try:
             user_id = msg.user_id
             if not user_id:
-                return
+                return False
             # Markdown → 纯文本（微信不支持富文本）
             plain = md_to_plain(text)
             # 分片发送
@@ -177,14 +190,18 @@ class WeixinChannel(Channel):
             for chunk in chunks:
                 if self.reply_format == "markdown":
                     # SDK 内置的微信兼容 markdown 过滤
+                    # 冗余 except 收窄：AttributeError 是 Exception 子类，
+                    # 保留单一 Exception 即可（send_markdown 缺失时抛 AttributeError）
                     try:
                         self._bot.send_markdown(user_id, chunk)
-                    except (AttributeError, Exception):
+                    except Exception:
                         self._bot.send_text(user_id, chunk)
                 else:
                     self._bot.send_text(user_id, chunk)
+            return True
         except Exception as e:
             logger.error("微信发送失败: %s", e)
             # errcode=-14 通常意味着 token 过期
             if "-14" in str(e):
-                logger.warning("微信 token 可能已过期，请重新扫码: python agent.py gateway login weixin")
+                logger.warning("微信 token 可能已过期，请重新扫码: jkagent-gateway login weixin")
+            return False

@@ -20,6 +20,11 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Python 打包产物
+/build/
+/dist/
+/*.egg-info/
+
 # 编辑器
 .vscode/
 .idea/
@@ -37,7 +42,8 @@ sessions/
 # 记忆系统（自动生成的对话归档）
 memory/daily/
 memory/workspaces/
-memory/config.json
+# 注：memory/config.json 仅含 version/created_at 且已被 git 跟踪，
+# 忽略规则对已跟踪文件无效，故移除该矛盾条目。
 
 # 日志文件（自动生成的调试日志）
 log/
@@ -46,7 +52,7 @@ log/
 
 .claude/
 
-# Gateway ?????????????
+# Gateway 运行时状态目录
 .agent/
 
 # Gateway 凭据（微信 token 等）
@@ -59,7 +65,32 @@ gateway/sessions_map.json
 gateway/scheduler_state.json
 
 # Agent 工作目录（运行时生成）
-workspace/
+/workspace/
 
-#测试目录
-tests/
+# 根目录测试源码纳入版本控制；仅忽略测试运行产生的临时数据/报告
+/tests/tmp/
+/tests/output/
+/tests/artifacts/
+/tests/.pytest_cache/
+
+/docs/
+
+# 前端构建产物与依赖（运行/构建必需，仅忽略 git 跟踪）
+gateway/webui/frontend/node_modules/
+gateway/webui/frontend/dist/
+gateway/webui/frontend/test-results/
+# 网关 Web UI 静态目录（构建产物：由 frontend/dist 经 npm run sync:static 同步，不提交）
+gateway/webui/static/
+# 网关运行日志（原位生成）
+gateway/gateway-run.log
+
+/output/
+# 运行时数据库（RuntimeStore 落盘 + 备份，运行时生成）
+/runtime/
+
+# 工作区智能体输出目录（编码智能体按 .jk/ 约定产出，运行时生成）
+.jk/
+
+# 前端目录下的 workspace/ 是各页面 e2e/验证脚本的临时工作区（截图/种子产物）
+gateway/webui/frontend/workspace/
+gateway/workspace/

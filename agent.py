@@ -2,23 +2,8 @@
 """
 
 Agent 主程序 —— 把 LLM + 工具串起来的"智能体指挥官"
-工作模式：ReAct（Reasoning + Acting）循环
-消息流结构：
-  user               "帮我看看 main.py"
-  ───────────────────────────────────────────────────
-  assistant          ← 这是 tool_use（LLM 决定调用工具）
-    "THOUGHT：需要查看文件
-     ACTION：read
-     INPUT：{"file_path": "test.txt"}"
-  ───────────────────────────────────────────────────
-  user (name=tool_result)  ← 这是 tool_result（工具返回数据）
-    "【工具执行结果】
-     工具: read
-     返回: 文件内容..."
-  ───────────────────────────────────────────────────
-  assistant          ← 最终回答
-    "THOUGHT：我看到了...
-     FINAL_ANSWER：文件内容是..."
+工作模式：原生 provider tool-call AgentLoop
+消息流结构：原生 provider tool calls → tool results → assistant final response
 使用示例：
     from agent import create_agent
     agent = create_agent()
@@ -32,6 +17,8 @@ import sys
 import queue
 import threading
 import uuid
+import itertools
+import time
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -41,19 +28,16 @@ import logging
 
 from core import JKAgentLLM, SystemPrompt
 from core.llm_client import detect_context_length
-from core.compressor import Compressor
-from core.task_list import TaskList
+from core.compressor import LIGHT_KEEP_RECENT_RESULTS, Compressor, tool_compress_needed
 from core.debug import (
     logger, setup_logging,
     set_debug,
     log_llm_response,
     log_info,
 )
-from core.message_store import MessageStore, _content_to_text
+from core.message_store import MessageStore, _content_to_text, _estimate_tokens
 from core.config_loader import is_enabled
 from core.config_loader import load_config
-from core.agent_protocol import parse_text_response
-from core.protocols.vision import is_image_file
 from core.permission import PermissionChecker, ALLOW, ASK, DENY
 from core.security_gate import SecurityGate
 from core.process_manager import ProcessManager
@@ -64,21 +48,31 @@ from memory import MemoryManager, workspace_memory_dir
 from skills import SkillManager, SkillTool, CreateSkillTool
 from core.sandbox import SandboxExecutor
 from core.hook import HookManager, HookEvent, Decision
+from core.runtime import TaskCancelled
 from core.runtime.tool_runtime import ToolRuntime
+from core.agent_runtime import AgentContext, ToolBatchExecutor
+from core.agent_runtime.control import BudgetExceeded
 from core.runtime.text_normalization import normalize_model_text
+from core.tool_schema import sanitize_message_name
 
 
 # 输出预留（tokens）：从模型上下文窗口中扣减，作为回复/工具调用输出的余量。
 # 历史预算 = context_length - 输出预留（替代旧的 context_length // 2）。
-# 8192 为默认单次输出上限，×3 覆盖多轮 ReAct 内的连续输出，另加 4096 固定余量；
+# 8192 为默认单次输出上限，×3 覆盖多轮工具调用内的连续输出，另加 4096 固定余量；
 # 小上下文模型按 1/4 缩放，避免预留挤占历史空间。
 OUTPUT_RESERVE = 8192 * 3 + 4096
 
 
 def _history_budget(context_length: int) -> int:
-    """历史消息预算：模型上下文减去输出预留（上限 28k、小模型按 1/4 缩放），最低 4096。"""
+    """历史消息预算：模型上下文减去输出预留（上限 28k、小模型按 1/4 缩放）。
+
+    L2#12 小模型输出预留：预算下限 = max(context_length - reserve,
+    context_length // 2)。旧实现以 4096 为绝对下限——小上下文模型（如 4k）
+    预算会被顶到整个窗口，输出无预留空间；改为随上下文缩放的下限后，
+    小模型至少留出半窗口给回复/工具调用输出。
+    """
     reserve = min(OUTPUT_RESERVE, max(context_length // 4, 0))
-    return max(context_length - reserve, 4096)
+    return max(context_length - reserve, context_length // 2)
 
 
 def _configured_workspace_path(config: Optional[dict] = None) -> Path:
@@ -98,120 +92,6 @@ def _configured_workspace_path(config: Optional[dict] = None) -> Path:
     return (_find_project_root() / path).resolve()
 
 
-def _configured_runtime_store_path(config: Optional[dict] = None) -> Path:
-    """Resolve the durable runtime database relative to the project root."""
-    if config is None:
-        config = load_config()
-    configured = config.get("runtime_store", {}).get("path")
-    if not configured:
-        return _configured_workspace_path(config) / ".agent" / "state" / "runtime.db"
-    path = Path(str(configured))
-    if path.is_absolute():
-        return path.resolve()
-    from core.config_loader import _find_project_root
-    return (_find_project_root() / path).resolve()
-
-
-# ============================================================
-# ReAct 关键字（英文，避免中文编码兼容问题）
-
-# ============================================================
-TAG_THOUGHT = "THOUGHT"
-TAG_ACTION = "ACTION"
-TAG_INPUT = "INPUT"
-TAG_FINAL = "FINAL_ANSWER"
-# 正则匹配 THOUGHT（不区分大小写）
-_THOUGHT_RE = re.compile(
-    rf"(?:{TAG_THOUGHT}|思考)[：:]\s*(.*?)"
-    rf"(?=\n*(?:{TAG_ACTION}|行动)[：:]|\n*(?:{TAG_FINAL}|最终回答)[：:]|$)",
-    re.DOTALL | re.IGNORECASE
-)
-
-
-# ============================================================
-# Plan 规划（CLI /plan 与 WebUI plan 预览共用）
-# ============================================================
-PLAN_PROMPT_TEXT = (
-    "请分析以下任务需求，输出一个分步骤的执行方案。\n\n"
-    "格式要求：\n"
-    "PLAN：\n"
-    "[1] 步骤1描述\n"
-    "[2] 步骤2描述\n"
-    "...（分步骤列出，5-8 步为宜）\n\n"
-    "只需要输出 PLAN 部分，不要执行任何工具。"
-)
-_PLAN_RE = re.compile(
-    r"PLAN[：:]\s*(\S[\s\S]*?)(?:\Z|(?=\n*(?:THOUGHT|ACTION|FINAL_ANSWER)))",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def extract_plan_text(response: str) -> Optional[str]:
-    """从 LLM 响应中提取 PLAN 正文；未识别返回 None"""
-    m = _PLAN_RE.search(response or "")
-    return m.group(1).strip() if m else None
-
-
-
-
-
-def _build_tool_result_content(combined: str):
-    """构造 tool_result 的 content：检测 [IMAGE:path=...] 标记并转为多模态块。
-
-    标记必须指向真实存在的图片文件才会被采纳——防止工具输出中恰好包含
-    标记字面量（如 agent 读取本文件源码）时被误匹配而污染会话历史，
-    也防止模型伪造标记读取任意文件。重复标记去重，保持出现顺序。
-    无有效图片时原样返回字符串。
-    """
-    markers = re.findall(r'\[IMAGE:path=(.+?)\]', combined)
-    if not markers:
-        return combined
-    valid_paths = []
-    for p in dict.fromkeys(markers):
-        if Path(p).is_file() and is_image_file(p):
-            valid_paths.append(p)
-        else:
-            logger.debug(f"忽略无效图片标记: {p}")
-    if not valid_paths:
-        return combined
-    content = [{"type": "text", "text": combined}]
-    for p in valid_paths:
-        content.append({"type": "image", "source": "file", "path": p})
-    return content
-
-
-def parse_react_response(response: str) -> dict:
-    """
-
-    解析 LLM 的 ReAct 回复，返回：
-      { thought, actions: [{name, input}], final_answer }
-    actions 可能包含多个工具调用（分批执行+合并结果）
-    """
-
-    runtime = load_config().get("agent_runtime", {})
-    turn = parse_text_response(
-        response or "",
-        mode=runtime.get("response_protocol", "legacy"),
-        legacy_execute=is_enabled(runtime.get("legacy_execute"), False),
-    )
-    final_answer = (turn.visible_text if not turn.tool_calls
-                    and turn.protocol_mode.value in {"legacy", "json_envelope"} else None)
-    thought = turn.thought
-    actions = [
-        {"name": call.internal_name, "input": call.raw_arguments or json.dumps(call.arguments, ensure_ascii=False)}
-        for call in turn.tool_calls
-    ]
-    return {
-        "thought": thought,
-        "actions": actions,
-        "final_answer": final_answer,
-        "raw_text": turn.raw_text,
-        "visible_text": turn.visible_text,
-        "protocol_mode": turn.protocol_mode.value,
-        "parse_status": turn.parse_status.value,
-        "diagnostics": [{"code": d.code, "message": d.message} for d in turn.diagnostics],
-    }
-
 # ============================================================
 # Agent 核心
 
@@ -221,12 +101,12 @@ def parse_react_response(response: str) -> dict:
 class Agent:
     """
 
-    AI 智能体 —— ReAct 模式
+    AI 智能体 —— 原生工具调用模式
     消息流约定：
       user (提问)
-      → assistant (tool_use: THOUGHT + ACTION + INPUT)
-      → user name=tool_result (tool_result: 工具返回的数据)
-      → assistant (继续思考或 FINAL_ANSWER)
+      → assistant (native tool_calls)
+      → tool (tool results)
+      → assistant (final response)
     工具选择优先级：
       read/write/edit/grep/glob → 文件操作首选
       bash → 仅用于运行脚本/安装包/git
@@ -239,7 +119,7 @@ class Agent:
         tool_registry: ToolRegistry,
         system_prompt: str = None,
         system_prompt_builder: SystemPrompt = None,
-        max_steps: int = 100,          # 最大 ReAct 循环步数
+        max_steps: int = 100,          # 最大 AgentLoop 步数
         max_history_tokens: int = 0,   # 上下文预算阈值（0=自动：模型上下文-输出预留）
         debug: bool = False,
         permission_checker: PermissionChecker = None,
@@ -264,10 +144,10 @@ class Agent:
         self.max_steps = max_steps
         self.non_interactive = non_interactive
         self.quiet = quiet
-        self.auto_approve_plan = True  # 非交互模式下自动批准 PLAN
-        # 权限审批回调（WebUI ask 档审批桥注入；None = 现状自动放行）
+        self.auto_approve_plan = True  # WebUI Plan approval bridge default
+        # 权限审批回调（WebUI ask 档审批桥注入；None 时 ASK fail-closed）
         self.ask_callback = None
-        # 协作式停止标志（WebUI 暂停按钮；run/_run_task_list 每步检查）
+        # 协作式停止标志（WebUI 停止按钮；统一 AgentLoop 每步检查）
         self._stop_requested = False
         # 上下文预算阈值：0 时取模型上下文减去输出预留（留足输出空间）
         if max_history_tokens == 0:
@@ -284,11 +164,10 @@ class Agent:
         self._gate = SecurityGate(
             self.permission, self.sandbox, str(self.permission.workspace)
         )
-        self._stop_block_count = 0  # 单次 run() 内 stop hook 连续 BLOCK 计数（上限 3）
-        # 长驻进程工具权限：L1 注册为 ALLOW（危险判定全交 L2：exec:shell 查 command、proc:manage 查 input）
-        if self.process_manager is not None:
-            for _t in ("proc_start", "proc_send", "proc_read", "proc_list", "proc_stop"):
-                self.permission.set_rule(_t, ALLOW)
+        # 运行事件锁：并行工具段多线程调用 _emit_event 时保护 seq 自增与 sink 调度
+        self._event_lock = threading.Lock()
+        # proc_* 工具权限：由 PolicyEngine 四档裁决（proc:manage/exec:shell 能力
+        # 分类），不再注册 set_rule——规则表无执行方读取，历史注册已清理。
         # Hook 模块：事件驱动自定义扩展（用户审计/通知/改写/拦截）
         self.hooks = HookManager(enabled=hooks_enabled)
         if debug:
@@ -316,51 +195,100 @@ class Agent:
         self.store.model_llm_type = getattr(self.llm, "llm_type", "") or ""
         # ---- 上下文压缩器 ----
         self._compressor = Compressor(llm=self.llm)
-        # ---- 任务清单（复杂任务拆分执行）----
-        self._task_list: Optional[TaskList] = None
+        # ---- A1：挂起的 system 模板（技能刷新/MCP reload/profile 更新后延迟应用）----
+        self._pending_system_template = None
+        # ---- A4：后台增量压缩状态 ----
+        self._compression_pending = False
+        self._compression_cooldown_until = 0.0
 
     # ============================================================
-    # 对话历史管理
-
-    # ============================================================
+    # Only perform destructive history eviction when the context is genuinely
+    # near overflow. Normal high usage is handled by full compression first.
+    EMERGENCY_TRUNCATE_RATIO = 0.95
+    # A4：自动压缩失败后的冷却秒数（冷却期间自动压缩跳过；手动 /compact 不受限）
+    COMPRESSION_FAILURE_COOLDOWN = 60.0
 
     def _truncate_history(self):
-        """
+        """Safely evict old history only at the emergency overflow threshold.
 
-        紧急截断：当压缩后仍超出上下文预算时，丢弃最早的消息。
-        作为压缩策略的最后一道防线（正常情况下应极少触发）。
-        始终保留：系统提示词 + 最近的一轮对话
+        Tool-call assistant messages and their following tool results are removed
+        as one unit so provider message pairing is never left malformed. Any
+        destructive eviction invalidates the provider usage anchor because its
+        original message prefix no longer exists.
         """
-
         if self.max_history_tokens <= 0 or len(self.messages) <= 3:
             return
         total = self.store.live_tokens()
-        if total <= self.max_history_tokens:
+        ratio = total / self.max_history_tokens
+        if ratio <= self.EMERGENCY_TRUNCATE_RATIO:
             return
-        # 从最早的消息开始丢弃，保留 system + 最近至少 2 条消息
+
+        # P2：O(n²) → O(n)——预计算每条消息的 token 估算（UI-only runtime 记录
+        # 与 _estimate_all_tokens 语义一致地计 0），逐轮增量扣减，避免每轮
+        # 全量重算 _estimate_all_tokens()。
+        per_msg = [
+            0 if m.get("runtime") else _estimate_tokens(m.get("content", ""))
+            for m in self.messages
+        ]
+        total = sum(per_msg)
+
         dropped = 0
         while len(self.messages) > 3 and total > self.max_history_tokens:
-            msg = self.messages.pop(1)  # 跳过 system（index 0）
-            dropped += 1
-            total = self.store.live_tokens()  # 重新计算，避免估算口径不一致
-        log_info(
-            f"⚠️ 紧急截断: 压缩后仍超预算，丢弃 {dropped} 条消息（剩余 {total} tokens）"
-        )
+            index = 1  # preserve system prompt
+            first = self.messages[index]
+            remove_count = 1
+            # Never leave tool_result messages without their assistant tool call.
+            if first.get("role") == "assistant" and first.get("kind") == "tool_calls":
+                while index + remove_count < len(self.messages):
+                    candidate = self.messages[index + remove_count]
+                    if candidate.get("role") == "tool":
+                        remove_count += 1
+                    else:
+                        break
+            elif first.get("role") == "tool":
+                # A defensive repair for malformed/legacy history: remove the
+                # contiguous tool-result group rather than one orphan result.
+                while index + remove_count < len(self.messages):
+                    candidate = self.messages[index + remove_count]
+                    if candidate.get("role") == "tool":
+                        remove_count += 1
+                    else:
+                        break
+            removed_tokens = sum(per_msg[index:index + remove_count])
+            del self.messages[index:index + remove_count]
+            del per_msg[index:index + remove_count]
+            dropped += remove_count
+            total -= removed_tokens
 
-    # ============================================================
-    # 上下文压缩
-
+        if dropped:
+            # The exact provider usage no longer describes this message list.
+            self.store.reset_anchor()
+            log_info(f"⚠️ 上下文接近溢出（{ratio:.0%}），安全截断 {dropped} 条历史消息")
     # ============================================================
 
     def _light_compress(self):
         """
-
-        轻量压缩：规则替换已消费的工具结果为短摘要。
+        轻量压缩：规则替换已消费的旧工具结果为短摘要 + 降级已消费图片。
         在每轮对话后自动执行，零 LLM 开销。
+
+        修复"工具输出被过早压缩 → 模型反复重读同一文件"：
+        - 压力门控：仅当历史预算占用 ≥ LIGHT_RESULT_RATIO（默认 60%）才
+          压缩工具结果；预算未配置时保持旧的始终压缩行为（保守兜底）；
+        - 近端保护：最近 LIGHT_KEEP_RECENT_RESULTS 条仍有内容的工具结果
+          永不压缩——模型当前工作集（刚读的文件等）必须保持可见，
+          否则同一个 Turn 内会陷入 read → 被压缩 → 再 read 的死循环；
+        - 已消费图片降级始终执行（收益大、几乎无回读需求）。
         """
 
         old_total = self.store.live_tokens()
-        self._compressor.light_compress(self.messages)
+        compress_results = tool_compress_needed(
+            old_total, self.store.max_tokens)
+        self._cancel_checkpoint()
+        self._compressor.light_compress(
+            self.messages,
+            compress_results=compress_results,
+            keep_recent_results=LIGHT_KEEP_RECENT_RESULTS,
+        )
         new_total = self.store.live_tokens()
         saved = old_total - new_total
         if saved > 0:
@@ -378,6 +306,7 @@ class Agent:
 
         # 全量压缩本身
         before_tokens = self.store.live_tokens()
+        self._cancel_checkpoint()
         ok = self._compressor.full_compress(
             store=self.store,
             messages=self.messages,
@@ -395,7 +324,8 @@ class Agent:
                 tokens_after=stats.get("remaining_tokens", 0),
                 summary_preview=self._history_summary_preview(),
             )
-            self.store.save_session()
+            # 持久化退役（C2 契约②）：文件转录停写后 save_session 为 no-op，
+            # 不再调用；会话权威在 SQLite 统一会话（gateway 路径）。
         return ok
 
     def _history_summary_preview(self) -> str:
@@ -408,96 +338,109 @@ class Agent:
 
     def _check_context(self, verbose: bool = True) -> bool:
         """
+        检查上下文占用率，按阈值自动压缩或提示（A4 压缩策略）。
 
-        检查上下文占用率，按阈值自动压缩或提示。
-        优先级：自动全量压缩 > 提示 > 无操作
+        阈值（相对 store.max_tokens 历史预算）：
+          ≥95%  同步紧急截断（安全网优先，任何后台延迟都不允许溢出）；
+          ≥80%  且非失败冷却 → 置 self._compression_pending，由 AgentLoop 在
+                turn 边界后台执行增量压缩（不阻塞本轮 provider 调用）；
+          ≥60%  提示用户可手动 /compact。
         返回:
-            True 表示执行了全量压缩
+            恒为 False（不再同步执行全量压缩；旧语义的“已执行全量压缩”
+            由后台增量压缩路径取代）
         """
-
-        return self._compressor.check_and_compact(
-            store=self.store,
-            messages=self.messages,
-            verbose=verbose,
-        )
-
-    # ============================================================
-    # 任务清单管理
-
-    # ============================================================
-
-    def _update_task_list_in_prompt(self):
-        """
-
-        在 system prompt 末尾追加/更新/移除任务清单段。
-        每次任务推进后调用，保证 LLM 感知最新进度。
-        """
-
-        if not self.messages or self.messages[0].get("role") != "system":
-            return
-        content = self.messages[0]["content"]
-        # 移除旧的任务清单段
-        content = re.sub(
-            r"\n*<SYSTEM_TASK_LIST>.*?</SYSTEM_TASK_LIST>\n*",
-            "", content, flags=re.DOTALL
-        )
-        # 追加新的
-        if self._task_list:
-            content += f"\n\n{self._task_list.to_prompt_section()}"
-        self.messages[0]["content"] = content
-        self.system_prompt = content
-
-    def _handle_plan(
-        self,
-        plan_text: str,
-        verbose: bool = True,
-    ) -> bool:
-        """
-
-        处理 LLM 返回的 PLAN 内容：展示给用户，等待确认。
-        参数:
-            plan_text: LLM 输出的 PLAN 文本
-            verbose:   是否输出提示信息
-        返回:
-            True = 用户确认，已创建 TaskList
-            False = 用户拒绝
-        """
-
-        print(f"\n  📋 方案如下：")
-        for line in plan_text.strip().split("\n"):
-            line = line.strip()
-            if line:
-                print(f"    {line}")
-        print(f"  ─────────────────────────────")
-        print(f"  Y = 确认执行")
-        print(f"  N = 拒绝方案，继续讨论")
-        if self.non_interactive:
-            choice = "y" if self.auto_approve_plan else "n"
-        else:
-            choice = input(f"  确认执行？[Y/n] ").strip().lower()
-        if choice in ("", "y", "yes", "是"):
-            self._task_list = TaskList.from_plan_text(plan_text)
-            if not self._task_list.tasks:
-                print(f"  ❌ 方案解析失败，未识别出有效任务")
-                return False
-            print(f"  ✅ 任务清单已创建（共 {len(self._task_list.tasks)} 步），开始执行…")
-            self._update_task_list_in_prompt()
-            self.store.save_session()
-            return True
-        else:
-            print(f"  ⏭️  已取消，可继续讨论或输入 /plan 重新规划")
+        max_tokens = self.store.max_tokens
+        if max_tokens <= 0:
             return False
+        ratio = self.store.live_tokens() / max_tokens
+
+        if ratio >= self._compressor.EMERGENCY_RATIO:
+            # 安全网优先：同步紧急截断，避免任何后台延迟导致溢出。
+            self._truncate_history()
+            ratio = self.store.live_tokens() / max_tokens
+
+        if ratio >= self._compressor.AUTO_RATIO:
+            if time.monotonic() < self._compression_cooldown_until:
+                if verbose:
+                    print(f"  ⏳ 上下文占用 {ratio:.0%}，自动压缩处于失败冷却中，跳过")
+                return False
+            self._compression_pending = True
+            if verbose:
+                print(f"  📐 上下文占用 {ratio:.0%}，本轮结束后将后台增量压缩…")
+            return False
+
+        if ratio >= self._compressor.WARN_RATIO:
+            if verbose:
+                print(f"  ⚠️  上下文占用 {ratio:.0%}，输入 /compact 可压缩历史释放空间")
+        return False
+
+    def _compression_commit_guard(self) -> bool:
+        """增量压缩提交护栏：新一轮 run 已开始时放弃本次提交。
+
+        增量压缩在后台线程完成 LLM 合并（不碰消息列表），提交
+        （clear+extend）前检查该护栏：若新一轮 run 已启动，放弃提交并重新
+        置位 _compression_pending，留待下一轮 turn 边界重试，避免与运行中的
+        消息列表变更竞争。
+        """
+        if getattr(self, "_is_running", False):
+            self._compression_pending = True
+            return False
+        return True
+
+    def _incremental_compress(self) -> bool:
+        """A4：turn 边界后台增量压缩（由 AgentLoop 后台线程调用）。
+
+        以现有 history_summary 为基底，仅对摘要之后的新片段做 LLM 合并摘要，
+        不重读全量历史（省 token/省时）；失败进入 60s 冷却——冷却期间自动
+        压缩跳过，手动 /compact（直接走 _full_compress）不受限。
+        """
+        before_tokens = self.store.live_tokens()
+        try:
+            self._cancel_checkpoint()
+        except Exception:
+            pass
+        try:
+            ok = self._compressor.incremental_compress(
+                store=self.store,
+                messages=self.messages,
+                verbose=False,
+                commit_guard=self._compression_commit_guard,
+            )
+        except Exception as exc:
+            logger.warning("增量压缩异常: %s", exc, exc_info=True)
+            ok = False
+        if not ok:
+            # 失败冷却：自动压缩跳过；手动 /compact 不受限。
+            self._compression_cooldown_until = (
+                time.monotonic() + self.COMPRESSION_FAILURE_COOLDOWN)
+            return False
+        stats = self.store.stats()
+        logger.info(
+            "增量压缩完成: %s 条消息, 剩余 %s tokens",
+            stats["total_messages"], stats.get("remaining_tokens", 0))
+        try:
+            self.store.record_event(
+                "compaction_incremental",
+                tokens_before=before_tokens,
+                tokens_after=stats.get("remaining_tokens", 0),
+                summary_preview=self._history_summary_preview(),
+            )
+        except Exception:
+            pass
+        # 持久化退役：增量压缩后不再调用 no-op 的 save_session
+        return True
 
     def _ask_user(self, tool_name: str, params: dict) -> str:
         """
         工具权限确认统一入口。
         交互模式：显示操作详情，等待用户输入 A/Y/N/S。
-        非交互模式：优先走 ask_callback（WebUI 审批桥），否则自动返回 "y"。
+        非交互模式：优先走 ask_callback（WebUI 审批桥）；没有审批器时拒绝。
         """
         if self.non_interactive:
             if self.ask_callback is not None:
                 return self.ask_callback(tool_name, params)
-            return "y"
+            logger.warning("非交互 ASK 缺少审批桥，已按 fail-closed 拒绝: %s", tool_name)
+            return "n"
         # 交互模式：原有逻辑
         print(f"\n  ❓ 需要确认: {tool_name}")
         for k, v in params.items():
@@ -508,11 +451,35 @@ class Agent:
         print(f"  Y = 允许本次操作")
         print(f"  N = 拒绝本次操作")
         print(f"  S = 跳过本次操作")
-        return input(f"  请选择 [A/Y/N/S] (默认Y) ").strip().lower()
+        try:
+            return input(f"  请选择 [A/Y/N/S] (默认Y) ").strip().lower()
+        except EOFError:
+            # P2-5：stdin 关闭（管道结束/守护环境）时 input() 抛 EOFError。
+            # 异常若逃逸会跳过本批其余工具结果的落账，留下悬空 tool_calls，
+            # provider 直接会话级 400。EOF 视为用户拒绝（fail-closed），
+            # 由调用方生成 is_error 的拒绝结果继续本批。
+            print("\n  ⚠️ 输入流已关闭（EOF），本次操作按拒绝处理")
+            return "n"
+        except KeyboardInterrupt:
+            # Ctrl+C 同样视为用户拒绝，而不是让异常炸出工具批次。
+            print("\n  ⚠️ 收到中断信号（Ctrl+C），本次操作按拒绝处理")
+            return "n"
 
     def request_stop(self):
-        """请求协作式停止：run/_run_task_list 在下一步检查点退出。"""
+        """请求协作式停止：统一 AgentLoop 在下一步检查点退出。
+
+        stop_timeout Fix-2：同时对本 agent 名下的在途工具进程组直接 SIGKILL
+        （run_killable 经线程本地登记的进程组）——不再依赖工具侧 0.2s 轮询
+        先观察到标志，停止即时生效，10s 停止看门不再有竞态窗口。
+        """
         self._stop_requested = True
+        try:
+            from core.shell import kill_owner_process_groups
+            killed = kill_owner_process_groups(id(self))
+            if killed:
+                logger.info("停止请求：已强杀 %d 个在途工具进程组", killed)
+        except Exception:
+            logger.debug("停止请求：在途进程组强杀失败（忽略，协作式停止仍生效）", exc_info=True)
         logger.info("收到停止请求（将在下一步检查点生效）")
 
     def _consume_stop(self) -> bool:
@@ -522,26 +489,56 @@ class Agent:
             return True
         return False
 
-    def clear_history(self):
-        """清空对话历史，但保留系统提示词"""
+    def _cancel_checkpoint(self) -> None:
+        """P1-5：协作取消检查点。外部 token 被取消则抛 TaskCancelled，交由
+        AgentLoop.run 收口为 CANCELLED。在压缩/截断等昂贵步骤边界调用。"""
+        control = getattr(self, "_run_control", None)
+        if control is not None:
+            control.checkpoint()
 
-        self.store.clear()        # 锚点失效——清空历史后 next-think 重新校准
-        # store.clear() 已重置 store._anchor_total 和 _anchor_msg_count
-        # 清空任务清单
-        self._task_list = None
-        # 标记记忆系统：下次保存时强制新建条目，防止覆盖清空前的内容
-        self._memory_clear_count = getattr(self, '_memory_clear_count', 0) + 1
+    def clear_history(self):
+        """Clear the live conversation and persist the empty state immediately.
+
+        ``/clear`` is handled as a gateway command, so it does not pass through
+        the normal ``agent.run`` finalization path. Saving here is therefore
+        required; otherwise the next WebUI history refresh or agent recreation
+        reloads the old session file and makes the clear appear ineffective.
+        """
+        self.store.clear()
+        self._memory_clear_count = getattr(self, "_memory_clear_count", 0) + 1
+        self.store.record_event("history_cleared", clear_count=self._memory_clear_count)
+        # 文件转录已退役（SQLite 统一会话为唯一权威）：/clear 由 dispatcher
+        # 联动 bridge.service.clear_history 清空统一会话 turns/nodes，重建时
+        # SQLite 回放自然为空，无需再写空会话文件防"清了又回来"。
 
     def switch_llm(self, **kwargs):
         """
-
         运行时切换 LLM 模型，不影响对话历史和工具
         用法:
             agent.switch_llm(provider="ollama", model="gemma4")
             agent.switch_llm(model="gpt-4", base_url="https://api.openai.com", llm_type="cloud")
-        """
 
+        线程安全（P2-9）：若 AgentLoop 正在运行，切换不即刻改共享的 llm/
+        压缩器/token 预算，而是挂起为 pending，由本轮结束后的下一轮原子应用，
+        避免同一轮前后半段用不同模型或上下文预算。
+        """
+        if getattr(self, "_is_running", False):
+            self._pending_llm_config = dict(kwargs)
+            logger.info("Agent 运行中，模型切换挂起，下一轮生效: %s", kwargs.get("model"))
+            return
+        self._apply_llm_config(**kwargs)
+
+    def _apply_llm_config(self, **kwargs):
+        """实际应用 LLM 配置（_apply / 下轮消费 pending 共用同一实现）。"""
+        old_llm = self.llm
         self.llm = JKAgentLLM(**kwargs)
+        # P3：旧实例尽力关闭（有 close 则调），释放连接/会话资源；无 close 跳过。
+        try:
+            close = getattr(old_llm, "close", None)
+            if callable(close):
+                close()
+        except Exception as exc:
+            logger.debug("关闭旧 LLM 实例失败（可忽略）: %s", exc)
         # 根据新模型的上下文长度重新计算压缩阈值（模型上下文 - 输出预留）
         self.max_history_tokens = _history_budget(self.llm.context_length)
         # 同步 store 的阈值和模型配置（/stats 显示用的 store.max_tokens）
@@ -561,16 +558,32 @@ class Agent:
                 llm_type=self.store.model_llm_type,
                 reasoning_level=getattr(self.llm, "reasoning_level", None),
             )
-        # 锚点失效——不同模型的 tokenizer 不同
-        self.store._anchor_total = 0
-        self.store._anchor_msg_count = 0
+        # 锚点失效——不同模型的 tokenizer 不同。
+        # 修复：仅推理等级变化（模型与上下文长度不变）时不失效锚点。
+        # 原实现无条件清零锚点 → live_tokens 回退到字符估算（远小于 provider
+        # 精确值），UI 上下文占用骤降，长会话下看起来像"上下文被清空"
+        # （实际消息完好，模型记忆不受影响）。纯推理切换不改变历史 token 数，
+        # 保留锚点反而更精确；下次 API 调用仍会自动校准。
+        _model_changed = (
+            getattr(old_llm, "model", "") != getattr(self.llm, "model", "")
+            or int(getattr(old_llm, "context_length", 0) or 0)
+                != int(getattr(self.llm, "context_length", 0) or 0))
+        if _model_changed:
+            self.store.reset_anchor()
         # 压缩器也要跟新 LLM 走（全量压缩用）
         self._compressor._llm = self.llm
-        # 任务清单失效——不同模型 context 不同
-        self._task_list = None
-        self._update_task_list_in_prompt()
         print(f"  ✅ 已切换模型: {self.llm}")
         print(f"  📐 上下文: {self.llm.context_length:,} tokens | 压缩阈值: {self.max_history_tokens:,} tokens")
+
+    def _consume_pending_llm(self) -> None:
+        """下一轮开始时原子应用运行期挂起的模型切换（P2-9）。"""
+        pending = getattr(self, "_pending_llm_config", None)
+        if pending:
+            self._pending_llm_config = None
+            try:
+                self._apply_llm_config(**pending)
+            except Exception as exc:
+                logger.warning("应用挂起的模型切换失败: %s", exc)
 
     # ============================================================
     # 系统提示词
@@ -603,10 +616,20 @@ class Agent:
             except Exception:
                 pass
 
+    def _full_tool_tables_enabled(self) -> bool:
+        """A2：读取 system_prompt.full_tool_tables（默认 False=紧凑索引）。"""
+        try:
+            cfg = getattr(self, "_config", None) or load_config()
+            return bool((cfg.get("system_prompt") or {}).get("full_tool_tables", False))
+        except Exception:
+            return False
+
     def _build_system_prompt(self) -> str:
         """使用 SystemPrompt 构建器生成带静态区和动态区的提示词"""
 
-        tool_descs = self.tool_registry.get_tool_descriptions()
+
+        tool_descs = self.tool_registry.get_tool_descriptions(
+            compact=not self._full_tool_tables_enabled())
         skill_descs = self.skill_manager.get_skill_descriptions() if self.skill_manager else ""
         mcp_descs = self.tool_registry.get_mcp_tool_descriptions()
         builder = self.system_prompt_builder or SystemPrompt(name=self.name)
@@ -635,41 +658,13 @@ class Agent:
             tool = SkillTool(skill)
             try:
                 self.tool_registry.register_skill_tool(tool)
-                # 技能只返回指令文本（无副作用），免确认；
-                # 其指挥的后续工具调用仍各自被 SecurityGate 拦截
-                self.permission.set_rule(tool.name, ALLOW)
+                # 技能执行只返回指令文本（无直接副作用）；技能名为动态值，
+                # 不在 PolicyEngine._PURE_TOOLS 名单内，按未分类工具走四档
+                # 兜底（readonly 拒 / ask 确认 / allow·unreviewed 放行）。
+                # 此前这里的 set_rule(ALLOW) 是无执行方读取的死代码，移除后
+                # 行为不变；技能指挥的后续工具调用仍各自被 SecurityGate 拦截。
             except (ValueError, TypeError) as e:
                 logger.warning(f"注册技能工具失败 '{tool.name}': {e}")
-
-    def _refresh_skills(self, force: bool = False) -> bool:
-        """Reload skill files and synchronize the live tool catalog/prompt."""
-        manager = getattr(self, "skill_manager", None)
-        if manager is None:
-            return False
-        try:
-            skills = manager.load_all()
-        except Exception as exc:
-            logger.warning("skill refresh failed: %s", exc)
-            return False
-        signature = tuple(
-            (skill.name, getattr(skill, "version", ""), skill.description,
-             skill.instruction, repr(skill.parameters))
-            for skill in sorted(skills, key=lambda item: item.name)
-        )
-        if not force and signature == getattr(self, "_skill_catalog_signature", None):
-            return False
-        # sync_skill_tools removes tools whose files disappeared and updates
-        # descriptions for files changed while a session stays alive.
-        tools = [SkillTool(skill) for skill in skills]
-        if hasattr(self.tool_registry, "sync_skill_tools"):
-            registered = self.tool_registry.sync_skill_tools(tools)
-            for name in registered:
-                self.permission.set_rule(name, ALLOW)
-        else:
-            self._register_skill_tools()
-        self._skill_catalog_signature = signature
-        self._rebuild_system_prompt()
-        return True
 
     def _register_create_skill_tool(self):
         """注册 create_skill 工具（LLM 运行时创建技能）"""
@@ -684,10 +679,14 @@ class Agent:
             logger.warning(f"注册 create_skill 失败: {e}")
 
     def _rebuild_system_prompt(self):
-        """重新构建 system prompt（技能/MCP 注册后调用）"""
+        """重新构建 system prompt（技能刷新/MCP reload/profile 更新后调用）。
+
+        A1 前缀稳定化：最新模板只写入 self._pending_system_template，不再立即
+        改写 messages[0]（避免打断 provider prompt 缓存）；AgentLoop 在下一轮
+        begin_run 后原子替换 messages[0] 并清除。
+        """
         self.system_prompt = self._build_system_prompt()
-        if self.messages and self.messages[0].get("role") == "system":
-            self.messages[0]["content"] = self.system_prompt
+        self._pending_system_template = self.system_prompt
 
     # ============================================================
     # MCP 初始化
@@ -714,8 +713,10 @@ class Agent:
         configs = self._mcp_pending_init
         self._mcp_pending_init = None  # 避免重复初始化
 
-        # 在 MCP 专用事件循环中执行异步初始化（长生命周期，跨多次调用复用）
-        run_in_mcp_loop(self._async_init_mcp(configs, MCPClientManager, MCPTool))
+        # 在 MCP 专用事件循环中执行异步初始化（长生命周期，跨多次调用复用）；
+        # P3：传入有限超时（默认 60s），避免初始化挂起拖死首轮 run。
+        run_in_mcp_loop(
+            self._async_init_mcp(configs, MCPClientManager, MCPTool), timeout=60)
 
     async def _async_init_mcp(self, configs, MCPClientManager_cls, MCPTool_cls):
         """异步初始化 MCP 连接（由 _init_mcp_if_needed 调用）"""
@@ -765,11 +766,10 @@ class Agent:
                     )
 
         # 4. 重建 System Prompt 以包含 MCP 工具描述
+        # A1：写入挂起模板（_rebuild_system_prompt），由 AgentLoop 在 turn
+        # 边界原子应用，不立即改写 messages[0]。
         if self._mcp_tool_names or self.tool_registry._mcp_tool_names:
-            self.system_prompt = self._build_system_prompt()
-            # 如果对话已开始（已有 system 消息），更新它
-            if self.messages and self.messages[0].get("role") == "system":
-                self.messages[0]["content"] = self.system_prompt
+            self._rebuild_system_prompt()
             logger.info(
                 f"MCP 初始化完成: {len(self._mcp_tool_names)} 个工具已注册"
             )
@@ -790,7 +790,8 @@ class Agent:
             logger.info("MCP 未初始化，reload 已写入待初始化配置")
             return
         from core.mcp_client import run_in_mcp_loop
-        run_in_mcp_loop(self._async_reload_mcp(configs or []))
+        # P3：reload 同样带有限超时，避免挂在 MCP 事件循环上。
+        run_in_mcp_loop(self._async_reload_mcp(configs or []), timeout=60)
 
     async def _async_reload_mcp(self, configs: list):
         """全量 diff 增删 MCP（MCP 事件循环内执行）"""
@@ -895,99 +896,9 @@ class Agent:
                         logger.warning(f"reconnect 注册工具失败 '{mcp_tool.name}': {e}")
             self._rebuild_system_prompt()
 
-        run_in_mcp_loop(_do_reconnect())
+        # P3：重连带有限超时，避免挂在 MCP 事件循环上。
+        run_in_mcp_loop(_do_reconnect(), timeout=60)
         logger.info("MCP 重连完成: %s", name)
-
-    def add_instruction(self, instruction: str) -> None:
-        """
-
-        向 System Prompt 动态区添加额外指令。
-        参数:
-            instruction: 指令文本，如 "本次对话请使用英文回复"
-        """
-
-        # 获取或创建 builder
-        builder = self.system_prompt_builder or SystemPrompt(name=self.name)
-        builder.add_session_instruction(instruction)
-        self._apply_prompt_roots(builder)
-        tool_descs = self.tool_registry.get_tool_descriptions()
-        new_prompt = builder.build(tool_descs=tool_descs)
-        # 更新消息列表中的 system prompt（如果已在对话中）
-        if self.messages:
-            for msg in self.messages:
-                if msg.get("role") == "system":
-                    msg["content"] = new_prompt
-                    break
-        self.system_prompt = new_prompt
-        self.system_prompt_builder = builder
-
-    # ============================================================
-    # 格式化工具结果
-
-    # ============================================================
-
-    @staticmethod
-
-    def _format_tool_result(tool_name: str, tool_input: str, observation: str) -> str:
-        """用固定模板包装工具返回数据"""
-
-        MAX_LEN = 10000
-        if len(observation) > MAX_LEN:
-            observation = observation[:MAX_LEN] + f"\n……（截断，共 {len(observation)} 字符）"
-        # 输入参数只保留摘要（太长会占上下文，LLM 已知道自己传了什么）
-        INPUT_MAX = 300
-        if len(tool_input) > INPUT_MAX:
-            tool_input = tool_input[:INPUT_MAX] + f"……（共 {len(tool_input)} 字符）"
-        return (
-            f"【工具执行结果】\n"
-            f"工具: {tool_name}\n"
-            f"输入摘要: {tool_input}\n"
-            f"返回结果:\n{observation}\n"
-            f"【工具执行完毕】\n\n"
-            f"（这是工具 '{tool_name}' 返回的数据，请基于此继续。\n"
-            f"信息足够时输出 agent.turn.v1/final JSON 信封；需要更多时输出 "
-            f"agent.turn.v1/tool_calls JSON 信封。）"
-        )
-
-    @staticmethod
-
-    def _combine_results(results: list) -> str:
-        """
-
-        合并多个工具的执行结果为一个消息
-        参数:
-            results: [(tool_name, tool_input, observation, is_error), ...]
-        返回:
-            合并后的格式化文本
-        """
-
-        if len(results) == 1:
-            # 单个工具直接走原有格式
-            name, inp, obs, _ = results[0]
-            return Agent._format_tool_result(name, inp, obs)
-        # 统计
-        ok_count = sum(1 for _, _, _, err in results if not err)
-        fail_count = sum(1 for _, _, _, err in results if err)
-        parts = [f"【批量工具执行结果】共 {len(results)} 个工具"]
-        if ok_count:
-            parts[0] += f"，✅ {ok_count} 个成功"
-        if fail_count:
-            parts[0] += f"，❌ {fail_count} 个失败"
-        parts.append("")
-        for i, (name, inp, obs, is_error) in enumerate(results, 1):
-            MAX_OBS = 5000
-            if len(obs) > MAX_OBS:
-                obs = obs[:MAX_OBS + 100] + f"\n……（截断，共 {len(obs)} 字符）"
-            mark = "❌" if is_error else "✅"
-            parts.append(f"  ─── 工具 {i}/{len(results)}: {mark} {name} ───")
-            parts.append(f"  输入: {inp[:200]}")
-            parts.append(f"  返回:\n{obs}")
-            parts.append("")
-        parts.append("【批量执行完毕】\n\n"
-                     "以上是所有工具的执行结果（✅ 成功 / ❌ 失败），请综合分析后继续。\n"
-                     "信息足够时输出 agent.turn.v1/final JSON 信封；需要更多时输出 "
-                     "agent.turn.v1/tool_calls JSON 信封。")
-        return "\n".join(parts)
 
     # ============================================================
     # 跨会话记忆自动保存
@@ -998,10 +909,15 @@ class Agent:
         """
 
         将本轮对话归档到跨会话记忆（memory/daily/）
-        在每轮对话结束时自动调用，与 self.store.save_session() 并行。
+        在每轮对话结束时自动调用，与统一会话持久化（gateway 侧 SQLite）并行。
         """
 
         if not self.memory:
+            return
+        # B2 记忆降噪：Plan/Goal/scheduler/subagent 是执行 worker 轮，不是
+        # 对话（与 runner 的 background_transcript 同一取向）——整轮不入记忆。
+        if (getattr(self, "_runtime_task_source", "") or ""
+                in {"plan", "goal", "scheduler", "subagent"}):
             return
         try:
             # 只保存不含 system prompt 的消息
@@ -1052,49 +968,48 @@ class Agent:
             return DENY, msg
         return self._gate.check(tool, params, tool_name)
 
-    def _execute_tool(self, tool_name: str, input_str: str = None) -> str:
-        """查找 → 解析参数 → 执行 → 返回"""
-
-        tool = self.tool_registry.get_tool(tool_name)
-        if not tool:
-            avail = ", ".join(t.name for t in self.tool_registry.list_tools())
-            return f"❌ 未知工具 '{tool_name}'。可用: {avail}"
-        kwargs = {}
-        if input_str:
-            try:
-                kwargs = json.loads(input_str)
-            except json.JSONDecodeError as e:
-                return f"❌ 参数不是合法 JSON: {e}\n收到: {input_str}"
-        if not isinstance(kwargs, dict):
-            return "❌ 参数必须是 JSON 对象"
-        validation_errors = self.tool_registry.validate_arguments(tool_name, kwargs)
-        if validation_errors:
-            return "❌ 参数校验失败: " + "; ".join(validation_errors)
-        try:
-            return tool.execute(**kwargs)
-        except TypeError as e:
-            return (
-                f"❌ 参数不匹配: {e}\n"
-                f"工具 '{tool_name}' 需要的参数:\n"
-                f"{json.dumps(tool.parameters, ensure_ascii=False, indent=2)}"
-            )
-        except Exception as e:
-            logger.error(f"工具 '{tool_name}' 执行失败: {e}", exc_info=True)
-            return f"❌ 工具出错: {type(e).__name__}: {e}"
-
     def _emit_event(self, event_type: str, **payload) -> None:
-        """Emit one ordered, typed runtime event to every presentation layer."""
+        """Emit one ordered, typed runtime event to every presentation layer.
+
+        P2：并行工具段（ThreadPoolExecutor 内 _execute_native_tool_call 会经
+        ToolRuntime 触发 tool_execution_start/end）与主循环线程同时调用本方法，
+        seq 自增与 sink 调度必须互斥，否则事件序号乱序/重复、sink 并发写入。
+        """
         sink = getattr(self, "_event_sink", None)
         if sink:
-            try:
-                self._event_seq = getattr(self, "_event_seq", 0) + 1
-                payload.setdefault("run_id", getattr(self, "_run_id", ""))
-                payload.setdefault("turn_id", getattr(self, "_turn_id", ""))
-                payload.setdefault("sequence", self._event_seq)
-                sink({"type": event_type, "data": payload})
-            except Exception:
-                logger.debug("运行事件投递失败", exc_info=True)
+            lock = getattr(self, "_event_lock", None)
+            if lock is not None:
+                with lock:
+                    self._emit_event_locked(event_type, payload, sink)
+            else:
+                self._emit_event_locked(event_type, payload, sink)
 
+    def _emit_event_locked(self, event_type: str, payload: dict, sink) -> None:
+        """在持有 _event_lock 时执行 seq 自增与 sink 投递（单次 try/except）。"""
+        try:
+            # `or 0` 兜底：run 收尾把 _event_seq 置 None 后，跨轮次的零星事件
+            # 仍能安全自增，而不是 None + 1 报错被静默丢弃。
+            self._event_seq = (getattr(self, "_event_seq", 0) or 0) + 1
+            payload.setdefault("runtime_source", getattr(self, "_runtime_task_source", ""))
+            payload.setdefault("plan_id", getattr(self, "_runtime_plan_id", ""))
+            payload.setdefault("plan_task_id", getattr(self, "_runtime_plan_task_id", ""))
+            payload.setdefault("goal_id", getattr(self, "_runtime_goal_id", ""))
+            payload.setdefault("sequence", self._event_seq)
+            sink({"type": event_type, "data": payload})
+        except Exception:
+            logger.debug("运行事件投递失败", exc_info=True)
+
+
+    @staticmethod
+    def _runtime_failure_text(exc: Exception) -> str:
+        """Return a concise, stable error without pretending the step succeeded."""
+        text = str(exc)
+        lowered = text.lower()
+        if "insufficient_quota" in lowered or "allocated quota exceeded" in lowered:
+            return "❌ LLM 调用失败：模型配额不足（insufficient_quota），本步骤未完成。"
+        if "429" in lowered or "rate limit" in lowered:
+            return "❌ LLM 调用失败：请求频率或配额受限，本步骤未完成。"
+        return f"❌ LLM 调用失败：{type(exc).__name__}: {text}"
     # ============================================================
     # 核心运行方法
 
@@ -1106,30 +1021,51 @@ class Agent:
 
     def run(self, user_input: str, verbose: bool = True,
             images: list | None = None, event_sink=None) -> str:
+        """Compatibility entry point delegated to the single AgentLoop."""
+        from core.agent_runtime.loop import AgentLoop
+        return AgentLoop(self).run(user_input, images=images, event_sink=event_sink).visible_text
+
+    def _run_native_loop(self, user_input: str, verbose: bool = True,
+            images: list | None = None, event_sink=None) -> str:
         """Run the native, typed tool-call loop.
 
         Tools are never parsed from model text.  The provider yields native
         function calls; this loop validates, authorizes, executes and records
         them as separate assistant/tool messages, mirroring Pi's agent loop.
         """
+        # AgentLoop owns control/persistence/providers. This method only hosts
+        # transitional transcript mutation while remaining loop logic migrates.
         self._event_sink = event_sink
         self._run_id = uuid.uuid4().hex
         self._event_seq = 0
         if not hasattr(self, "_tool_runtime"):
-            self._tool_runtime = ToolRuntime(max_result_chars=10000)
+            # 兼容兜底分支：create_agent 已预建 _tool_runtime（见文件尾部），
+            # 正式路径不会进入；直接构造 Agent 的测试/脚本仍依赖此惰性初始化，
+            # 因此保留分支而非删除。P3-2：原实现引用裸名 _config（应为
+            # self._config），NameError 被下方 except 吞掉，导致
+            # max_parallel_tools 配置被静默忽略——改为显式 getattr 取值。
+            try:
+                _cfg = getattr(self, "_config", None) or {}
+                _mpt = max(1, int(_cfg.get("agent_runtime", {}).get("max_parallel_tools", 4)))
+            except Exception:
+                _mpt = 4
+            self._tool_runtime = ToolRuntime(max_result_chars=10000,
+                                             executor_max_workers=_mpt)
         if not hasattr(self, "hooks"):
             self.hooks = HookManager(enabled=False)
-        if not hasattr(self, "_task_list"):
-            self._task_list = None
-        if not hasattr(self, "_stop_block_count"):
-            self._stop_block_count = 0
         self._init_mcp_if_needed()
+        # P2-9：若上一轮运行期挂起了模型切换，本轮开始时原子应用，避免与本轮共享状态并发。
+        self._consume_pending_llm()
         if not self.messages:
             self.messages.append({"role": "system", "content": self.system_prompt})
         self._light_compress()
         self._check_context(verbose=verbose)
         hr = self.hooks.run_user_prompt(user_input)
         if hr.decision == Decision.BLOCK:
+            # P2：BLOCK 路径完整收口——先发唯一 agent_end 并复位 _last_run_reason
+            # 为 blocked，避免外层 AgentLoop 因 reason 缺失把拦截轮误报为
+            # completed/error；随后才返回拦截文案。
+            self._active_loop.finish("blocked")
             return f"⛔ 输入被 hook 拦截: {hr.reason}"
         if hr.decision == Decision.MODIFY and hr.data:
             user_input = hr.data.get("prompt", user_input)
@@ -1137,6 +1073,13 @@ class Agent:
         if images:
             blocks = ([{"type": "text", "text": user_input}] if user_input else []) + list(images)
             user_message["content"] = blocks
+        # B1 记忆降噪：runtime 注入的任务协议文本（Plan step / Goal 轮 /
+        # scheduler 触发 / subagent 委派）打 internal 标记——记忆序列化会
+        # 跳过 internal 消息，不让执行协议污染 BM25 语料（dispatcher 注入
+        # 的运行状态提示同理，见 _runtime_status_note 前置拼接路径）。
+        if (getattr(self, "_runtime_task_source", "") or ""
+                in {"plan", "goal", "scheduler", "subagent"}):
+            user_message["internal"] = True
         self.messages.append(user_message)
         self._truncate_history()
         self._emit_event("agent_start", message_id="user")
@@ -1144,99 +1087,103 @@ class Agent:
         self._emit_event("message_end", role="user")
         provider_tools, name_map = self.tool_registry.get_provider_tools()
 
-        for step in range(1, self.max_steps + 1):
+        # 会话不限制最大步骤数：循环按需推进，直到模型返回终答、被停止
+        # （外部 CancellationToken）或被取消；真正无限循环由 RunControl 的
+        # max_tool_calls 与运行超时兜底。不再用 max_steps 硬性截断。
+        for step in itertools.count(1):
+            self._active_loop.next_turn(step)
             if self._consume_stop():
-                self.store.save_session()
-                self._emit_event("agent_end", reason="stopped")
+                self._active_loop.finish("stopped")
+                # 持久化退役：文件转录停写后无落盘动作（gateway 以 SQLite
+                # 统一会话为权威；独立 Agent 明确不持久化，见 create_agent 文档）
                 return "⏹️ 已停止"
-            self._turn_id = f"turn_{step}"
-            self._emit_event("turn_start", step=step)
+            self._emit_event("turn_start", step=step, turn_id=getattr(self, "_turn_id", ""))
+            # Full compression is a pre-provider check. Never invoke the
+            # summary LLM immediately after a tool batch has been appended.
+            self._check_context(verbose=verbose)
+            self._truncate_history()
             assistant_id = uuid.uuid4().hex
             self._emit_event("message_start", message_id=assistant_id, role="assistant")
             try:
-                cfg = getattr(self, "_config", None) or load_config()
-                native_stream = is_enabled(
-                    cfg.get("agent_runtime", {}).get("native_tool_streaming"), True)
-                if native_stream:
-                    response = self.llm.stream_with_tools(
-                        self.messages, provider_tools, temperature=0,
-                        on_event=lambda event: self._forward_provider_event(assistant_id, event),
-                    )
-                else:
-                    response = self.llm.complete(self.messages, tools=provider_tools, temperature=0)
-                    for call in response.tool_calls:
-                        self._forward_provider_event(assistant_id, {
-                            "type": "tool_call_start", "call_id": call.call_id,
-                            "name": call.name, "order": call.order,
-                        })
-                        self._forward_provider_event(assistant_id, {
-                            "type": "tool_call_end", "call_id": call.call_id,
-                            "name": call.name, "arguments": call.arguments, "order": call.order,
-                        })
-                    if response.text:
-                        self._forward_provider_event(assistant_id,
-                                                     {"type": "text_delta", "text": response.text})
+                llm_messages = AgentContext(self.messages).llm_messages()
+                response = self._provider_turn.complete(llm_messages, provider_tools, assistant_id)
             except Exception as exc:
                 logger.error("原生工具调用失败: %s", exc, exc_info=True)
                 self._emit_event("message_end", message_id=assistant_id, status="error")
-                self._emit_event("agent_end", reason="error")
-                return f"❌ LLM 调用失败: {exc}"
+                # 错误分支收口（P1）：先发唯一 agent_end 再返回错误文本；
+                # 不会因收尾异常跳过 finish 或丢失返回值。（持久化已退役：
+                # 历史上的"错误分支落盘防重启丢输入"随文件转录停写一并移除。）
+                self._active_loop.finish("error")
+                return self._runtime_failure_text(exc)
             self.store.set_anchor(self.llm.last_usage)
+            # P2：累计 token 预算（若有 max_total_tokens 配置）——每轮 provider
+            # 调用后累加 last_usage，超限由 RunControl.checkpoint 抛 BudgetExceeded。
+            try:
+                self._run_control.add_tokens(self.llm.last_usage)
+            except Exception as exc:
+                logger.debug("累计 token 预算失败（可忽略）: %s", exc)
 
             if not response.tool_calls:
-                answer = normalize_model_text(response.text)
+                answer = normalize_model_text(response.text) or "（模型未返回可见文本）"
                 self.messages.append({"role": "assistant", "content": answer, "kind": "final"})
                 self._emit_event("message_end", message_id=assistant_id, role="assistant",
                                  content=answer, finish_reason=response.finish_reason)
                 self._emit_event("turn_end", step=step, tool_calls=0)
-                self._emit_event("agent_end", reason="completed")
-                self.store.save_session()
+                # 成功收尾保护（P1）：finish("completed") 提前到压缩/落盘之前，
+                # 确保成功轮次只发一次 agent_end；压缩与持久化包 try/except，
+                # 后置步骤异常不得吞掉终答——本轮必返回 answer。
+                self._active_loop.finish("completed")
+                try:
+                    # 最终回复轮次也要轻压缩：这轮工具结果带完整内容若直接持久化，
+                    # 会浪费体积并抬高下次 run 首步 token 峰值。
+                    self._light_compress()
+                except (TaskCancelled, BudgetExceeded):
+                    raise  # 取消/预算超限不能吞，交由 AgentLoop 收口
+                except Exception as exc:
+                    logger.error("最终轮轻量压缩失败: %s", exc, exc_info=True)
                 self._save_memory(user_input)
-                return answer or "（模型未返回可见文本）"
+                return answer
 
-            native_calls = []
-            for call in sorted(response.tool_calls, key=lambda item: item.order):
-                call_id = call.call_id or uuid.uuid4().hex
-                internal_name = name_map.get(call.name)
-                if internal_name is None and self.tool_registry.get_tool(call.name):
-                    internal_name = call.name
-                native_calls.append((call_id, call.name, internal_name, call.arguments, call.raw_arguments))
+            batch = ToolBatchExecutor(self)
+            native_calls = batch.prepare(response.tool_calls, name_map)
             self.messages.append({
                 "role": "assistant", "content": response.text or None, "kind": "tool_calls",
-                "tool_calls": [{"id": call_id, "type": "function", "function": {
-                    "name": provider_name, "arguments": raw_arguments or "{}"}}
-                    for call_id, provider_name, _, _, raw_arguments in native_calls],
+                "tool_calls": [{"id": call.call_id, "type": "function", "function": {
+                    "name": sanitize_message_name(call.provider_name),
+                    "arguments": call.raw_arguments or "{}"}}
+                    for call in native_calls],
             })
             self._emit_event("message_end", message_id=assistant_id, role="assistant",
                              finish_reason="tool_calls")
 
             result_count = 0
-            for call_id, provider_name, tool_name, arguments, raw_arguments in native_calls:
-                observation, is_error = self._execute_native_tool_call(
-                    call_id, provider_name, tool_name, arguments, raw_arguments)
-                self.messages.append({"role": "tool", "tool_call_id": call_id,
-                                      "name": provider_name, "content": observation,
+            for call, observation, is_error in batch.execute(native_calls):
+                self.messages.append({"role": "tool", "tool_call_id": call.call_id,
+                                      "name": sanitize_message_name(call.provider_name),
+                                      "content": observation,
                                       "kind": "tool_result", "is_error": is_error})
-                self._emit_event("message_start", message_id=f"result_{call_id}", role="tool",
-                                 tool_call_id=call_id, tool=tool_name or provider_name)
-                self._emit_event("message_end", message_id=f"result_{call_id}", role="tool",
-                                 tool_call_id=call_id, tool=tool_name or provider_name,
+                self._emit_event("message_start", message_id=f"result_{call.call_id}", role="tool",
+                                 tool_call_id=call.call_id, tool=call.tool_name or call.provider_name)
+                self._emit_event("message_end", message_id=f"result_{call.call_id}", role="tool",
+                                 tool_call_id=call.call_id, tool=call.tool_name or call.provider_name,
                                  content=observation, is_error=is_error)
                 result_count += 1
+            self._run_control.add_tool_calls(result_count)
+            # P1-5：工具边界取消检查点。若外部 CancellationToken 已取消则抛
+            # TaskCancelled，交由 AgentLoop.run 收口为 CANCELLED，而非继续下一轮。
+            self._run_control.checkpoint()
             self._emit_event("turn_end", step=step, tool_calls=result_count)
             self._light_compress()
-            self._check_context(verbose=False)
-            self._truncate_history()
-
-        self.store.save_session()
-        self._emit_event("agent_end", reason="max_steps")
-        return f"⚠️ 已达最大步骤数 {self.max_steps}"
 
     def _forward_provider_event(self, assistant_id: str, event: dict) -> None:
         """Project provider-native events into the stable Agent event schema."""
         event_type = event.get("type")
         if event_type == "text_delta":
             self._emit_event("text_delta", message_id=assistant_id, text=normalize_model_text(event.get("text", "")))
+        elif event_type in {"reasoning_delta", "reasoning", "thinking", "thought"}:
+            text = event.get("text") or event.get("delta") or event.get("reasoning") or event.get("thinking") or event.get("thought") or ""
+            if text:
+                self._emit_event("reasoning_delta", message_id=assistant_id, turn_id=getattr(self, "_turn_id", ""), text=str(text))
         elif event_type == "tool_call_start":
             self._emit_event("tool_call_start", message_id=assistant_id,
                              tool_call_id=event.get("call_id", ""), tool=event.get("name", ""),
@@ -1255,407 +1202,42 @@ class Agent:
         return self._tool_runtime.execute_native_call(
             self, call_id, provider_name, tool_name, arguments, raw_arguments)
 
-    def _run_task_list(self, user_input, max_steps, verbose):
-        """Phase 2: 任务清单模式 —— 框架主动推进，逐任务执行"""
-        # plan 模式：自动信任工作区，区内操作免确认，区外仍需审批
-        self.permission.allow_workspace()
-        while not self._task_list.is_all_done():
-            if self._consume_stop():
-                self.store.save_session()
-                return "⏹ 已停止（任务清单中断）"
-            current = self._task_list.get_current()
-            if not current:
-                break
-            task_prompt = (
-                f"## 请执行任务 {current.id}/{self._task_list.total}：{current.description}\n"
-                f"执行此任务，完成后只输出 agent.turn.v1/final JSON 信封。"
-            )
-            self.messages.append({"role": "user", "content": task_prompt})
-            if verbose:
-                print(f"\n  📋 任务 {current.id}/{self._task_list.total}: {current.description}")
-
-            task_done = False
-            # plan 模式子任务步数不应受默认 max_steps 限制，至少 200 步
-            task_max_steps = max(max_steps, 200)
-            for t_step in range(1, task_max_steps + 1):
-                if verbose:
-                    print(f"\n  ─── 任务 {current.id} 第 {t_step}/{task_max_steps} 步 ───")
-                try:
-                    response = self.llm.think(self.messages, temperature=0)
-                except Exception as e:
-                    logger.error(f"LLM 调用失败: {e}", exc_info=True)
-                    return f"❌ LLM 调用失败: {e}"
-                self.store.set_anchor(self.llm.last_usage)
-                if not response:
-                    return "❌ LLM 调用失败"
-                log_llm_response(t_step, response)
-                if verbose:
-                    m = _THOUGHT_RE.search(response)
-                    if m:
-                        print(f"  💭 {m.group(1).strip()[:200]}")
-                parsed = parse_react_response(response)
-                acts = parsed.get("actions", [])
-                # COMPLETE_TASK
-                cm = re.search(r"COMPLETE_TASK[：:]\s*(\d+)\s*(.*)", response, re.IGNORECASE)
-                if cm and self._task_list:
-                    tid, res = int(cm.group(1)), cm.group(2).strip()
-                    self._task_list.mark_done(tid, res)
-                    task_done = True
-                    if verbose:
-                        print(f"  ✅ 任务 {tid}/{self._task_list.total} 完成{(' → ' + res) if res else ''}")
-                    break
-                # FINAL_ANSWER
-                if parsed["final_answer"] and not acts:
-                    self.messages.append({"role": "assistant", "content": parsed["final_answer"]})
-                    if verbose:
-                        print(f"  ✅ {parsed['final_answer']}")
-                    self._task_list.mark_done(current.id, parsed["final_answer"][:200])
-                    task_done = True
-                    if verbose:
-                        print(f"  ✅ 任务 {current.id}/{self._task_list.total} 完成")
-                    break
-                # ACTIONS
-                if acts:
-                    if verbose:
-                        names = [a["name"] for a in acts]
-                        print(f"  🛠️  {TAG_ACTION}({len(acts)}): {', '.join(names)}")
-                    self.messages.append({"role": "assistant", "content": response})
-                    # 权限检查（plan 模式：区内自动放行，区外需确认）
-                    checked_acts = []
-                    denied_acts = []
-                    for a in acts:
-                        tool_name = a["name"]
-                        input_str = a["input"]
-                        try:
-                            params = json.loads(input_str) if input_str else {}
-                        except json.JSONDecodeError:
-                            params = {}
-                        if not isinstance(params, dict):
-                            reason = f"INPUT 必须是 JSON 对象，但收到了 JSON {type(params).__name__}。"
-                            denied_acts.append((tool_name, input_str, reason))
-                            continue
-                        level, gate_reason = self._gate_check(tool_name, params)
-                        if level == ALLOW:
-                            checked_acts.append(a)
-                        elif level == DENY:
-                            reason = gate_reason or "权限不足，操作已被系统拒绝"
-                            denied_acts.append((tool_name, input_str, reason))
-                            if verbose:
-                                print(f"  ⛔ {tool_name}: {reason}")
-                        elif level == ASK:
-                            choice = self._ask_user(tool_name, params)
-                            if choice == "a":
-                                self.permission.allow_workspace()
-                                checked_acts.append(a)
-                            elif choice in ("", "y", "yes"):
-                                checked_acts.append(a)
-                            elif choice == "s":
-                                denied_acts.append((tool_name, input_str, "用户选择跳过"))
-                            else:
-                                return f"操作已取消：用户拒绝了 {tool_name}，对话已终止。"
-                    t_results = []
-                    if checked_acts:
-                        with ThreadPoolExecutor(max_workers=min(len(checked_acts), 5)) as pool:
-                            tfm = {pool.submit(self._execute_tool, a["name"], a["input"]): a for a in checked_acts}
-                            for f in as_completed(tfm):
-                                a = tfm[f]
-                                try:
-                                    obs = f.result()
-                                except Exception as e:
-                                    obs = f"❌ 异常: {e}"
-                                t_results.append((a["name"], a["input"], obs, obs.startswith("❌")))
-                    for tool_name, input_str, reason in denied_acts:
-                        t_results.append((tool_name, input_str, f"⏭️ 跳过: {reason}", True))
-                    combined = self._combine_results(t_results)
-                    self.messages.append({
-                        "role": "user", "name": "tool_result",
-                        "content": _build_tool_result_content(combined),
-                    })
-                    # 上下文管理（与 Phase 1 保持一致）
-                    self._light_compress()
-                    self._check_context(verbose=verbose)
-                    self._truncate_history()
-                    continue
-                # ELSE
-                answer = response.strip()
-                self.messages.append({"role": "assistant", "content": answer})
-                if verbose:
-                    print(f"  💬 {answer}")
-                self._task_list.mark_done(current.id, answer[:200])
-                task_done = True
-                break
-            if not task_done:
-                # 子任务超步数：标记失败，继续执行下一个任务
-                fail_reason = f"已达最大步数（{task_max_steps} 步），任务未完成"
-                self._task_list.mark_done(current.id, fail_reason)
-                if verbose:
-                    print(f"  ⚠️  任务 {current.id}/{self._task_list.total} {fail_reason}")
-            self._update_task_list_in_prompt()
-            self.store.save_session()
-        # 全部完成
-        self._update_task_list_in_prompt()
-        self.store.save_session()
-        if self._task_list.is_all_done():
-            total = self._task_list.total
-            summary_lines = [f"🎉 全部 {total} 个任务完成！"]
-            summary_lines.append("")
-            summary_lines.append(self._task_list.to_summary())
-            self._task_list = None
-            self._update_task_list_in_prompt()
-            self.store.save_session()
-            self._save_memory(user_input)
-            summary = "\n".join(summary_lines)
-            if verbose:
-                print(f"\n  {summary}")
-            return summary
-        self._save_memory(user_input)
-        return f"⚠️ 任务执行中断"
-
-    # ============================================================
-    # 流式运行
-    # ============================================================
-
-    def run_events(self, user_input: str, images: list | None = None):
-        """Run the canonical Agent loop in a worker and yield runtime events."""
-        events: queue.Queue = queue.Queue()
-
-        def sink(event):
-            events.put(event)
-
-        def worker():
-            try:
-                answer = self.run(user_input, verbose=False, images=images,
-                                  event_sink=sink)
-                events.put({"type": "final", "data": {"answer": answer}})
-            except Exception as exc:
-                logger.exception("流式运行失败")
-                events.put({"type": "error", "data": {"message": str(exc)}})
-            finally:
-                events.put(None)
-
-        threading.Thread(target=worker, name="agent-stream", daemon=True).start()
-        while True:
-            event = events.get()
-            if event is None:
-                return
-            yield event
-
-    def stream_run(self, user_input: str, images: list | None = None):
-        """Backward-compatible text view over the canonical Agent loop."""
-        visible_text_emitted = False
-        for event in self.run_events(user_input, images=images):
-            event_type = event["type"]
-            data = event["data"]
-            if event_type == "text_delta":
-                visible_text_emitted = True
-                yield data.get("text", "")
-            elif event_type == "text_reset":
-                yield "\n"
-            elif event_type in {"tool_result", "tool_execution_end"}:
-                yield f"\n{data.get('result', '')}\n"
-            elif event_type == "final":
-                if not visible_text_emitted:
-                    yield data.get("answer", "")
-            elif event_type == "error":
-                yield f"❌ {data.get('message', '流式运行失败')}"
-        return
-        """逐步输出 Agent 的思考过程"""
-
-        max_steps = self.max_steps
-        if not self.messages:
-            self.messages.append({"role": "system", "content": self.system_prompt})
-        # plan 模式：自动信任工作区，区内操作免确认，区外仍需审批
-        self.permission.allow_workspace()
-        self._light_compress()
-        self._check_context(verbose=False)
-        self.messages.append({"role": "user", "content": user_input})
-        self._truncate_history()
-        yield f"🤖 {self.name}（最大 {max_steps} 步）\n"
-        for step in range(1, max_steps + 1):
-            yield f"\n── 第 {step}/{max_steps} 步 ──\n"
-            try:
-                response = self.llm.think(self.messages, temperature=0)
-            except Exception as e:
-                logger.error(f"LLM 调用失败: {e}", exc_info=True)
-                yield f"❌ LLM 调用失败: {e}\n"
-                return
-            self.store.set_anchor(self.llm.last_usage)
-            if not response:
-                yield "❌ LLM 调用失败\n"
-                return
-            parsed = parse_react_response(response)
-            if parsed["thought"]:
-                yield f"💭 {parsed['thought']}\n"
-            actions = parsed.get("actions", [])
-            if parsed["final_answer"] and not actions:
-                self.messages.append({"role": "assistant", "content": parsed["final_answer"]})
-                self.store.save_session()
-                self._save_memory(user_input)
-                yield f"\n✅ {parsed['final_answer']}\n"
-                return
-            if actions:
-                self._emit_event("text_reset", reason="tool_calls")
-                # Keep streaming compatible while executing every structured
-                # call in this turn.  The former implementation silently
-                # ignored actions[1:], causing tool loops to stall.
-                results = []
-                for order, action in enumerate(actions):
-                    tool_name = action["name"]
-                    input_str = action.get("input", "{}")
-                    try:
-                        params = json.loads(input_str)
-                    except (TypeError, json.JSONDecodeError) as exc:
-                        observation = f"❌ 协议错误：工具参数不是合法 JSON 对象: {exc}"
-                        results.append((tool_name, input_str, observation, True))
-                        yield f"📊 {observation}\n"
-                        continue
-                    if not isinstance(params, dict):
-                        observation = "❌ 协议错误：工具参数必须是 JSON 对象"
-                        results.append((tool_name, input_str, observation, True))
-                        yield f"📊 {observation}\n"
-                        continue
-                    errors = self.tool_registry.validate_arguments(tool_name, params)
-                    if errors:
-                        observation = "❌ 参数校验失败: " + "; ".join(errors)
-                        results.append((tool_name, input_str, observation, True))
-                        yield f"📊 {observation}\n"
-                        continue
-                    level, gate_reason = self._gate_check(tool_name, params)
-                    if level == DENY:
-                        observation = f"⏭️ 跳过: {gate_reason or '权限不足，操作已被系统拒绝'}"
-                    elif level == ASK:
-                        observation = "⏭️ 跳过: 工作区外操作需在交互模式下确认"
-                    else:
-                        yield f"🛠️  {TAG_ACTION}[{order + 1}/{len(actions)}]: {tool_name}\n"
-                        try:
-                            observation = self._execute_tool(tool_name, input_str)
-                        except Exception as e:
-                            logger.error(f"工具执行失败: {e}", exc_info=True)
-                            observation = f"❌ 工具执行失败: {type(e).__name__}: {e}"
-                    is_error = observation.startswith(("❌", "⏭️", "⛔"))
-                    results.append((tool_name, input_str, observation, is_error))
-                    yield f"📊 {observation[:500]}\n"
-                for _tname, _input_str, _obs, _is_err in results:
-                    self._emit_event("tool_result", tool=_tname,
-                                     result=_obs, is_error=_is_err)
-                self.messages.append({"role": "assistant", "content": response,
-                                      "kind": "tool_calls"})
-                self.messages.append({
-                    "role": "user",
-                    "name": "tool_result",
-                    "content": _build_tool_result_content(self._combine_results(results)),
-                })
-                self._light_compress()
-                self._check_context(verbose=False)
-                self._truncate_history()
-            else:
-                answer = response.strip()
-                self.messages.append({"role": "assistant", "content": answer})
-                self.store.save_session()
-                self._save_memory(user_input)
-                yield f"💬 {answer}\n"
-                return
-        self.store.save_session()
-        self._save_memory(user_input)
-        yield f"\n⚠️ 已达最大步数 {max_steps}\n"
-
-
     def generate_plan(self, user_input: str) -> dict:
-        """Ask the provider for a typed plan using one native tool call."""
-        from core.plan import PlanStatus
-        plan_tool = {
-            "type": "function",
-            "function": {
-                "name": "submit_plan",
-                "description": "Submit an ordered execution plan without performing work.",
-                "parameters": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "steps": {"type": "array", "minItems": 1,
-                                  "items": {"type": "object", "additionalProperties": False,
-                                            "properties": {"description": {"type": "string"}},
-                                            "required": ["description"]}},
-                    },
-                    "required": ["steps"],
-                },
-            },
-        }
-        messages = [{"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": user_input}]
-        response = self.llm.complete(messages, tools=[plan_tool], temperature=0)
-        calls = getattr(response, "tool_calls", None) or []
-        call = next((item for item in calls if item.name == "submit_plan"), None)
-        if call is None or not isinstance(call.arguments, dict):
-            raise ValueError("plan generation failed: model did not return submit_plan")
-        steps = call.arguments.get("steps")
-        if not isinstance(steps, list) or not steps:
-            raise ValueError("plan generation failed: steps is empty")
-        return {"steps": steps}
+        """Generate a typed plan without provider-forced tool_choice.
 
-    def execute_plan(self, plan: dict, source_prompt: str = "", *, verbose: bool = True) -> str:
-        """Execute a typed plan through the durable local runtime."""
-        import asyncio
-        from core.plan import PlanManager, PlanStatus
-        from core.runtime import RuntimeStore, TaskEnvelope, TaskResult, TaskStatus, TaskRuntime
-        runtime_store = RuntimeStore(_configured_runtime_store_path())
-        manager = PlanManager(runtime_store)
-        session_id = f"cli:{self.store.session_id}"
-        title = source_prompt[:120] or "CLI Plan"
-        persisted = manager.create_preview(session_id, plan, source_prompt=source_prompt, title=title)
-        manager.approve(persisted.plan_id, actor="cli")
-        manager.activate(persisted.plan_id)
-        self.permission.allow_workspace()
-
-        async def execute_task(envelope, token):
-            token.checkpoint()
-            task = manager.get(envelope.metadata["plan_task_id"])
-            prompt = envelope.prompt
-            try:
-                output = self.run(prompt, verbose=False)
-                token.checkpoint()
-                return TaskResult(task_id=envelope.task_id, status=TaskStatus.COMPLETED,
-                                  visible_text=output, summary=output[:1000])
-            except Exception as exc:
-                return TaskResult(task_id=envelope.task_id, status=TaskStatus.FAILED,
-                                  summary=str(exc), error_message=str(exc))
-
-        async def run_all():
-            runtime = TaskRuntime(runtime_store, execute_task, max_global_concurrency=1,
-                                  worker_id="cli", max_attempts=1)
-            await runtime.start()
-            try:
-                while True:
-                    current = manager.get(persisted.plan_id)
-                    ready = manager.ready_tasks(persisted.plan_id)
-                    if not ready:
-                        if current.status in PlanStatus.terminal():
-                            break
-                        await asyncio.sleep(0)
-                        continue
-                    for item in ready:
-                        envelope = TaskEnvelope.create(
-                            session_id=session_id, session_key=session_id, source="plan",
-                            prompt=item.description, priority=50,
-                            timeout_seconds=60, max_steps=self.max_steps,
-                            metadata={"plan_task_id": item.plan_task_id},
-                        )
-                        manager.assign_task(persisted.plan_id, item.plan_task_id, envelope.task_id)
-                        manager.start_task(persisted.plan_id, item.plan_task_id)
-                        await runtime.submit(envelope)
-                        result = await runtime.wait(envelope.task_id)
-                        manager.finish_task(persisted.plan_id, item.plan_task_id,
-                                            success=result.status is TaskStatus.COMPLETED,
-                                            summary=(result.summary or result.visible_text or result.error_message))
-            finally:
-                await runtime.stop()
-            return manager.get(persisted.plan_id)
-
-        final = asyncio.run(run_all())
-        completed = sum(1 for item in final.tasks if item.status.value == "completed")
-        if final.status is PlanStatus.COMPLETED:
-            return f"Plan \u5df2\u5b8c\u6210: {completed}/{len(final.tasks)} (ID: {final.plan_id})"
-        return f"Plan status={final.status.value}, completed={completed}/{len(final.tasks)} (ID: {final.plan_id})"
+        Thinking endpoints commonly reject named function tool_choice. Planning is
+        a normal, read-only model request; the runtime validates returned JSON.
+        """
+        instruction = (
+            "你现在只负责为下面任务生成执行方案。不要执行任何操作。"
+            "仅返回 JSON 对象，格式为 {\"steps\":[{\"description\":\"步骤\"}]}。"
+            "步骤必须有序、具体、可验证，不要返回 Markdown 或额外文字。"
+        )
+        response = self.llm.complete(
+            [{"role": "system", "content": self.system_prompt + "\n\n" + instruction},
+             {"role": "user", "content": user_input}], temperature=0)
+        raw_text = (getattr(response, "text", "") or "").strip()
+        if raw_text.startswith("```"):
+            raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.I | re.S).strip()
+        parsed = None
+        try:
+            parsed = json.loads(raw_text)
+        except (TypeError, json.JSONDecodeError):
+            # P3：回退改为整体匹配第一个 JSON 对象（greedy "{" 到最后一个 "}"，
+            # DOTALL），容忍模型在代码块外夹带文字/嵌套花括号；解析仍容错。
+            match = re.search(r"\{.*\}", raw_text, flags=re.S)
+            if match:
+                try:
+                    parsed = json.loads(match.group(0))
+                except (TypeError, json.JSONDecodeError):
+                    parsed = None
+        steps = parsed.get("steps") if isinstance(parsed, dict) else None
+        if isinstance(steps, list):
+            valid = [{"description": str(item.get("description", "")).strip()}
+                     for item in steps if isinstance(item, dict) and str(item.get("description", "")).strip()]
+            if valid:
+                return {"steps": valid}
+        raise ValueError("方案生成失败：模型未返回有效 JSON steps")
 
 # ============================================================
 # MCP 配置加载
@@ -1697,6 +1279,31 @@ def _load_mcp_config(mcp_servers: list = None) -> list:
 
 # ============================================================
 
+# L6#9-part：进程内一次性日志初始化守卫。debug.setup_logging 现已自带
+# once-guard（幂等）；此处双检锁作为纵深防御，确保 WebUI 每会话懒创建
+# Agent 反复走 create_agent 时也绝无 handler 丢失/重复输出竞态。
+_LOGGING_SETUP_LOCK = threading.Lock()
+_LOGGING_SETUP_DONE = False
+
+
+def _init_logging_once(debug: bool = False) -> None:
+    """进程内一次性初始化 jk_agent 日志（L6#9-part）。
+
+    create_agent 不再清空重建 jk_agent handlers：首次调用执行
+    setup_logging（含 debug 档 set_debug），后续重复调用直接返回。
+    debug.py 内部如需微调属他组范围，这里仅在 agent.py 侧加 once-guard。
+    """
+    global _LOGGING_SETUP_DONE
+    if _LOGGING_SETUP_DONE:
+        return
+    with _LOGGING_SETUP_LOCK:
+        if _LOGGING_SETUP_DONE:
+            return
+        setup_logging(debug=debug)
+        if debug:
+            set_debug(True)
+        _LOGGING_SETUP_DONE = True
+
 
 def create_agent(
     name: str = "JKagent",
@@ -1735,7 +1342,7 @@ def create_agent(
         api_key: API 密钥
         base_url: API 地址
         provider: 服务商（ollama/openai/lmstudio）
-        max_steps: 最大 ReAct 步数
+        max_steps: 最大 AgentLoop 步数
         max_history_tokens: 上下文预算阈值
         debug: 调试模式
         permission: 权限管理
@@ -1746,9 +1353,8 @@ def create_agent(
         mcp_servers: MCP 服务器配置列表，每项含 name/transport/command 等
     """
 
-    setup_logging(debug=debug)
-    if debug:
-        set_debug(True)
+    # L6#9-part：进程内一次性初始化（重复 create_agent 不再清空重建 handlers）。
+    _init_logging_once(debug)
     from core.config_loader import load_config as _lc
     from core.config_loader import _find_project_root
     # Take one config snapshot before changing anything.  The snapshot is
@@ -1800,8 +1406,17 @@ def create_agent(
     skill_manager = SkillManager() if skills else None
     if skill_manager:
         skill_manager.load_all()
-    # 沙箱执行器（L2 内容拦截 + 资源隔离）——显式工作目录
-    sandbox_executor = SandboxExecutor(workspace=_working_directory) if sandbox else None
+    # Ensure config-backed hard L2 rules are loaded for every Agent instance,
+    # including sessions that change permission mode at runtime.
+    try:
+        from core.sandbox.guard import apply_guard_config
+        apply_guard_config(_config.get("sandbox", {}))
+    except Exception:
+        logger.debug("无法加载 sandbox 配置", exc_info=True)
+    sandbox_executor = SandboxExecutor(
+        workspace=_working_directory,
+        extra_workspace_roots=_extra_workspace_roots,
+    ) if sandbox else None
     # 权限管理——显式 project_root + 显式 extra roots（工作区模式空列表不回退全局）
     checker = PermissionChecker(
         workspace=_project_root,
@@ -1819,11 +1434,34 @@ def create_agent(
     # 长驻子进程管理器（依赖沙箱的 max_output/idle 配置）
     process_manager = None
     if sandbox_executor and checker:
-        process_manager = ProcessManager(sandbox_executor, _working_directory)
+        # 四档权限感知 cwd 边界：注入同一 checker，ask/allow/unreviewed 下
+        # proc_start 界外 cwd 交还授权层裁决（确认后可达），readonly/无权限
+        # 直调路径保持硬拒绝
+        process_manager = ProcessManager(sandbox_executor, _working_directory,
+                                         permission=checker)
     registry = ToolRegistry()
+    # P0-3：读路径工作区边界——显式注入允许根（工作目录 + 项目根 + 额外工作区），
+    # 未注入时工具层不拦截，这里必须传入以保证主链路边界生效。
+    _boundary_roots = [_working_directory, _project_root]
+    if _extra_workspace_roots:
+        _boundary_roots.extend(
+            str(Path(p).expanduser().resolve()) for p in _extra_workspace_roots
+        )
+    # P1 安全：图片 file 源白名单与工具读路径边界同源（同一 _boundary_roots）
+    from core.protocols.vision import set_allowed_image_roots, set_vision_permission
+    set_allowed_image_roots(_boundary_roots)
+    # 四档权限感知：ask/allow/unreviewed 下图片白名单交还裁决（与工具读写
+    # 边界的对齐方向一致），readonly/无权限直调路径保持白名单
+    set_vision_permission(checker)
     register_all_tools(
         registry, memory_manager=memory_manager,
         sandbox=sandbox_executor, process_manager=process_manager,
+        workspace_roots=_boundary_roots,
+        # 四档权限感知写边界：ask/allow/unreviewed 模式下写边界交还
+        # PolicyEngine 裁决（界外写按档位 ASK/放行，确认后的执行必须可达）；
+        # readonly 与未注入权限的直调路径保持硬边界。工具持有同一 checker
+        # 引用，/perm 切换模式即时生效。
+        permission=checker,
     )
     register_web_tools(registry)
     # Phase 4：能力子集过滤（schemas + Prompt 描述 + catalog 三方一致）
@@ -1885,639 +1523,20 @@ def create_agent(
         agent._rebuild_system_prompt()
     return agent
 
-# ============================================================
-# 交互式 CLI
-
-# ============================================================
-
-
-def start_interactive_shell(debug: bool = False, resume_session_id: str = None):
-    """启动交互式命令行，支持 /model 切换模型"""
-
-    # Linux: 激活 input() 的行编辑（方向键/Home/End/历史）和 tab 补全
-    try:
-        import readline
-    except ImportError:
-        pass
-
-    print("\n╔═══════════════════════════════════════════════╗")
-    print("║   🚀 JKagent 交互式命令行                  ║")
-    if debug:
-        print("║   🐛 调试模式已开启                           ║")
-    print("║                                                 ║")
-    print("║   /model             查看当前模型               ║")
-    print("║   /model list        列出本地服务商             ║")
-    print("║   /model <name>      切换到云端模型             ║")
-    print("║   /model local <name> 切换到本地模型            ║")
-    print("║   /session           查看/管理会话              ║")
-    print("║   /session list      列出所有历史会话           ║")
-    print("║   /session save      保存当前会话               ║")
-    print("║   /session delete <id> 删除指定会话             ║")
-    print("║   /skill list        列出所有技能               ║")
-    print("║   /skill <name>      直接调用指定技能           ║")
-    print("║   /skill delete <name> 删除指定技能             ║")
-    print("║   /sandbox           查看沙箱状态               ║")
-    print("║   /sandbox on/off    开启/关闭沙箱              ║")
-    print("║   /sandbox strict    切换到严格模式             ║")
-    print("║   /sandbox bypass    临时绕过沙箱               ║")
-    print("║   /sandbox profile   切换配置档                 ║")
-    print("║   /proc              查看长驻进程会话           ║")
-    print("║   /proc stop <id>    停止指定进程               ║")
-    print("║   /proc tail <id>    持续打印进程输出          ║")
-    print("║   /hook              查看已注册 hook            ║")
-    print("║   /hook reload       重新加载 config.json 的 hooks 配置 ║")
-    print("║   /stats             查看上下文占用             ║")
-    print("║   /history             查看当前会话内容         ║")
-    print("║   /compact           全量压缩历史（释放上下文）  ║")
-    print("║   /clear             清空对话历史               ║")
-    print("║   /help              显示帮助                   ║")
-    print("║   exit               退出                       ║")
-    print("╚═══════════════════════════════════════════════╝")
-    # ---- 恢复会话 or 新建 ----
-    if resume_session_id:
-        from pathlib import Path
-        from core.message_store import DEFAULT_SESSION_DIR
-        session_file = Path(DEFAULT_SESSION_DIR) / f"{resume_session_id}.json"
-        if not session_file.exists():
-            print(f"\n❌ 未找到会话: {resume_session_id}")
-            print(f"   尝试: python agent.py --resume <session_id>")
-            print(f"   或:  /session list 查看已有会话")
-            sys.exit(1)
-        with open(session_file, "r", encoding="utf-8") as f:
-            session_data = json.load(f)
-        # 用会话中的模型配置创建 Agent
-        agent = create_agent(
-            debug=debug,
-            model=session_data.get("model_id"),
-            provider=session_data.get("model_provider") or None,
-        )
-        # 恢复消息到 store（不含 system，由后续插入）
-        agent.store.load_session_data(session_data)
-        # 在 index 0 插入新的 system prompt
-        agent.messages.insert(0, {"role": "system", "content": agent.system_prompt})
-        # 恢复任务清单（如果有）
-        resume_task_info = ""
-        if agent.store.task_list:
-            agent._task_list = TaskList.from_dict(agent.store.task_list)
-            agent._update_task_list_in_prompt()
-            current = agent._task_list.get_current()
-            if current:
-                resume_task_info = f"，任务 {current.id}/{agent._task_list.total}: {current.description}"
-        print(f"\n📂 已恢复会话: {resume_session_id}（{session_data.get('message_count', 0)} 条消息{resume_task_info}）")
-    else:
-        try:
-            agent = create_agent(debug=debug)
-        except ValueError as e:
-            print(f"\n❌ 创建失败: {e}")
-            print("   配置文件: config.json（项目根目录）")
-            sys.exit(1)
-    # 显示当前状态
-    print(f"\n🤖 {agent.name}")
-    print(f"📡 当前模型: {agent.llm}  |  session: {agent.store.session_id}")
-    perm_status = f"[PERM] 权限管理: {'启用' if agent.permission else '关闭'}"
-    sb_status = f" | Sandbox: {'ON' if getattr(agent, 'sandbox', None) and agent.sandbox.enabled else 'OFF'}" if getattr(agent, 'sandbox', None) else ""
-    print(f"[TOOLS] {agent.tool_registry.count()} 个工具就绪 | {perm_status}{sb_status}")
-    while True:
-        try:
-            u = input("\n👤 你: ").strip()
-            if not u:
-                continue
-            # ---- 退出 ----
-            if u.lower() in ("exit", "quit", "q", "退出"):
-                # 清理 MCP 连接（关闭 aiohttp session 和子进程）
-                if hasattr(agent, 'mcp_manager') and agent.mcp_manager:
-                    try:
-                        from core.mcp_client import run_in_mcp_loop
-                        # 在 MCP 专用事件循环中关闭，复用同一连接状态
-                        run_in_mcp_loop(agent.mcp_manager.close_all(), timeout=10)
-                    except Exception:
-                        pass
-                # 清理长驻子进程（杀整树）
-                if getattr(agent, 'process_manager', None):
-                    try:
-                        agent.process_manager.cleanup_all()
-                    except Exception:
-                        pass
-                print("👋 再见！")
-                break
-            # ---- /model 命令 ----
-            if u.startswith("/model"):
-                parts = u.split()
-                cmd = parts[1] if len(parts) > 1 else ""
-                if cmd == "list" or cmd == "ls":
-                    llm = agent.llm
-                    mode = "☁️ 云端" if llm.llm_type == "cloud" else "🏠 本地"
-                    prov = getattr(llm, "provider", "") or ""
-                    print(f"\n  当前配置:")
-                    print(f"    模型:   {llm.model}")
-                    print(f"    类型:   {mode}{f' [{prov}]' if prov else ''}")
-                    print(f"    地址:   {llm.base_url}")
-                    print(f"    上下文:     {llm.context_length:,} tokens")
-                    print(f"    压缩阈值:   {agent.max_history_tokens:,} tokens（60% 提示 / 80% 自动全量压缩）")
-                    print()
-                elif cmd == "local":
-                    # /model local <model_name>
-                    local_model = parts[2] if len(parts) > 2 else None
-                    provider = os.getenv("LLM_PROVIDER") or "ollama"
-                    kwargs = {"provider": provider}
-                    if local_model:
-                        kwargs["model"] = local_model
-                    agent.switch_llm(**kwargs)
-                elif cmd == "":
-                    # /model → 查看当前
-                    print(f"  📡 {agent.llm}")
-                else:
-                    # /model <model_name> → 切换云端模型（其他参数从 .env 读）
-                    agent.switch_llm(model=cmd, llm_type="cloud")
-                continue
-            # ---- /session ----
-            if u.startswith("/session"):
-                parts = u.split()
-                cmd = parts[1] if len(parts) > 1 else ""
-                if cmd == "" or cmd == "info":
-                    s = agent.store
-                    print(f"\n  session: {s.session_id}")
-                    print(f"  模型: {s.model_id or '未知'}")
-                    print(f"  消息: {len(s)} 条")
-                    print(f"  创建: {s.session_id}")
-                elif cmd == "list":
-                    from core.message_store import MessageStore
-                    sessions = MessageStore.list_session_files()
-                    if not sessions:
-                        print("  📭 暂无已保存的会话")
-                    else:
-                        print(f"\n  已保存的会话（共 {len(sessions)} 个）:")
-                        for s in sessions:
-                            print(f"    {s['session_id']}  {s['model_id']:20s}  {s['message_count']:3d} 条  {s['created_at'][:16]}")
-                elif cmd == "save":
-                    path = agent.store.save_session()
-                    print(f"  ✅ 已保存: {path}")
-                elif cmd == "delete":
-                    targets = parts[2:] if len(parts) > 2 else []
-                    if targets:
-                        from core.message_store import MessageStore
-                        for target in targets:
-                            if MessageStore.delete_session_file(target):
-                                print(f"  🗑️  已删除会话: {target}")
-                            else:
-                                print(f"  ❌ 未找到会话: {target}")
-                    else:
-                        print("  ❓ 用法: /session delete <session_id1> [<session_id2> ...]")
-                else:
-                    print("  ❓ 用法: /session [info|list|save|delete]")
-                continue
-            # ---- /skill ----
-            if u.startswith("/skill"):
-                parts = u.split()
-                cmd = parts[1] if len(parts) > 1 else ""
-                sm = getattr(agent, 'skill_manager', None)
-
-                if cmd == "" or cmd == "list":
-                    if not sm or sm.skill_count() == 0:
-                        print("  📭 暂无技能（使用 create_skill 工具创建）")
-                    else:
-                        print(f"\n  已保存的技能（共 {sm.skill_count()} 个）:")
-                        for s in sm.get_all_skills():
-                            print(f"    ▶ {s.name}")
-                            print(f"      描述: {s.description[:60]}")
-                            print()
-                elif cmd == "delete":
-                    target = parts[2] if len(parts) > 2 else None
-                    if not target:
-                        print("  ❓ 用法: /skill delete <skill_name>")
-                    elif not sm:
-                        print("  ❌ 技能系统未就绪")
-                    elif sm.delete_skill(target):
-                        print(f"  🗑️  已删除技能: {target}")
-                    else:
-                        print(f"  ❌ 未找到技能: {target}")
-                else:
-                    # /skill <name> [args...] → 直接调用技能（传参）
-                    if not sm:
-                        print("  ❌ 技能系统未就绪")
-                    else:
-                        skill_name = cmd
-                        skill = sm.get_skill(skill_name)
-                        if not skill:
-                            print(f"  ❌ 未找到技能: {skill_name}")
-                            print("  可用: /skill list 查看所有技能")
-                        else:
-                            # 解析额外参数传入技能
-                            extra_args = parts[2:]
-                            kwargs_desc = f"参数：{extra_args}" if extra_args else "无参数"
-                            msg = (
-                                f'用户通过 /skill 命令调用了技能 "{skill_name}"，{kwargs_desc}。\n\n'
-                                f"请按以下技能指令逐步执行，可调用其他工具：\n"
-                                f"{skill.instruction}\n\n"
-                                f"所有步骤完成后，只输出 agent.turn.v1/final JSON 信封。"
-                            )
-                            agent.run(msg)
-                continue
-            # ---- /sandbox ----
-            if u.startswith("/sandbox"):
-                parts = u.split()
-                cmd = parts[1] if len(parts) > 1 else ""
-                sb = getattr(agent, 'sandbox', None)
-                if not sb:
-                    print("  ❌ 沙箱未启用（create_agent(sandbox=False)")
-                elif cmd == "on":
-                    sb.enabled = True
-                    print("  [OK] 沙箱已开启")
-                elif cmd == "off":
-                    sb.enabled = False
-                    print("  [WARN] 沙箱已关闭（仅保留 L1 权限检查）")
-                elif cmd == "bypass":
-                    sb.bypass_next()
-                    print("  [BYPASS] 下一条命令绕过沙箱")
-                elif cmd == "strict":
-                    msg = sb.set_profile("restricted")
-                    print(f"  [LOCK] {msg}")
-                elif cmd == "profile":
-                    name = parts[2] if len(parts) > 2 else ""
-                    if name:
-                        msg = sb.set_profile(name)
-                        print(f"  [CFG] {msg}")
-                    else:
-                        print(f"  Usage: /sandbox profile <name>")
-                elif cmd == "list":
-                    profiles = sb.list_profiles()
-                    print(f"  可用配置档: {', '.join(profiles)}")
-                else:
-                    print(f"\n  {sb.get_status_text()}")
-                continue
-            # ---- /proc ----
-            if u.startswith("/proc"):
-                pm = getattr(agent, 'process_manager', None)
-                if not pm:
-                    print("  ❌ 长驻进程模块未启用（create_agent 需 sandbox=True）")
-                    continue
-                parts = u.split()
-                sub = parts[1] if len(parts) > 1 else "list"
-                if sub == "list":
-                    sessions = pm.list_sessions()
-                    if not sessions:
-                        print("  📭 暂无进程会话")
-                    else:
-                        print(f"\n  🖥️  进程会话（共 {len(sessions)} 个）:")
-                        for s in sessions:
-                            print(f"    [{s['id']}] {s['name']} | {s['status']}"
-                                  f" | exit={s['exit_code']} | idle={s['idle_for']}s")
-                elif sub == "stop" and len(parts) > 2:
-                    try:
-                        print(f"  {pm.stop(int(parts[2]))}")
-                    except ValueError:
-                        print("  ❌ 用法: /proc stop <id>")
-                elif sub == "tail" and len(parts) > 2:
-                    try:
-                        sid = int(parts[2])
-                        print(f"  📺 tail session={sid}（Ctrl-C 中断）")
-                        import time as _t
-                        try:
-                            while True:
-                                out, err, trunc, status = pm.read(sid)
-                                if out:
-                                    print(out, end="", flush=True)
-                                if err:
-                                    print(f"\n📕 {err}", end="", flush=True)
-                                if trunc:
-                                    print("\n⚠️ 部分输出因缓冲区满被丢弃", end="", flush=True)
-                                if status and ("exited" in status or "killed" in status):
-                                    print(f"\n  {status.strip()}")
-                                    break
-                                _t.sleep(0.5)
-                        except KeyboardInterrupt:
-                            print("\n  ⏹  tail 已中断")
-                    except ValueError:
-                        print("  ❌ 用法: /proc tail <id>")
-                else:
-                    print("  用法: /proc [list | stop <id> | tail <id>]")
-                continue
-            # ---- /hook ----
-            if u.startswith("/hook"):
-                parts = u.split()
-                cmd = parts[1] if len(parts) > 1 else ""
-                if cmd == "reload":
-                    # 强制重新加载 config.json，然后重新加载 hooks
-                    from core.config_loader import load_config as _reload_cfg
-                    _reload_cfg(force_reload=True)
-                    if agent.hooks._try_load_unified():
-                        print(f"  🔄 已重新加载 hooks 配置")
-                    else:
-                        print(f"  ⚠️  hooks 重新加载失败")
-                else:
-                    hlist = agent.hooks.list_hooks()
-                    if not hlist:
-                        print("  📭 暂无已注册 hook")
-                    else:
-                        print(f"\n  已注册 hook（共 {len(hlist)} 个）:")
-                        print("  ─" * 25)
-                        for h in hlist:
-                            print(f"  [{h['event']:18s}] {h['hook']}  matcher={h['matcher']}")
-                continue
-            # ---- /stats ----
-            if u.startswith("/stats"):
-                print(f"\n{agent.store.format_stats()}")
-                continue
-            # ---- /history ----
-            if u.startswith("/history"):
-                print(f"\n  📋 当前会话内容（共 {len(agent.messages)} 条消息）:")
-                print(f"  {'='*55}")
-                for i, msg in enumerate(agent.messages):
-                    role = msg.get("role", "?")
-                    name = msg.get("name", "")
-                    # 多模态 list content → 纯文本预览
-                    content = _content_to_text(msg.get("content", ""))
-                    # 角色图标
-                    icon = {"system": "⚙️", "user": "👤", "assistant": "🤖", "tool": "🔧"}.get(role, "❓")
-                    label = f"{role}"
-                    if name:
-                        label += f"({name})"
-                    # 截取预览
-                    preview = content[:300].replace("\n", " ")
-                    if len(content) > 300:
-                        preview += "..."
-                    print(f"  [{i:3d}] {icon} {label:20s} {preview}")
-                print(f"  {'='*55}")
-                continue
-            # ---- /plan ----
-            if u.startswith("/plan"):
-                if not agent.messages:
-                    agent.messages.append({"role": "system", "content": agent.system_prompt})
-                # 支持 /plan <任务描述> 直接指定任务
-                plan_input = u[len("/plan "):].strip() if len(u) > len("/plan ") else ""
-                if plan_input:
-                    agent.messages.append({"role": "user", "content": plan_input})
-                print(f"\n  📐 正在分析任务并生成方案…")
-                plan_response = agent.llm.think(
-                    agent.messages + [{"role": "user", "content": PLAN_PROMPT_TEXT}],
-                    temperature=0.3,
-                    stream=False,
-                    silent=True,
-                )
-                plan_text = extract_plan_text(plan_response) if plan_response else None
-                if plan_text:
-                    if agent._handle_plan(plan_text, verbose=True):
-                        # 用户确认 → 进入任务执行阶段
-                        result = agent._run_task_list(
-                            user_input=plan_input or "plan execution",
-                            max_steps=agent.max_steps,
-                            verbose=True,
-                        )
-                        print(f"\n  🤖 {result}")
-                elif plan_response:
-                    print(f"  ❌ 未能识别出方案内容，请重试")
-                else:
-                    print(f"  ❌ LLM 返回空")
-                continue
-            # ---- /compact ----
-            if u.startswith("/compact"):
-                print(f"\n  📐 执行全量压缩…")
-                before = agent.store.stats()
-                ok = agent._full_compress(verbose=True)
-                if ok:
-                    after = agent.store.stats()
-                    saved = before["total_tokens"] - after["total_tokens"]
-                    print(f"  ✅ 压缩完成: 释放了 {saved:,} tokens，剩余 {after['remaining_tokens']:,} tokens")
-                else:
-                    print(f"  ℹ️  无需压缩")
-                continue
-            # ---- /clear ----
-            if u.startswith("/clear"):
-                agent.store.save_session()  # 先保存当前历史到文件
-                agent.clear_history()
-                print(f"  🗑️  当前上下文已清空（历史仍保存在会话文件中）")
-                continue
-            # ---- /mcp ----
-            if u.startswith("/mcp"):
-                from tools.mcp_tools import MCPTool
-
-                # 有未初始化的配置则立即初始化
-                if not agent.mcp_manager and agent._mcp_pending_init:
-                    agent._init_mcp_if_needed()
-
-                if not agent.mcp_manager:
-                    print("\n  ℹ️  未配置 MCP 服务器")
-                    print("  配置方式：")
-                    print("    1. create_agent(mcp_servers=[...])")
-                    print("    2. 在 config.json 的 mcp.servers 中配置")
-                else:
-                    parts = u.split()
-                    sub = parts[1] if len(parts) > 1 else "status"
-                    conn_names = agent.mcp_manager.list_connections()
-
-                    if sub == "list":
-                        print(f"\n  🔌 MCP 服务器详情")
-                        print(f"  ─────────────────────────────────")
-                        for i, name in enumerate(conn_names, 1):
-                            conn = agent.mcp_manager.get_connection(name)
-                            status = "✅ 已连接" if (conn and conn.is_initialized) else "❌ 未连接"
-                            transport = agent.mcp_manager._configs.get(name, {}).get("transport", "?")
-                            print(f"  [{i}] {name} ({transport})")
-                            print(f"     状态: {status}")
-                            # 列出该服务器的工具
-                            mcp_tools = [
-                                t for t in agent.tool_registry.list_tools()
-                                if isinstance(t, MCPTool) and t.name.startswith(f"{name}/")
-                            ]
-                            if mcp_tools:
-                                print(f"     工具:")
-                                for t in mcp_tools:
-                                    desc_short = t.description[:50]
-                                    print(f"       - {t.name}")
-                                    if desc_short:
-                                        print(f"         {desc_short}")
-                            else:
-                                print(f"     工具: （无）")
-                            print()
-                    elif sub == "tools":
-                        # /mcp tools [server]
-                        target = parts[2] if len(parts) > 2 else None
-                        all_mcp = [t for t in agent.tool_registry.list_tools() if isinstance(t, MCPTool)]
-                        if target:
-                            all_mcp = [t for t in all_mcp if t.name.startswith(f"{target}/")]
-                        if not all_mcp:
-                            print(f"\n  ℹ️  未找到 MCP 工具" + (f"（服务器: {target}）" if target else ""))
-                        else:
-                            print(f"\n  🔧 MCP 工具列表" + (f"（{target}）" if target else ""))
-                            print(f"  ─────────────────────────────────")
-                            for t in all_mcp:
-                                desc_short = t.description[:60]
-                                print(f"  ▶ {t.name}")
-                                if desc_short:
-                                    print(f"     {desc_short}")
-                                # 显示参数摘要
-                                props = t.parameters.get("properties", {})
-                                if props:
-                                    required = t.parameters.get("required", [])
-                                    param_hints = []
-                                    for pname, pinfo in props.items():
-                                        req = "必填" if pname in required else "可选"
-                                        param_hints.append(f"{pname} ({pinfo.get('type', '?')}, {req})")
-                                    print(f"     参数: {', '.join(param_hints[:5])}")
-                                    if len(param_hints) > 5:
-                                        print(f"           ... 共 {len(param_hints)} 个参数")
-                                print()
-                    else:
-                        # /mcp 或 /mcp status — 概览
-                        ok = sum(1 for n in conn_names
-                                 if (c := agent.mcp_manager.get_connection(n)) and c.is_initialized)
-                        fail = len(conn_names) - ok
-                        # 统计 MCP 工具总数
-                        all_mcp = [t for t in agent.tool_registry.list_tools() if isinstance(t, MCPTool)]
-                        print(f"\n  🔌 MCP 服务器状态")
-                        print(f"  ─────────────────────────────────")
-                        for name in conn_names:
-                            conn = agent.mcp_manager.get_connection(name)
-                            if conn and conn.is_initialized:
-                                server_tools = [t for t in all_mcp if t.name.startswith(f"{name}/")]
-                                print(f"  🔗 {name:<16} ✅ 已连接  ({len(server_tools)} 个工具)")
-                            else:
-                                print(f"  🔗 {name:<16} ❌ 未连接")
-                        print(f"  ─────────────────────────────────")
-                        print(f"  共 {len(conn_names)} 个服务器, {len(all_mcp)} 个 MCP 工具注册")
-                        if ok:
-                            print(f"  运行 /mcp list 查看详情")
-                        if fail > 0:
-                            print(f"  ⚠️  {fail} 个服务器初始化失败，检查日志了解详情")
-                continue
-            # ---- /help ----
-            if u.startswith("/help"):
-                print("\n  命令:")
-                print("    /model              查看当前模型")
-                print("    /model list         列出可用服务商")
-                print("    /model <name>       切换到云端模型")
-                print("    /model local <name> 切换到本地模型")
-                print("    /session            查看/管理会话")
-                print("    /session list       列出所有会话")
-                print("    /session save       保存当前会话")
-                print("    /session delete <id> 删除指定会话")
-                print("    /skill list         列出所有技能")
-                print("    /skill <name>       直接调用技能")
-                print("    /skill delete <name> 删除指定技能")
-                print("    /sandbox            查看沙箱状态")
-                print("    /sandbox on/off     开启/关闭沙箱")
-                print("    /sandbox strict     切换到严格模式")
-                print("    /sandbox bypass     临时绕过沙箱")
-                print("    /sandbox profile    切换配置档")
-                print("    /proc               查看长驻进程会话")
-                print("    /proc stop <id>     停止指定进程")
-                print("    /proc tail <id>     持续打印进程输出")
-                print("    /hook               查看已注册 hook")
-                print("    /hook reload        重新加载 config.json 的 hooks 配置")
-                print("    /stats              查看上下文占用统计")
-                print("    /history            查看当前会话内容")
-                print("    /mcp                查看 MCP 服务器状态")
-                print("    /mcp list           查看 MCP 服务器详情与工具列表")
-                print("    /compact            手动执行全量压缩（上下文 >60% 时推荐使用）")
-                print("    /clear              清空对话历史")
-                print("    /help               显示此帮助")
-                print("    exit                退出")
-                continue
-            # ---- 普通对话 ----
-            agent.run(u)
-        except KeyboardInterrupt:
-            print("\n👋 中断")
-            break
-        except Exception as e:
-            print(f"\n❌ {e}")
-
-# ============================================================
-# 入口
-
-# ============================================================
+# Gateway/WebUI is the sole interactive surface.
+#
 if __name__ == "__main__":
-    # 用法帮助（可在多处复用）
     USAGE = (
-        "用法: python agent.py [参数] [问题]\n"
-        "\n"
-        "参数:\n"
-        "  --help, -h         显示此帮助\n"
-        "  --debug            开启调试日志\n"
-        "  --resume <id>      恢复指定会话\n"
-        "  --resume last      恢复最新会话\n"
-        "  init               运行交互式初始化向导（配置 LLM/MCP/hooks）\n"
-        "  gateway            启动 gateway 服务（飞书/微信消息网关）\n"
-        "\n"
-        "示例:\n"
-        "  python agent.py                    启动交互模式\n"
-        "  python agent.py init               交互式初始化配置\n"
-        "  python agent.py gateway             启动消息网关服务\n"
-        "  python agent.py --debug            启动交互模式（带调试）\n"
-        "  python agent.py --resume a7f3e2c9  恢复指定会话\n"
-        "  python agent.py --resume last      恢复最新会话\n"
-        '  python agent.py "帮我看看目录"      直接提问，不进入交互模式\n'
+        "Usage: python agent.py init\n\n"
+        "JKagent runs exclusively through Gateway/WebUI.\n"
+        "Start it with: jkagent-gateway run\n"
     )
-    if "--help" in sys.argv or "-h" in sys.argv:
+    args = sys.argv[1:]
+    if args in (["--help"], ["-h"]):
         print(USAGE)
         sys.exit(0)
-
-    # ============================================================
-    # 参数解析
-    # 已知 flag 列表（以 - 开头的参数不在这个列表里就是非法的）
-
-    # ============================================================
-    KNOWN_FLAGS = {"--help", "-h", "--debug", "-debug", "--resume", "-resume"}
-    debug_mode = "--debug" in sys.argv or "-debug" in sys.argv
-    resume_id = None
-    # 收集所有需要跳过的参数（flag 本身 + 它的值）
-    skip_args = set()
-    for flag in ("--resume", "-resume"):
-        if flag in sys.argv:
-            idx = sys.argv.index(flag)
-            skip_args.add(flag)
-            if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("-"):
-                raw = sys.argv[idx + 1]
-                skip_args.add(raw)
-                if raw == "last":
-                    from core.message_store import MessageStore
-                    sessions = MessageStore.list_session_files()
-                    if sessions:
-                        resume_id = sessions[0]["session_id"]
-                        print(f"📂 恢复最新会话: {resume_id}")
-                    else:
-                        print("❌ 没有已保存的会话")
-                        sys.exit(1)
-                else:
-                    resume_id = raw
-    # ---- gateway 子命令（需在 flag 检查前拦截，gateway 自带 --port/--dry-run 等参数）----
-    non_flag_args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    if non_flag_args and non_flag_args[0] == "gateway":
-        gw_idx = sys.argv.index("gateway")
-        gw_args = sys.argv[gw_idx + 1:]  # gateway 后的所有参数
-        from gateway.cli import main as gateway_main
-        sys.exit(gateway_main(gw_args, debug_mode))
-    # ---- 检查非法参数 ----
-    unknown_flags = [a for a in sys.argv[1:]
-                     if a.startswith("-")
-                     and a not in KNOWN_FLAGS
-                     and a not in skip_args]
-    if unknown_flags:
-        print(f"❌ 未知参数: {' '.join(unknown_flags)}\n")
-        print(USAGE)
-        sys.exit(1)
-    # ---- 剩余非 flag 参数视为问题（必须不用引号包裹，实际就是不以 - 开头） ----
-    query_args = [a for a in sys.argv[1:]
-                  if not a.startswith("-")
-                  and a not in skip_args]
-    # ---- init 子命令：交互式初始化向导（不创建 Agent，直接读写 config.json）----
-    if query_args and query_args[0] == "init":
-        if len(query_args) > 1:
-            print(f"❌ init 子命令不接受额外参数: {' '.join(query_args[1:])}\n")
-            print(USAGE)
-            sys.exit(1)
+    if args == ["init"]:
         from core.init_wizard import run_init_wizard
         sys.exit(run_init_wizard())
-    if query_args:
-        query = " ".join(query_args)
-        agent = create_agent(debug=debug_mode)
-        result = agent.run(query)
-        print(f"\n🤖 {agent.name}:\n{result}")
-        # 单轮测试不保留会话文件
-        import os
-        from core.message_store import DEFAULT_SESSION_DIR
-        session_file = os.path.join(DEFAULT_SESSION_DIR, f"{agent.store.session_id}.json")
-        if os.path.exists(session_file):
-            os.remove(session_file)
-        sys.exit(0)
-    else:
-        start_interactive_shell(debug=debug_mode, resume_session_id=resume_id)
+    print(USAGE, file=sys.stderr)
+    sys.exit(2)

@@ -1,14 +1,4 @@
-openai>=2.0.0
-requests>=2.31.0
-beautifulsoup4>=4.12.0
-ddgs>=8.0.0
-rank-bm25>=0.2.2
-jieba>=0.42.1
-aiohttp>=3.9.0
-anthropic>=0.50.0
-google-genai>=1.0.0
-lark-oapi>=1.7.0
-weixin-ilink[qr]>=0.3.5
-Pillow>=10.0.0
-croniter>=2.0.0
-jsonschema>=4.0.0
+# Full feature installation for the Gateway and Agent runtime.
+# The canonical dependency metadata lives in pyproject.toml; this compatibility
+# file intentionally delegates to the optional `all` extra.
+-e .[all]

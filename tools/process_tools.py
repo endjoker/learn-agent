@@ -74,6 +74,10 @@ class ProcessSendTool(_ProcessToolBase):
     def execute(self, session: int, input: str) -> str:
         if not self._pm:
             return "❌ 进程管理器未就绪"
+        try:
+            session = int(session)
+        except (TypeError, ValueError):
+            return "❌ session 必须是整数"
         return self._pm.send(session, input)
 
 
@@ -81,6 +85,9 @@ class ProcessReadTool(_ProcessToolBase):
     """增量读取进程 stdout/stderr（自上次读取），不阻塞。"""
     name: str = "proc_read"
     capabilities = ("proc:read",)
+    # B5：读路径（ProcessManager.read 内部按 session 加锁，无数据竞态）；
+    # 同一 session 并发读会按锁串行消费增量（语义仍一致）。
+    parallel_safe: bool = True
     description: str = (
         "读取指定 session 的进程输出增量（自上次读取以来新增的内容）。"
         "不阻塞，从后台缓冲区取数据。返回 stdout / stderr / 是否截断 / 进程状态"
@@ -96,6 +103,10 @@ class ProcessReadTool(_ProcessToolBase):
     def execute(self, session: int) -> str:
         if not self._pm:
             return "❌ 进程管理器未就绪"
+        try:
+            session = int(session)
+        except (TypeError, ValueError):
+            return "❌ session 必须是整数"
         out, err, trunc, status = self._pm.read(session)
         parts = []
         if out:
@@ -115,6 +126,7 @@ class ProcessListTool(_ProcessToolBase):
     """列出所有进程会话状态。"""
     name: str = "proc_list"
     capabilities = ("proc:read",)
+    parallel_safe: bool = True   # B5：只读会话快照（见需协调项：list_sessions 遍历建议加锁）
     description: str = "列出所有当前活动的进程会话状态（ID / 名称 / 状态 / 退出码 / 空闲时长）"
     parameters: dict = {"type": "object", "properties": {}, "required": []}
 
@@ -149,6 +161,10 @@ class ProcessStopTool(_ProcessToolBase):
     def execute(self, session: int) -> str:
         if not self._pm:
             return "❌ 进程管理器未就绪"
+        try:
+            session = int(session)
+        except (TypeError, ValueError):
+            return "❌ session 必须是整数"
         return self._pm.stop(session)
 
 

@@ -17,6 +17,8 @@ import json
 import os
 import copy
 import logging
+import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -29,8 +31,13 @@ logger = logging.getLogger("jk_agent")
 _DEFAULT_CONFIG: dict[str, Any] = {
     "agent_runtime": {
         "native_tool_streaming": True,
-        "max_tool_result_chars": 10000,
+        "max_tool_result_chars": 12000,
+        "max_tool_calls": 600,
+        "max_parallel_tools": 4,
     },
+    "goal": {"enabled": True, "max_active_per_session": 1},
+    "subagent": {"enabled": True, "max_children": 4, "one_level_only": True},
+    "retention": {"enabled": True, "terminal_days": 30, "artifact_days": 30, "interval_seconds": 3600},
     "runtime_store": {
         "backend": "sqlite",
         "path": "./workspace/.agent/state/runtime.db",
@@ -45,6 +52,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "cancel_grace_seconds": 10,
         "zombie_max_seconds": 300,
         "max_attempts": 2,
+        "channel_replay_max_attempts": 3,
     },
     "artifacts": {
         "root": "./workspace/.agent/artifacts",
@@ -64,39 +72,6 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         # repository remain outside the permission boundary.
         "extra_workspaces": ["."],
         "default_mode": "ask",
-        "tool_rules": {
-            # 注：只列出有固定权限的工具。bash/read/write/edit/glob/file_mgr
-            # 使用动态回调（如路径检查、命令分类），不在 tool_rules 中配置固定值。
-            # 如需覆盖，可在 config.json 中显式设置 "bash": "allow" 等。
-            "grep": "allow", "datetime": "allow", "calculate": "allow",
-            "notes": "allow", "memory_search": "allow", "memory_update": "allow",
-            "search": "allow", "web_fetch": "allow", "create_skill": "allow",
-            "python": "ask", "http": "ask",
-        },
-        "bash_commands": {
-            "readonly": [
-                "ls", "dir", "pwd", "echo", "cat", "type", "more", "less",
-                "head", "tail", "findstr", "where", "which",
-                "git status", "git log", "git diff", "git show", "git branch",
-                "git stash list", "git remote -v", "git config",
-                "pip list", "pip show",
-                "python --version", "python3 --version",
-                "node --version", "npm --version",
-            ],
-            "write": [
-                "rm", "del", "rd", "rmdir",
-                "mv", "move", "rename",
-                "cp", "copy", "xcopy", "robocopy",
-                "mkdir", "md",
-                "git add", "git commit", "git push", "git pull",
-                "git merge", "git rebase", "git reset",
-                "git checkout -b", "git branch -d", "git tag",
-                "pip install", "pip uninstall", "pip update",
-                "npm install", "npm uninstall",
-                "chmod", "chown",
-                "taskkill", "kill -9",
-            ],
-        },
     },
     "hooks": {
         "enabled": True,
@@ -112,13 +87,12 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "servers": [],
     },
     "sandbox": {
-        "enabled": True,
+        # L2 沙箱硬闸门默认关闭：安全兜底由 4 档权限（readonly/ask/allow/
+        # unreviewed）承担；需要硬拦截时由 config.json → sandbox.enabled=true 开启。
+        "enabled": False,
         "idle_timeout_seconds": 300,
-        "sensitive_files": [
-            ".env", ".git/config",
-            "core/permission.py", "core/llm_client.py",
-            "agent.py", "requirements.txt",
-        ],
+        # 不默认保护项目文件；危险命令、系统路径等其他安全规则仍保留。
+        "sensitive_files": [],
         "dangerous_commands": [
             "rm -rf /", "rm -rf ~", "rm -rf .",
             "del /f /s", "rd /s /q",
@@ -213,6 +187,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "allow_non_loopback": False,
             "auth_token": "",
             "allowed_ips": [],
+            "main_session": {"tools": None, "skills": None, "mcp_servers": None},
         },
     },
     "prompt": {
@@ -223,25 +198,33 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "workspace": {
         "path": "./workspace",
         "dirs": ["ref", "scripts", "downloads", "tmp", "output"],
+        "allow_unc": False, "block_system_paths": True, "list_limit": 100, "list_limit_max": 1000,
+        "max_json_body_bytes": 1048576, "path_confirmation_required": True,
+        "sensitive_file_patterns": [], "snapshot_retention_days": 30, "snapshot_retention_per_workspace": 20,
     },
 }
 
 def is_enabled(value, default: bool = True) -> bool:
     """解析配置开关值。
 
-    兼容 bool 与字符串写法：`"false"/"0"/"no"/"off"`（不区分大小写）视为关闭，
-    其他非空字符串视为开启；None 使用默认值。
+    兼容 bool 与字符串写法："false"/"0"/"no"/"off"（不区分大小写）视为关闭，
+    其他非空字符串视为开启；None 与空/纯空白字符串视为"未设置"，回退到 default。
+    边界说明：空字符串不视为开启（避免 "enabled": "" 意外启用某项功能）。
     """
     if value is None:
         return default
     if isinstance(value, str):
-        return value.strip().lower() not in ("false", "0", "no", "off")
+        stripped = value.strip()
+        if not stripped:
+            return default
+        return stripped.lower() not in ("false", "0", "no", "off")
     return bool(value)
 
 
-# 缓存
+# 缓存（load_config 并发安全：force_reload 与首次加载均在锁内完成）
 _config_cache: Optional[dict] = None
 _config_loaded: bool = False
+_config_lock = threading.Lock()
 
 
 # ============================================================
@@ -249,7 +232,14 @@ _config_loaded: bool = False
 # ============================================================
 
 def _find_project_root() -> Path:
-    """从当前文件向上查找项目根目录（含 .git 或 agent.py 的目录）"""
+    """从当前文件向上查找项目根目录（含 .git 或 agent.py 的目录）。
+
+    fallback 说明：仅检查当前目录与其父目录两层——core/ 位于项目根下，
+    core/config_loader.py 的 parent（即 core/ 的上级）应为项目根；两层都未
+    命中（例如以第三方包方式安装进 site-packages）时回退到 current.parent 并
+    照常返回。调用方仅用该路径定位 config.json / config.example.json，
+    未命中时文件不存在，自然走默认配置分支，不产生其他副作用。
+    """
     current = Path(__file__).resolve().parent
     for parent in [current, current.parent]:
         if (parent / "agent.py").exists() or (parent / ".git").exists():
@@ -279,32 +269,39 @@ def load_config(config_path: Optional[str] = None, force_reload: bool = False) -
     """
     global _config_cache, _config_loaded
 
+    # 快路径：无锁读缓存（deepcopy 结果由调用方独享，安全）
     if _config_loaded and not force_reload:
         return copy.deepcopy(_config_cache)
 
-    project_root = _find_project_root()
+    with _config_lock:
+        # 双重检查：等待锁期间可能已被其他线程加载；
+        # force_reload 在锁内重新加载并整体替换缓存，保证并发安全
+        if _config_loaded and not force_reload:
+            return copy.deepcopy(_config_cache)
 
-    # ---- 尝试加载 config.json ----
-    if config_path:
-        cfg_path = Path(config_path)
-    else:
-        cfg_path = project_root / "config.json"
+        project_root = _find_project_root()
 
-    if cfg_path.exists():
-        config = _load_json_config(cfg_path)
-        logger.info("从 %s 加载了统一配置", cfg_path)
-    else:
-        logger.info("未找到 config.json，使用默认配置")
-        config = copy.deepcopy(_DEFAULT_CONFIG)
+        # ---- 尝试加载 config.json ----
+        if config_path:
+            cfg_path = Path(config_path)
+        else:
+            cfg_path = project_root / "config.json"
 
-    # ---- 环境变量覆盖 ----
-    config = _apply_env_overrides(config)
+        if cfg_path.exists():
+            config = _load_json_config(cfg_path)
+            logger.info("从 %s 加载了统一配置", cfg_path)
+        else:
+            logger.info("未找到 config.json，使用默认配置")
+            config = copy.deepcopy(_DEFAULT_CONFIG)
 
-    # ---- 缓存 ----
-    _config_cache = config
-    _config_loaded = True
+        # ---- 环境变量覆盖 ----
+        config = _apply_env_overrides(config)
 
-    return copy.deepcopy(config)
+        # ---- 缓存 ----
+        _config_cache = config
+        _config_loaded = True
+
+        return copy.deepcopy(config)
 
 
 def _load_json_config(path: Path) -> dict:
@@ -312,45 +309,110 @@ def _load_json_config(path: Path) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             user_cfg = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning("config.json 解析失败: %s，使用默认配置", e)
+    except json.JSONDecodeError as e:
+        # JSON 损坏不再静默降级：显式报错，并把损坏文件改名留证
+        logger.error("config.json 解析失败: %s；已改名为 .corrupt-<时间戳> 留证，使用默认配置", e)
+        _quarantine_corrupt(path)
+        return copy.deepcopy(_DEFAULT_CONFIG)
+    except OSError as e:
+        logger.error("config.json 读取失败: %s，使用默认配置", e)
+        return copy.deepcopy(_DEFAULT_CONFIG)
+
+    if not isinstance(user_cfg, dict):
+        # 顶层非对象（如 JSON 数组）同样视为损坏，避免 _deep_merge 对非 dict 崩溃
+        logger.error("config.json 顶层必须是 JSON 对象，实际为 %s；已改名为 .corrupt-<时间戳> 留证，使用默认配置",
+                     type(user_cfg).__name__)
+        _quarantine_corrupt(path)
         return copy.deepcopy(_DEFAULT_CONFIG)
 
     return _deep_merge(copy.deepcopy(_DEFAULT_CONFIG), user_cfg)
 
 
+def _quarantine_corrupt(path: Path) -> None:
+    """把损坏的 config.json 改名 .corrupt-<ts> 留证；改名失败仅告警不中断。"""
+    try:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = path.with_name(f"{path.name}.corrupt-{ts}")
+        path.rename(target)
+    except OSError as e:
+        logger.warning("损坏的 config.json 改名失败: %s", e)
+
+
 def _apply_env_overrides(config: dict) -> dict:
     """环境变量覆盖（API Key 敏感信息优先从环境变量读取）"""
-    # ANTHROPIC_API_KEY / GEMINI_API_KEY / OPENAI_API_KEY 覆盖模型配置
-    for model_name, model_cfg in config.get("llm", {}).get("models", {}).items():
-        protocol = model_cfg.get("protocol", "openai")
-        if protocol == "anthropic":
-            env_key = os.getenv("ANTHROPIC_API_KEY", "")
-            if env_key:
-                model_cfg["api_key"] = env_key
-        elif protocol == "gemini":
-            env_key = os.getenv("GEMINI_API_KEY", "")
-            if env_key:
-                model_cfg["api_key"] = env_key
-        elif protocol == "openai" and not model_cfg.get("api_key"):
-            env_key = os.getenv("OPENAI_API_KEY", "")
-            if env_key:
-                model_cfg["api_key"] = env_key
+    llm = config.get("llm")
+    # 类型守卫：llm 段被配置文件写成非 dict（如字符串/数组）时跳过，不再 AttributeError 崩溃
+    if not isinstance(llm, dict):
+        if llm is not None:
+            logger.warning("config.llm 不是字典（%s），跳过环境变量覆盖", type(llm).__name__)
+        return config
 
-    # LLM_PROTOCOL 全局覆盖
+    models = llm.get("models")
+    if models is not None and not isinstance(models, dict):
+        logger.warning("config.llm.models 不是字典（%s），跳过模型级环境变量覆盖", type(models).__name__)
+    else:
+        # ANTHROPIC_API_KEY / GEMINI_API_KEY / OPENAI_API_KEY 覆盖模型配置。
+        # openai / anthropic / gemini 语义对称：环境变量非空即覆盖（环境变量优先级最高），
+        # 与模块优先级注释（config.json → 环境变量 → 默认值）一致。
+        for model_name, model_cfg in (models or {}).items():
+            if not isinstance(model_cfg, dict):
+                logger.warning("config.llm.models.%s 不是字典（%s），跳过该模型的环境变量覆盖",
+                               model_name, type(model_cfg).__name__)
+                continue
+            protocol = model_cfg.get("protocol", "openai")
+            if protocol == "anthropic":
+                env_key = os.getenv("ANTHROPIC_API_KEY", "")
+            elif protocol == "gemini":
+                env_key = os.getenv("GEMINI_API_KEY", "")
+            elif protocol == "openai":
+                env_key = os.getenv("OPENAI_API_KEY", "")
+            else:
+                env_key = ""
+            if env_key:
+                model_cfg["api_key"] = env_key
+                logger.debug("环境变量 %s 覆盖 llm.models.%s.api_key",
+                             _ENV_KEY_FOR_PROTOCOL.get(protocol, "?"), model_name)
+
+    # LLM_PROTOCOL 全局覆盖（models 缺失时创建；非 dict 时跳过并告警）
     env_protocol = os.getenv("LLM_PROTOCOL", "")
     if env_protocol:
-        current_model = config.get("llm", {}).get("model_id", "")
+        current_model = llm.get("model_id", "")
         if current_model:
-            config["llm"].setdefault("models", {}).setdefault(current_model, {})["protocol"] = env_protocol
+            models_holder = llm.get("models")
+            if models_holder is None:
+                models_holder = {}
+                llm["models"] = models_holder
+            if isinstance(models_holder, dict):
+                target = models_holder.setdefault(current_model, {})
+                if isinstance(target, dict):
+                    target["protocol"] = env_protocol
+                else:
+                    logger.warning("config.llm.models.%s 不是字典，跳过 LLM_PROTOCOL 覆盖", current_model)
+            else:
+                logger.warning("config.llm.models 不是字典，跳过 LLM_PROTOCOL 覆盖")
 
     # Optional operational override.  It intentionally applies globally so
     # deployments can tune latency/cost without rewriting model credentials.
     env_reasoning = os.getenv("LLM_REASONING_EFFORT", "")
     if env_reasoning:
-        config.setdefault("llm", {}).setdefault("reasoning", {})["level"] = env_reasoning
+        reasoning = llm.get("reasoning")
+        if reasoning is None:
+            reasoning = {}
+            llm["reasoning"] = reasoning
+        if isinstance(reasoning, dict):
+            reasoning["level"] = env_reasoning
+        else:
+            logger.warning("config.llm.reasoning 不是字典，跳过 LLM_REASONING_EFFORT 覆盖")
 
     return config
+
+
+# 协议 → 环境变量名（仅用于日志）
+_ENV_KEY_FOR_PROTOCOL = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+}
 
 
 # ============================================================

@@ -122,6 +122,7 @@ class Plan:
     tasks: list[PlanTask]
     status: PlanStatus = PlanStatus.DRAFT
     version: int = 1
+    goal_id: Optional[str] = None
     source_prompt: str = ""
     approved_at: Optional[str] = None
     approval_actor: Optional[str] = None
@@ -182,7 +183,7 @@ class Plan:
         return {
             "plan_id": self.plan_id, "session_id": self.session_id, "title": self.title,
             "tasks": [task.to_dict() for task in self.tasks], "status": self.status.value,
-            "version": self.version, "progress": self.progress, "source_prompt": self.source_prompt,
+            "version": self.version, "goal_id": self.goal_id, "progress": self.progress, "source_prompt": self.source_prompt,
             "approved_at": self.approved_at, "approval_actor": self.approval_actor,
             "archived_at": self.archived_at,
             "created_at": self.created_at, "updated_at": self.updated_at,
@@ -193,8 +194,7 @@ class Plan:
         data = dict(value)
         # progress is a derived serialization field, not constructor state.
         data.pop("progress", None)
-        # Snapshots written by earlier releases may retain this retired field.
-        data.pop("goal_id", None)
+        data.setdefault("goal_id", None)
         data.setdefault("archived_at", None)
         data["status"] = PlanStatus(data["status"])
         data["tasks"] = [PlanTask.from_dict(item) for item in data.get("tasks") or []]

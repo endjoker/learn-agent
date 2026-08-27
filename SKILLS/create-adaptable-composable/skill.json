@@ -1,0 +1,7 @@
+{
+  "name": "create-adaptable-composable",
+  "description": "Vue.js skill from vuejs-ai/skills (security-cleaned)",
+  "version": "1.0.0",
+  "source": "https://github.com/vuejs-ai/skills/tree/main/skills/create-adaptable-composable",
+  "license": "MIT"
+}

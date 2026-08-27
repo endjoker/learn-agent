@@ -77,6 +77,44 @@ class BaseTool:
     SecurityGate 会跳过 L2、走 L1 权限。
     """
 
+    parallel_safe: bool = False
+    """
+    是否可与其他工具并行执行（默认 False = 默认拒绝并行，P3-4 显式化）。
+
+    此前本属性未在基类声明，ToolBatchExecutor._is_parallel_safe 靠
+    getattr(tool, "parallel_safe", False) 隐式默认拒绝——方向安全但不可见，
+    新增工具作者容易不知道存在这个开关。只有纯读、无共享可变状态、且经过
+    审计的工具才应显式声明 True（如 read/glob/grep/clock/calculator）。
+    """
+
+    _permission = None
+    """注入的 PermissionChecker（四档权限感知边界用，见 set_permission）。
+
+    项目权限只遵循四项基本权限（readonly/ask/allow/unreviewed 经
+    PolicyEngine 裁决）：注入后，工具层的工作区边界对读完全交还裁决、
+    对写按 readonly 之外的档位交还裁决；未注入（无裁决层的直调路径）
+    时工具层硬边界是唯一防线。"""
+
+    def configure(self, *, sandbox=None, policy=None, workspace_roots=None,
+                  memory_manager=None, permission=None) -> None:
+        """统一注入接口（P2-4）：register_all_tools 对所有工具调用同一入口。
+
+        按子类实际实现的 set_* setter 分发（hasattr 探测），未实现的注入项
+        自动跳过——新增工具只需实现需要的 setter，不再依赖 register_all_tools
+        里逐工具 if 判断（Write/Edit 漏配边界校验注入正是这样漏掉的）。
+        默认实现无状态、可安全重复调用。
+        """
+        if sandbox is not None and hasattr(self, "set_sandbox"):
+            self.set_sandbox(sandbox)
+        if policy is not None and hasattr(self, "set_policy"):
+            self.set_policy(policy)
+        if workspace_roots is not None and hasattr(self, "set_workspace_roots"):
+            self.set_workspace_roots(workspace_roots)
+        if memory_manager is not None and hasattr(self, "set_memory_manager"):
+            self.set_memory_manager(memory_manager)
+        if permission is not None and hasattr(self, "set_permission"):
+            self.set_permission(permission)
+
     def resolve_capabilities(self, params: dict) -> tuple:
         """
         返回本次调用的安全能力（默认返回类属性 capabilities）。

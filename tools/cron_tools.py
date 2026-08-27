@@ -70,15 +70,32 @@ class CronAddJobTool(BaseTool):
     }
 
     def execute(self, **kwargs) -> str:
+        # timeout 参数 try/int 包裹，非法值回退默认 600 秒并钳制到 [1, 3600]
+        try:
+            timeout = max(1, min(int(kwargs.get("timeout") or 600), 3600))
+        except (TypeError, ValueError):
+            timeout = 600
+
+        deliver_mode = kwargs.get("deliver_mode", "none") or "none"
+        deliver_target = kwargs.get("deliver_target", "") or ""
+
+        # webhook 投递目标 URL 经 safe_http 校验（SSRF 防护）
+        if deliver_mode == "webhook" and deliver_target:
+            from core.safe_http import validate_url
+            try:
+                validate_url(deliver_target)
+            except Exception as e:
+                return f"❌ webhook 目标 URL 无效，已拒绝创建任务: {e}"
+
         return add_job(
             name=kwargs.get("name", ""),
             schedule=kwargs.get("schedule", ""),
             prompt=kwargs.get("prompt", ""),
             session=kwargs.get("session", "isolated"),
-            deliver_mode=kwargs.get("deliver_mode", "none"),
+            deliver_mode=deliver_mode,
             deliver_channel=kwargs.get("deliver_channel", ""),
-            deliver_target=kwargs.get("deliver_target", ""),
-            timeout=int(kwargs.get("timeout", 600)),
+            deliver_target=deliver_target,
+            timeout=timeout,
             enabled=True,
         )
 
@@ -110,7 +127,9 @@ class CronListJobsTool(BaseTool):
         jobs = src.jobs
         if not jobs:
             return "当前无定时任务。用 cron_add_job 创建一个。"
-        state = src._state.get("jobs", {})
+        # 经调度器公开只读快照读取（不触碰私有 _state/_paused）
+        state = src.job_stats()
+        paused = src.paused_jobs()
         lines = ["⏰ 定时任务列表:"]
         for j in jobs:
             name = j.get("name", "?")
@@ -118,7 +137,7 @@ class CronListJobsTool(BaseTool):
             lines.append(
                 f"  - {name}  [{j.get('schedule','')}]  "
                 f"deliver={j.get('deliver',{}).get('mode','none')}  "
-                f"{'暂停' if name in src._paused else '运行中'}  "
+                f"{'暂停' if name in paused else '运行中'}  "
                 f"最近: {st.get('last_status','-')}  "
                 f"({st.get('runs',0)}次/{st.get('failures',0)}失败)"
             )

@@ -22,9 +22,38 @@ import requests
 from typing import Optional
 from urllib.parse import urlparse
 from .base_tool import BaseTool
-from core.safe_http import UnsafeUrl, request as safe_request
+from core.safe_http import UnsafeUrl, validate_url, request as safe_request
 
 logger = logging.getLogger('jk_agent')
+
+
+# ============================================================
+# 内容类型判断（P2：仅文本类响应才做 HTML 解析）
+# ============================================================
+
+def _is_textual_content_type(content_type: str) -> bool:
+    """判断 Content-Type 是否为可解析的文本类。
+
+    text/* 一律视为文本；application 下仅放行 json/xml/xhtml/javascript
+    等文本类；二进制类型（zip/exe/image 等）返回 False。
+    Content-Type 缺失时按文本处理（部分服务器不回该头，默认尝试解析）。
+    """
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if not ct:
+        return True  # 未声明类型时保守地按文本尝试
+    if ct.startswith("text/"):
+        return True
+    if ct.endswith("+xml") or ct.endswith("+json"):
+        return True
+    return ct in {
+        "application/json",
+        "application/xml",
+        "application/xhtml+xml",
+        "application/javascript",
+        "application/x-www-form-urlencoded",
+        "application/rss+xml",
+        "application/atom+xml",
+    }
 
 
 # ============================================================
@@ -138,8 +167,15 @@ class WebSearchTool(BaseTool):
             ),
         }
         url = f"https://www.bing.com/search?q={requests.utils.quote(query)}&count={max_results}"
-        resp = requests.get(url, headers=headers, timeout=10)
+        # SSRF 校验（safe_http 逐跳校验，防内网/回环地址）
+        validate_url(url)
+        resp = safe_request("GET", url, headers=headers, timeout=10)
         resp.raise_for_status()
+
+        # 非文本类响应不做 HTML 解析（safe_request 流式阶段已截断至 10MB，
+        # 无需再查 content 大小）
+        if not _is_textual_content_type(resp.headers.get("Content-Type", "")):
+            return []
 
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -206,14 +242,27 @@ class WebFetchTool(BaseTool):
 
         参数:
             url:       网页链接
-            max_chars: 最多返回字符数
+            max_chars: 最多返回字符数（钳制到 ≤200k）
 
         返回:
             网页正文的纯文本
         """
-        # ---- 1. 校验 URL ----
+        # max_chars 钳制（≤200k），防止异常大值导致输出爆炸
+        try:
+            max_chars = max(1, min(int(max_chars), 200_000))
+        except (TypeError, ValueError):
+            max_chars = 5000
+
+        # ---- 1. 校验 URL（SSRF） ----
         if not url.startswith(("http://", "https://")):
             return f"❌ 无效 URL: {url}\n   必须以 http:// 或 https:// 开头"
+        try:
+            validate_url(url)
+        except UnsafeUrl as e:
+            return f"⛔ 安全拦截: {e}"
+        except Exception as e:
+            logger.error(f"URL 校验失败: {e}", exc_info=True)
+            return f"❌ URL 校验失败: {type(e).__name__}: {e}"
 
         # ---- 2. 请求网页 ----
         try:
@@ -231,6 +280,15 @@ class WebFetchTool(BaseTool):
         except Exception as e:
             logger.error(f"请求失败: {e}", exc_info=True)
             return f"❌ 请求失败: {type(e).__name__}: {e}"
+
+        # ---- 2.5 内容类型判断（P2）：仅文本类才解析；safe_request 流式阶段
+        # 已把响应体截断至 10MB，无需再检查 content 大小（原判断为死代码） ----
+        content_type = resp.headers.get("Content-Type", "")
+        if not _is_textual_content_type(content_type):
+            return (
+                f"ℹ️ 非文本内容({content_type.split(';')[0].strip() or '未知'})，已跳过解析: {url}\n"
+                f"   💡 该地址返回的是二进制/媒体文件，web_fetch 仅支持文本类内容。"
+            )
 
         # ---- 3. 检测编码 ----
         resp.encoding = resp.apparent_encoding or "utf-8"

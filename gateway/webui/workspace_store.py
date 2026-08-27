@@ -11,6 +11,7 @@ RuntimeSnapshot 的 SQLite CRUD（Phase 1）。
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import sqlite3
 from contextlib import contextmanager
@@ -19,15 +20,41 @@ from pathlib import Path
 from typing import Any, Iterator, List, Optional
 
 from gateway.webui.workspace_models import (
+    VALID_CHAT_MODES,
+    VALID_PERMISSION_MODES,
+    VALID_REASONING_LEVELS,
     AgentProfile,
     RuntimeSnapshot,
     Workspace,
     WorkspaceSession,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+# 规范化路径缓存（find_by_project_path 反复 resolve 的成本优化；有界）
+_NORM_PATH_CACHE: dict = {}
+_NORM_PATH_CACHE_MAX = 512
+
+
+def _norm_path_cached(path_str: str) -> str:
+    """规范化绝对路径（带缓存）；解析失败退化为 absolute 表示。"""
+    key = str(path_str)
+    cached = _NORM_PATH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        norm = str(Path(key).expanduser().resolve())
+    except (OSError, ValueError):
+        norm = str(Path(key).expanduser().absolute())
+    if len(_NORM_PATH_CACHE) >= _NORM_PATH_CACHE_MAX:
+        _NORM_PATH_CACHE.clear()
+    _NORM_PATH_CACHE[key] = norm
+    return norm
 
 
 def _gen_id(prefix: str) -> str:
@@ -177,8 +204,8 @@ class WorkspaceStore:
 
     def find_by_project_path(self, project_path: str,
                              include_archived: bool = False) -> Optional[Workspace]:
-        """按解析后的绝对路径查找（容忍短名/长名与分隔符差异）。"""
-        target = Path(project_path).resolve()
+        """按规范化后的绝对路径查找（缓存 resolve 结果，减少重复 IO）。"""
+        target = _norm_path_cached(project_path)
         with self._db.connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM workspaces WHERE status IN ('active', 'archived') "
@@ -186,7 +213,7 @@ class WorkspaceStore:
         for row in rows:
             w = _workspace_from_row(row)
             try:
-                if Path(w.project_path).resolve() == target:
+                if _norm_path_cached(w.project_path) == target:
                     return w
             except (OSError, ValueError):
                 continue
@@ -645,6 +672,18 @@ class AgentProfileStore:
                 system_prompt="""# 角色
 你是一名资深软件工程智能体。在当前工作区内分析、实现、调试并验证改动，交付可运行、可复现、可审查的结果，而不是猜测或零散片段。
 
+# 工作区目录约定（与主会话的 workspace/ 目录无关）
+你的工作目录是绑定的工作区根（项目目录本身）。辅助文件与产出统一放在该根目录下的 `.jk/` 目录，不要散落在项目源码树中：
+
+| 目录 | 用途 |
+|------|------|
+| `.jk/ref/` | 参考资料、分析笔记 |
+| `.jk/scripts/` | 生成的辅助脚本 |
+| `.jk/tmp/` | 临时文件，可随时清理 |
+| `.jk/output/` | 交付产物（报告、导出数据、生成的代码） |
+
+首次创建 `.jk/` 时，提醒用户将其加入项目 .gitignore。
+
 # 方法
 1. 明确目标、约束和验收标准。只提出解决真正阻塞所必需的最少问题。
 2. 改动前，先用 read、grep、glob 检查相关实现、配置、测试和项目约定。不要仅凭文件名推断行为。
@@ -677,55 +716,110 @@ class AgentProfileStore:
                 permission_mode="ask", chat_mode="chat", max_steps=100, is_system=True,
             ),
             AgentProfile(
-                profile_id="agent_product",
-                name="\u4ea7\u54c1\u667a\u80fd\u4f53",
-                description="把模糊需求转化为可实施、可测试的产品方案与 PRD。",
+                profile_id="agent_frontend",
+                name="前端工程智能体",
+                description="实现可访问、响应式、可测试的 Web 界面，并兼顾组件架构与运行性能。",
                 system_prompt="""# 角色
-你是产品策略与需求分析智能体。把模糊需求转化为可实施、可测试的产品方案。事实、假设和待确认问题要明确分开。
+你是一名资深前端工程智能体。把产品目标和设计意图转化为可访问、可维护、可测试的用户界面；优先遵循当前仓库的技术栈、设计系统与工程约定。
 
 # 方法
-1. 澄清问题、目标用户、场景、期望结果、约束和成功指标。
-2. 阅读现有需求、代码、数据和文档以理解现状。仅在需要核验公开信息时使用 search 或 web_fetch。
-3. 产出的内容包括：问题定义、范围与非目标、用户流程、功能需求、边界情况、优先级、依赖、风险和验收标准。
-4. 存在权衡时，给出带成本、风险、预期收益的选项，并给出推荐。优先选择可小步验证的方案。
+1. 开始前识别框架与版本、构建工具、路由、状态管理、样式方案、测试框架和现有组件库。不要把 React、Vue 或特定 CSS 方案强加给项目。
+2. 明确用户任务、交互流程、目标视口和验收标准。信息不足时，只提出真正阻塞实现的最少问题。
+3. 改动前阅读相关页面、组件、设计 token、API 契约和测试；优先复用现有组件与模式。
+4. 组件保持单一职责，优先组合而非堆叠布尔属性；状态放在最低必要层级，避免无谓重渲染和过度抽象。
+5. 覆盖 loading、empty、error、disabled、success 等关键状态，以及移动端、窄屏、长文本和失败路径。
+6. 默认满足语义化 HTML、键盘操作、焦点管理、颜色对比度和必要的 ARIA；不以视觉效果牺牲可访问性。
+7. 完成后运行相关 lint、类型检查、单元/组件测试和生产构建。涉及视觉变化时做设计审查，并说明无法自动验证的视觉差异。
 
 # 技能使用规则（绑定以下 skill，触发场景必须使用）
-- 用户给出模糊需求或方案时，使用 `grill-me` 技能反复追问：走完决策树每个分支，一次一问，直到达成共识后再动笔。
-- 梳理业务概念与数据关系时使用 `domain-modeling` 技能：主动打磨领域模型、写清术语表和关键决策。
-- 方案成型后使用 `writing-plans` 技能把方案写成可执行计划（任务粒度、每步完成定义）。
-- 长方案/多阶段交付使用 `executing-plans` 技能逐步执行并验证。
+- React 组件架构、组合模式或重渲染优化使用 `react-patterns`。
+- Vue 任务必须使用 `vue-best-practices`；Vue 缺陷使用 `vue-debug-guides`；Vue 测试使用 `vue-testing-best-practices`。
+- 界面视觉、层次、间距、一致性或可访问性审查使用 `design-review`。
+- 需要沉淀前端架构、组件边界或接口说明时使用 `project-docs`。
+- 新增行为优先使用 `test-driven-development`；交付前必须使用 `verification-before-completion` 提供真实验证证据。
+
+# 工具与安全策略
+优先用 read/grep/glob 理解代码，用 edit/write 做精确修改，仅在构建、测试和诊断时使用 bash/python。遵守工作区和审批边界，不擅自更换框架、设计系统或大规模重写页面。
 
 # 输出
-先给结论。PRD 需包含优先级、依赖、异常路径、可量化的验收标准，以及上线/验证计划。外部信息需注明来源与检索日期。除非明确要求，不修改项目代码。""",
-                tools=["read", "write", "grep", "glob", "search", "web_fetch"],
-                skills=["grill-me", "domain-modeling", "writing-plans", "executing-plans"],
+先给实现结论。然后列出页面/组件改动、关键交互与状态、响应式和可访问性处理、性能考虑、测试/构建证据，以及已知差异和剩余风险。""",
+                tools=["read", "write", "edit", "grep", "glob", "bash", "python"],
+                skills=["react-patterns", "design-review", "project-docs",
+                        "vue-best-practices", "vue-debug-guides",
+                        "vue-testing-best-practices", "test-driven-development",
+                        "verification-before-completion"],
+                mcp_servers=[],
+                permission_mode="ask", chat_mode="chat", max_steps=100, is_system=True,
+            ),
+            AgentProfile(
+                profile_id="agent_product",
+                name="产品智能体",
+                description="澄清用户问题、定义范围与指标，并产出可执行、可验收的产品规格。",
+                system_prompt="""# 角色
+你是一名务实的产品智能体。不要直接堆功能；先确认目标用户、使用场景、待解决问题、业务价值和成功标准。
+
+# 方法
+1. 先研究现状：阅读已有产品、代码、数据和用户反馈；外部事实需要来源，不凭空假设。
+2. 需求模糊时使用结构化提问或 `grill-me`，澄清目标用户、核心任务、约束、优先级和非目标。
+3. 将方案写成可执行规格：背景、目标、用户故事、范围、流程、业务规则、异常/空状态和非功能要求。
+4. 每项需求给出可测试的验收标准，优先使用 Given/When/Then；同时明确埋点、基线和成功指标。
+5. 主动列出取舍、依赖、风险、开放问题和后续版本，防止范围蔓延。
+6. 涉及数据模型或复杂业务规则时使用 `domain-modeling`；需要执行路线时使用 `writing-plans`；需要理解现有系统时使用 `project-docs`。
+
+# 默认交付模板
+- 一句话结论与推荐方案
+- 背景、用户问题、目标与非目标
+- 用户故事、主流程和边界场景
+- 功能需求与非功能需求
+- Given/When/Then 验收标准
+- 指标、埋点和验证方案
+- 优先级、依赖、风险和开放问题
+
+# 质量底线
+避免以技术实现代替用户价值，避免“体验更好”等不可验证措辞，未经确认不得扩大范围。若证据不足，明确标注假设和验证方式。""",
+                tools=["read", "write", "grep", "glob", "search", "web_fetch", "ask_question"],
+                skills=["grill-me", "domain-modeling", "writing-plans", "executing-plans", "project-docs"],
                 mcp_servers=["web-search"],
-                permission_mode="ask", chat_mode="plan", max_steps=60, is_system=True,
+                permission_mode="ask", chat_mode="chat", max_steps=60, is_system=True,
             ),
             AgentProfile(
                 profile_id="agent_tester",
-                name="\u6d4b\u8bd5\u667a\u80fd\u4f53",
-                description="设计测试、执行验证、隔离回归并输出可复现缺陷。",
+                name="测试工程智能体",
+                description="基于风险设计测试、执行自动化验证、定位缺陷并给出发布质量结论。",
                 system_prompt="""# 角色
-你是软件测试与质量保障智能体。把需求和实现变更转化为可执行的证据，并准确报告质量风险。
+你是一名资深测试工程智能体。测试目标不是增加用例数量，而是用最小而有效的测试集尽早暴露高风险缺陷。
 
 # 方法
-1. 检查需求、变更代码、现有测试和运行配置。覆盖正常路径、边界、失败、兼容性和回归风险。
-2. 尽可能复用项目现有的测试命令和框架。执行前说明范围，并保留关键结果证据。
-3. 缺陷报告必须包含环境/前置条件、精确复现步骤、期望结果、实际结果、影响、严重度和证据。
-4. 明确区分已确认缺陷、风险观察和疑问。不要把未运行的测试或偶发症状当作已确认结论。
+1. 阅读需求、验收标准、改动 diff、调用链和历史测试，识别业务与技术风险。
+2. 建立覆盖矩阵：正常路径、边界值、异常恢复、权限/安全、并发/幂等、兼容性、性能和可访问性。
+3. 按风险排序：P0 为核心流程、数据正确性和安全；P1 为高频边界与集成；P2 为低概率体验问题。
+4. 单元测试验证纯逻辑，集成测试验证模块边界，E2E 只覆盖关键用户旅程；避免在不同层级重复覆盖同一细节。
+5. 测试失败时先稳定复现、保留证据并定位根因，不把环境问题误判为代码问题。
+6. 缺陷报告必须包含环境、前置条件、最小复现步骤、实际/预期结果、证据、影响和严重级别。
+7. 完成前运行真实测试并记录命令、结果和未覆盖项；不得以静态阅读代替验证。
 
 # 技能使用规则（绑定以下 skill，触发场景必须使用）
-- 编写测试用例时使用 `test-driven-development` 技能：先写失败测试，再最小实现使其通过。
-- 回归排查时使用 `diagnosing-bugs` 技能：复现→定位→假设→验证，输出可复现步骤。
-- 完成测试/验证后使用 `verification-before-completion` 技能：以真实运行证据为准，不凭猜测下结论。
-- 以测试视角审查代码时使用 `code-review` 技能：检查测试覆盖缺口、可测性和边界。
+- 新增行为使用 `test-driven-development`。
+- 疑难故障使用 `systematic-debugging` 或 `diagnosing-bugs`。
+- 以测试视角审查实现时使用 `code-review`。
+- Vue 项目使用 `vue-testing-best-practices`；其他技术栈遵循仓库现有测试框架。
+- 交付前必须使用 `verification-before-completion`，以真实运行证据为准。
 
-# 工具与输出策略
-分析用 read/grep/glob；仅在需要做聚焦验证时使用 bash 或 python。未经明确授权不得修改产品代码。先给质量结论和阻塞项，再给覆盖范围、执行结果、失败项和推荐后续动作。""",
+# 默认交付模板
+- 测试范围与风险摘要
+- 环境、数据和前置条件
+- 覆盖矩阵、优先级和自动化层级
+- 测试实现或可执行步骤
+- 执行命令、结果、缺陷和阻塞项
+- 未覆盖项与剩余风险
+- 发布建议：通过 / 有条件通过 / 阻塞
+
+# 质量底线
+测试必须可复现、可观察、可维护；避免只断言实现细节、过度依赖 snapshot、使用固定 sleep 掩盖异步问题，或在没有证据时宣称通过。未经明确授权不得修改产品代码。""",
                 tools=["read", "grep", "glob", "bash", "python"],
-                skills=["code-review", "test-driven-development",
-                        "verification-before-completion", "diagnosing-bugs"],
+                skills=["code-review", "test-driven-development", "systematic-debugging",
+                        "diagnosing-bugs", "verification-before-completion",
+                        "vue-testing-best-practices"],
                 mcp_servers=[],
                 permission_mode="ask", chat_mode="chat", max_steps=80, is_system=True,
             ),
@@ -861,10 +955,32 @@ class WorkspaceSessionStore:
                                  *, model: str = None, permission_mode: str = None,
                                  chat_mode: str = None, reasoning_level: str = None, name: str = None,
                                  expected_busy: bool = False) -> WorkspaceSession:
-        """更新运行期覆盖（模型/权限/chat mode/名称）。busy 时拒绝。"""
+        """更新运行期覆盖（模型/权限/chat mode/名称）。busy 时拒绝。
+
+        存储层枚举校验：permission_mode / chat_mode / reasoning_level 非法值
+        抛 ValidationError（400），不落库（与 API 白名单双重防线）。
+        """
         current = self.get_owned(workspace_id, session_id)
         if expected_busy and current.is_busy:
             raise StoreBusy("会话正在运行，不能切换配置", code="WORKSPACE_SESSION_BUSY")
+        if permission_mode is not None:
+            permission_mode = str(permission_mode).strip()
+            if permission_mode not in VALID_PERMISSION_MODES:
+                raise ValidationError(
+                    f"permission_mode 必须是 {VALID_PERMISSION_MODES} 之一",
+                    code="INVALID_PERMISSION_MODE")
+        if chat_mode is not None:
+            chat_mode = str(chat_mode).strip()
+            if chat_mode not in VALID_CHAT_MODES:
+                raise ValidationError(
+                    f"chat_mode 必须是 {VALID_CHAT_MODES} 之一",
+                    code="INVALID_CHAT_MODE")
+        if reasoning_level is not None:
+            reasoning_level = str(reasoning_level).strip().lower()
+            if reasoning_level not in VALID_REASONING_LEVELS:
+                raise ValidationError(
+                    f"reasoning_level 必须是 {VALID_REASONING_LEVELS} 之一",
+                    code="INVALID_REASONING_LEVEL")
         fields = []
         params: list = []
         if model is not None:
@@ -885,6 +1001,7 @@ class WorkspaceSessionStore:
         if not fields:
             return current
         now = utc_now()
+        fields.append("client_config_version=client_config_version+1")
         fields.append("updated_at=?")
         params.append(now)
         params.extend([workspace_id, session_id])
@@ -903,6 +1020,35 @@ class WorkspaceSessionStore:
                 "WHERE workspace_id=? AND session_id=?",
                 (1 if busy else 0, utc_now(), workspace_id, session_id),
             )
+
+    def try_set_busy(self, workspace_id: str, session_id: str) -> bool:
+        """条件置忙：仅当当前未忙时成功（UPDATE ... WHERE is_busy=0 检查 rowcount）。
+
+        供会话执行入口使用：并发请求只有首个能获得 busy 令牌，
+        finally 侧仅由获得令牌者清除（token/owner 语义，防止误清他人持有）。
+        """
+        with self._db.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE workspace_sessions SET is_busy=1, updated_at=? "
+                "WHERE workspace_id=? AND session_id=? AND is_busy=0",
+                (utc_now(), workspace_id, session_id),
+            )
+            return int(cursor.rowcount or 0) > 0
+
+    def reset_stale_busy(self) -> int:
+        """Clear persisted busy flags left by an interrupted gateway process.
+
+        ``is_busy`` describes an in-process request, so it cannot survive a
+        gateway restart. Active requests set it back to true before dispatch;
+        startup recovery must clear only the durable stale marker.
+        """
+        with self._db.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE workspace_sessions SET is_busy=0, updated_at=? "
+                "WHERE is_busy=1",
+                (utc_now(),),
+            )
+            return int(cursor.rowcount or 0)
 
     def touch_snapshot(self, workspace_id: str, session_id: str,
                        snapshot_id: str) -> None:
@@ -1022,69 +1168,6 @@ class RuntimeSnapshotStore:
                 (dedup_key,),
             ).fetchone()
         return _snapshot_from_row(row) if row else None
-
-    def list_for_session(self, workspace_session_id: str,
-                         limit: int = 50) -> list[RuntimeSnapshot]:
-        with self._db.connection() as conn:
-            rows = conn.execute(
-                "SELECT * FROM workspace_runtime_snapshots "
-                "WHERE workspace_session_id=? ORDER BY created_at DESC LIMIT ?",
-                (workspace_session_id, limit),
-            ).fetchall()
-        return [_snapshot_from_row(r) for r in rows]
-
-    def retain(self, *, days: int = 30, per_workspace: int = 10) -> int:
-        """只删除超期/超量且未被当前 Session 引用的旧快照（P1-S-09）。"""
-        from datetime import timedelta
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        deleted = 0
-        with self._db.transaction() as conn:
-            referenced = set()
-            for r in conn.execute(
-                    "SELECT DISTINCT last_snapshot_id FROM workspace_sessions "
-                    "WHERE last_snapshot_id != ''").fetchall():
-                referenced.add(r["last_snapshot_id"])
-            rows = conn.execute(
-                "SELECT snapshot_id FROM workspace_runtime_snapshots "
-                "WHERE created_at < ?", (cutoff,),
-            ).fetchall()
-            for r in rows:
-                if r["snapshot_id"] in referenced:
-                    continue
-                conn.execute(
-                    "DELETE FROM workspace_runtime_snapshots WHERE snapshot_id=?",
-                    (r["snapshot_id"],),
-                )
-                deleted += 1
-            ws_rows = conn.execute(
-                "SELECT DISTINCT workspace_session_id FROM workspace_runtime_snapshots"
-            ).fetchall()
-            for w in ws_rows:
-                sid = w["workspace_session_id"]
-                keep = conn.execute(
-                    "SELECT snapshot_id FROM workspace_runtime_snapshots "
-                    "WHERE workspace_session_id=? ORDER BY created_at DESC LIMIT ?",
-                    (sid, per_workspace),
-                ).fetchall()
-                keep_ids = {r["snapshot_id"] for r in keep}
-                old = conn.execute(
-                    "SELECT snapshot_id FROM workspace_runtime_snapshots "
-                    "WHERE workspace_session_id=?", (sid,),
-                ).fetchall()
-                for r in old:
-                    if r["snapshot_id"] in keep_ids or r["snapshot_id"] in referenced:
-                        continue
-                    conn.execute(
-                        "DELETE FROM workspace_runtime_snapshots WHERE snapshot_id=?",
-                        (r["snapshot_id"],),
-                    )
-                    deleted += 1
-        return deleted
-
-# ============================================================
-# 行 → 模型
-# ============================================================
-
 
 def _workspace_from_row(row) -> Workspace:
     return Workspace(

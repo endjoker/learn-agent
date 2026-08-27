@@ -19,6 +19,8 @@ class MemorySearchTool(BaseTool):
     """
 
     name: str = "memory_search"
+    # B5：读为主的检索（MemoryManager.search 内部持锁；命中会权重+1，锁内串行，无数据竞态）
+    parallel_safe: bool = True
     description: str = (
         "搜索历史对话记忆。"
         "当用户询问之前讨论过的内容、需要回忆上次对话的上下文、"
@@ -55,7 +57,10 @@ class MemorySearchTool(BaseTool):
         if self._manager is None:
             return "⏳ 记忆系统未就绪（memory=True 时可用）"
 
-        limit = min(max(1, int(limit)), 20)
+        try:
+            limit = min(max(1, int(limit)), 20)
+        except (TypeError, ValueError):
+            limit = 5
         results = self._manager.search(query=query, date=date, limit=limit)
 
         if not results:
@@ -121,6 +126,18 @@ class MemoryUpdateTool(BaseTool):
     def execute(self, memory_id: int, action: str) -> str:
         if self._manager is None:
             return "⏳ 记忆系统未就绪"
+
+        try:
+            memory_id = int(memory_id)
+        except (TypeError, ValueError):
+            return "❌ memory_id 必须是整数"
+
+        # 枚举显式校验（P3-3）：非法值不能被静默当作 not_useful 处理
+        if action not in ("useful", "not_useful"):
+            return (
+                f"❌ 非法的 action 值: '{action}'。"
+                f"只允许 'useful'（权重+1）或 'not_useful'（权重-1），请修正后重试"
+            )
 
         delta = 1 if action == "useful" else -1
         success = self._manager.update_weight(memory_id, delta)

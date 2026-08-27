@@ -1,6 +1,7 @@
 """Deterministic quality checks for durable Plan workflows."""
 from __future__ import annotations
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -40,8 +41,12 @@ class QualityGate:
         exe=Path(argv[0]); allowed=False
         if exe.is_absolute() or any(ch in argv[0] for ch in ("/","\\")):
             exe=(exe if exe.is_absolute() else self.project_root/exe).resolve()
-            venv=(self.project_root/".venv"/"Scripts"/"python.exe").resolve()
-            allowed=exe == venv
+            if sys.platform == "win32":
+                venv = (self.project_root / ".venv" / "Scripts" / "python.exe")
+            else:
+                venv = (self.project_root / ".venv" / "bin" / "python")
+            venv = venv.resolve()
+            allowed = exe == venv
             argv=[str(exe),*argv[1:]]
         elif argv[0].lower()=="git" and argv[1:2] in (["diff"],["status"]): allowed=True
         if not allowed: return False,"command must use project .venv Python or read-only git"

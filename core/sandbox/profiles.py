@@ -12,8 +12,11 @@ from core.config_loader import _deep_merge
 logger = logging.getLogger("jk_agent")
 
 # 默认配置（config.json 无 sandbox section 时使用）
+# enabled 默认关闭：L2 沙箱硬闸门（命令/代码/进程内容拦截、系统路径拦截等）
+# 默认不生效；需要时通过 config.json → sandbox.enabled = true 重新开启。
+# 关闭时安全兜底仍由 4 档 PolicyEngine（readonly/ask/allow/unreviewed）承担。
 _DEFAULT_CONFIG = {
-    "enabled": True,
+    "enabled": False,
     "default_profile": "agent",
     "idle_timeout_seconds": 300,   # 长驻进程空闲上限（5 分钟无 read/send → kill），供 ProcessManager 用
     "network": {
@@ -38,7 +41,7 @@ _DEFAULT_CONFIG = {
         "agent": {
             "memory_mb": 512,
             "cpu_seconds": 30,
-            "timeout_seconds": 60,
+            "timeout_seconds": 1200,
             "max_processes": 50,
             "max_output_mb": 10,
             "max_files": 256,
@@ -70,7 +73,6 @@ _DEFAULT_CONFIG = {
         },
     },
 }
-
 
 
 def load_config() -> dict[str, Any]:

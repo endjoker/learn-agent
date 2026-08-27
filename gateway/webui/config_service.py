@@ -10,6 +10,12 @@ ConfigService —— config 读写服务（P3c 建，P3d 复用）
 白名单（保守版，用户决策）：llm / gateway.sessions / prompt / workspace；
 mcp.servers 走专用端点 update_mcp_servers（整表替换）。
 permission / sandbox / hooks / gateway 主段 不开放 UI 编辑。
+
+注意（2026-08-26 设置页清理时核实）：GatewayServer 的 self.config 是
+get_gateway_config() 返回的 **gateway 子段**（gateway/config.py），因此
+"gateway.sessions" 就是会话参数的真实路径（sess_cfg = config.get("sessions")
+读到的即 gateway.sessions）；workspace 段的 path 键当前无消费者（agent
+工作区来自 permission.workspace），UI 已不再暴露该卡片，但段保留可编辑。
 """
 
 import asyncio
@@ -17,17 +23,19 @@ import copy
 
 from core.config_writer import (
     read_raw_config, write_config, backup_file, mask_dict,
-    is_masked_placeholder, default_config_path,
+    is_masked_placeholder, is_secret_key_name, default_config_path,
 )
 
 # 通用 PATCH 可编辑段（mcp.servers 除外，走专用端点）
 EDITABLE_SECTIONS = {"llm", "prompt", "workspace", "gateway.sessions"}
 
-_SECRET_KEYS = ("api_key", "token", "secret", "password", "authorization")
-
 
 class ConfigConflictError(Exception):
-    """base_rev 不符（并发写冲突）"""
+    """base_rev 不符（并发写冲突）。携带当前 rev 供客户端自动重试。"""
+
+    def __init__(self, message: str, current_rev: int):
+        super().__init__(message)
+        self.current_rev = current_rev
 
 
 class ConfigService:
@@ -64,8 +72,9 @@ class ConfigService:
             raise ValueError("patch 必须是对象")
 
         async with self._lock:
-            if base_rev is not None and base_rev != self._rev():
-                raise ConfigConflictError("config 已被修改，请刷新后重试")
+            # 单用户本地部署：采用 last-write-wins，不再用 config.json mtime 做乐观锁。
+            # mtime 每次写盘都变化，导致保存频繁 409；进程内 asyncio.Lock 已串行化并发写，
+            # base_rev 仅保留参数兼容（忽略）。
             data, status = read_raw_config()
             if status == "corrupt":
                 raise ValueError("config.json 损坏，请人工修复后重试")
@@ -73,6 +82,20 @@ class ConfigService:
             target = self._ensure_path(data, section)
             self._merge(target, patch)
 
+            backup_file()
+            write_config(None, data)
+            self._force_reload()
+            return self._rev()
+
+    # ---------- 写：整表（持锁管线） ----------
+
+    async def write_full(self, data: dict) -> int:
+        """整表写盘（持锁管线：backup → write → force_reload）。
+
+        供 api_settings.backup_and_write / main_session_put 等配置写盘统一走
+        ConfigService 的 asyncio.Lock 串行化，避免绕过锁的并发写冲突。
+        """
+        async with self._lock:
             backup_file()
             write_config(None, data)
             self._force_reload()
@@ -123,5 +146,6 @@ class ConfigService:
 
     @staticmethod
     def _is_secret_key(key: str) -> bool:
-        lk = str(key).lower()
-        return any(s in lk for s in _SECRET_KEYS)
+        """密钥键名判定：复用 config_writer 的统一正则（含 encrypt_key/
+        appkey/access_key 等扩充变体），保证读侧脱敏与写侧保留同源一致。"""
+        return is_secret_key_name(key)

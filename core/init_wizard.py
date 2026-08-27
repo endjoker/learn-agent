@@ -9,6 +9,7 @@
 设计要点:
   - 裸读 config.json（不用 load_config），避免默认值膨胀和环境变量密钥泄露
   - 全程只收集 fragments，最后确认 → 备份 → 原子写，Ctrl+C 零副作用
+  - 稀疏写入：只固化用户显式选择/确认的值，默认值留在代码里随版本演进
   - MCP servers 返回完整列表（_deep_merge 对 list 是整体替换）
 """
 
@@ -98,6 +99,32 @@ def _ask_int(prompt: str, default: int) -> int:
             return int(val)
         except ValueError:
             print(f"  ❗ 请输入整数，如 {default}")
+
+
+def _as_int(value, default: int) -> int:
+    """把配置值安全转 int；缺失/非法（旧配置中的字符串脏值等）回退默认值。
+
+    向导把现有配置值当作输入默认值时使用，避免 int("abc") 直接崩溃。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_valid_host(value: str) -> bool:
+    """监听地址基础校验：IP（v4/v6）或合法主机名。"""
+    value = value.strip()
+    if not value or any(ch.isspace() for ch in value):
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        pass
+    # 主机名：字母/数字/点/连字符/下划线，不以连字符开头
+    return (not value.startswith("-")
+            and all(ch.isalnum() or ch in ".-_" for ch in value))
 
 
 def _ask_yes_no(prompt: str, default: bool = True) -> bool:
@@ -558,7 +585,7 @@ def _step_agent_runtime(existing: dict) -> Optional[dict]:
     )
     max_result_chars = max(0, _ask_int(
         "Maximum characters retained from one tool result (0 disables truncation)",
-        int(runtime.get("max_tool_result_chars", 10000)),
+        _as_int(runtime.get("max_tool_result_chars"), 10000),
     ))
     retired_keys = {
         "response_protocol", "legacy_execute", "protocol_retry_limit",
@@ -566,7 +593,7 @@ def _step_agent_runtime(existing: dict) -> Optional[dict]:
     }
     needs_migration = any(key in runtime for key in retired_keys)
     if (runtime.get("native_tool_streaming") is native_stream
-            and int(runtime.get("max_tool_result_chars", 10000)) == max_result_chars
+            and _as_int(runtime.get("max_tool_result_chars"), 10000) == max_result_chars
             and not needs_migration):
         return None
     return {"agent_runtime": {
@@ -595,13 +622,13 @@ def _step_task_runtime(existing: dict) -> Optional[dict]:
     if store.get("backend", "sqlite") != "sqlite":
         store_changes["backend"] = "sqlite"
 
-    max_workers = _ask_int("TaskRuntime 最大并发会话数", int(runtime.get("max_global_concurrency", 4)))
+    max_workers = _ask_int("TaskRuntime 最大并发会话数", _as_int(runtime.get("max_global_concurrency"), 4))
     if max_workers != runtime.get("max_global_concurrency", 4):
         runtime_changes["max_global_concurrency"] = max_workers
-    timeout = _ask_int("TaskRuntime 默认超时（秒）", int(runtime.get("default_timeout_seconds", 1200)))
+    timeout = _ask_int("TaskRuntime 默认超时（秒）", _as_int(runtime.get("default_timeout_seconds"), 1200))
     if timeout != runtime.get("default_timeout_seconds", 1200):
         runtime_changes["default_timeout_seconds"] = timeout
-    grace = _ask_int("超时后取消等待时间（秒）", int(runtime.get("cancel_grace_seconds", 10)))
+    grace = _ask_int("超时后取消等待时间（秒）", _as_int(runtime.get("cancel_grace_seconds"), 10))
     if grace != runtime.get("cancel_grace_seconds", 10):
         runtime_changes["cancel_grace_seconds"] = grace
 
@@ -613,6 +640,82 @@ def _step_task_runtime(existing: dict) -> Optional[dict]:
     return changes or None
 
 
+def _step_goal(existing: dict) -> Optional[dict]:
+    """Configure the durable Goal runtime defaults."""
+    print("\n  Goal（长期目标自动续跑）")
+    goal = existing.get("goal", {})
+    changes: dict[str, Any] = {}
+    enabled = _ask_yes_no("启用 Goal 模块？", default=is_enabled(goal.get("enabled"), True))
+    if enabled != is_enabled(goal.get("enabled"), True):
+        changes["enabled"] = enabled
+    max_active = _ask_int("每会话最大同时运行的 Goal 数",
+                          _as_int(goal.get("max_active_per_session"), 1))
+    if max_active >= 1 and max_active != goal.get("max_active_per_session", 1):
+        changes["max_active_per_session"] = max_active
+    return {"goal": changes} if changes else None
+
+
+def _step_subagent(existing: dict) -> Optional[dict]:
+    """Configure the Subagent delegation runtime defaults."""
+    print("\n  Subagent（子 Agent 委派）")
+    sub = existing.get("subagent", {})
+    changes: dict[str, Any] = {}
+    enabled = _ask_yes_no("启用 Subagent 模块？", default=is_enabled(sub.get("enabled"), True))
+    if enabled != is_enabled(sub.get("enabled"), True):
+        changes["enabled"] = enabled
+    max_children = _ask_int("每 Goal 最大子 Agent 数", _as_int(sub.get("max_children"), 4))
+    if max_children >= 1 and max_children != sub.get("max_children", 4):
+        changes["max_children"] = max_children
+    one_level = _ask_yes_no("子 Agent 仅一层（不可再派生）？",
+                            default=is_enabled(sub.get("one_level_only"), True))
+    if one_level != is_enabled(sub.get("one_level_only"), True):
+        changes["one_level_only"] = one_level
+    return {"subagent": changes} if changes else None
+
+
+def _step_retention(existing: dict) -> Optional[dict]:
+    """Configure the runtime record retention policy."""
+    print("\n  Retention（运行时记录保留策略）")
+    ret = existing.get("retention", {})
+    changes: dict[str, Any] = {}
+    enabled = _ask_yes_no("启用自动清理？", default=is_enabled(ret.get("enabled"), True))
+    if enabled != is_enabled(ret.get("enabled"), True):
+        changes["enabled"] = enabled
+    terminal = _ask_int("终态任务保留天数", _as_int(ret.get("terminal_days"), 30))
+    if terminal >= 1 and terminal != ret.get("terminal_days", 30):
+        changes["terminal_days"] = terminal
+    artifact = _ask_int("Artifact 保留天数", _as_int(ret.get("artifact_days"), 30))
+    if artifact >= 1 and artifact != ret.get("artifact_days", 30):
+        changes["artifact_days"] = artifact
+    interval = _ask_int("清理间隔（秒）", _as_int(ret.get("interval_seconds"), 3600))
+    if interval >= 1 and interval != ret.get("interval_seconds", 3600):
+        changes["interval_seconds"] = interval
+    return {"retention": changes} if changes else None
+
+
+def _step_runtime_store(existing: dict) -> Optional[dict]:
+    """Configure the unified SQLite runtime store (path / WAL / busy timeout).
+
+    此前是向导唯一未覆盖的顶层段（2026-08 审计补齐）：统一会话/任务运行时
+    的存储位置属用户可感知选项（备份/迁移/磁盘容量决策），给出显式入口。
+    """
+    print("\n  🗄️  运行时存储（统一会话 + 任务运行时，SQLite）")
+    current = existing.get("runtime_store", {}) or {}
+    changes: dict[str, Any] = {}
+    path = _ask("SQLite 路径", current.get("path", "./workspace/.agent/state/runtime.db"))
+    if path != current.get("path", "./workspace/.agent/state/runtime.db"):
+        changes["path"] = path
+    wal = _ask_yes_no("启用 WAL 模式（并发读写更稳，推荐）",
+                      default=is_enabled(current.get("wal"), True))
+    if wal != is_enabled(current.get("wal"), True):
+        changes["wal"] = wal
+    busy = _ask_int("busy_timeout 毫秒（写冲突等待）",
+                    _as_int(current.get("busy_timeout_ms"), 5000))
+    if busy != _as_int(current.get("busy_timeout_ms"), 5000):
+        changes["busy_timeout_ms"] = busy
+    return {"runtime_store": changes} if changes else None
+
+
 def _step_artifacts(existing: dict) -> Optional[dict]:
     """Configure the durable ArtifactStore root and retention limits."""
     print("\n  产物存储（ArtifactStore）")
@@ -621,10 +724,10 @@ def _step_artifacts(existing: dict) -> Optional[dict]:
     root = _ask("Artifact 根目录", artifacts.get("root", "./workspace/.agent/artifacts"))
     if root != artifacts.get("root", "./workspace/.agent/artifacts"):
         changes["root"] = root
-    max_bytes = _ask_int("单个 Artifact 最大字节数", int(artifacts.get("max_file_bytes", 52428800)))
+    max_bytes = _ask_int("单个 Artifact 最大字节数", _as_int(artifacts.get("max_file_bytes"), 52428800))
     if max_bytes > 0 and max_bytes != artifacts.get("max_file_bytes", 52428800):
         changes["max_file_bytes"] = max_bytes
-    retention = _ask_int("Artifact 保留天数", int(artifacts.get("retention_days", 30)))
+    retention = _ask_int("Artifact 保留天数", _as_int(artifacts.get("retention_days"), 30))
     if retention >= 1 and retention != artifacts.get("retention_days", 30):
         changes["retention_days"] = retention
     return {"artifacts": changes} if changes else None
@@ -640,26 +743,45 @@ def _step_gateway_runtime(existing: dict) -> Optional[dict]:
     enabled = _ask_yes_no("启用 Gateway？", default=is_enabled(gateway.get("enabled"), True))
     if enabled != is_enabled(gateway.get("enabled"), True):
         changes["enabled"] = enabled
-    host = _ask("监听地址", str(gateway.get("host", "127.0.0.1")))
+    while True:
+        host = _ask("监听地址", str(gateway.get("host", "127.0.0.1")))
+        if _is_valid_host(host):
+            break
+        print("  ❗ 无效的监听地址（应为 IP 地址或主机名）")
     if host != gateway.get("host", "127.0.0.1"):
         changes["host"] = host
-    port = _ask_int("监听端口", int(gateway.get("port", 9120)))
+    while True:
+        port = _ask_int("监听端口", _as_int(gateway.get("port"), 9120))
+        if 1 <= port <= 65535:
+            break
+        print("  ❗ 端口范围应为 1-65535")
     if port != gateway.get("port", 9120):
         changes["port"] = port
-    workers = _ask_int("工作线程数", int(gateway.get("worker_pool_size", 4)))
+    workers = _ask_int("工作线程数", _as_int(gateway.get("worker_pool_size"), 4))
     if workers != gateway.get("worker_pool_size", 4):
         changes["worker_pool_size"] = workers
 
     agent_changes: dict[str, Any] = {}
-    max_steps = _ask_int("单轮最大工具步骤", int(agent.get("max_steps", 100)))
+    max_steps = _ask_int("单轮最大工具步骤", _as_int(agent.get("max_steps"), 100))
     if max_steps != agent.get("max_steps", 100):
         agent_changes["max_steps"] = max_steps
+    # 权限默认值诚实化：全新配置实际合并写入的是 _DEFAULT_CONFIG 的默认值
+    # （gateway.agent.permission_mode="allow"）；向导推荐 ask 时与之比对，
+    # 确保写出的就是向导展示/推荐的值，消除"展示 ask 实际 allow"漂移。
+    gateway_agent_defaults = _DEFAULT_CONFIG["gateway"]["agent"]
     permission_mode = _ask_choice("Gateway 默认权限:", [
-        ("ask", "ask — 需要确认"), ("allow", "allow — 允许"),
+        ("ask", "ask — 需要确认（推荐）"), ("allow", "allow — 全部允许"),
         ("unreviewed", "unreviewed — 不审查"),
     ], default=1)
-    if permission_mode != agent.get("permission_mode", "ask"):
+    if permission_mode != agent.get("permission_mode", gateway_agent_defaults["permission_mode"]):
         agent_changes["permission_mode"] = permission_mode
+    # ask 模式不自动批准 Plan（allow / unreviewed 才推荐自动批准）；
+    # 无论选哪种模式都把 auto_approve_plan 与所选权限对齐写入，消除漂移
+    auto_approve = _ask_yes_no(
+        "自动批准 Plan（仅 allow / unreviewed 推荐）？",
+        default=permission_mode != "ask")
+    if auto_approve != is_enabled(agent.get("auto_approve_plan"), gateway_agent_defaults["auto_approve_plan"]):
+        agent_changes["auto_approve_plan"] = auto_approve
     quiet = _ask_yes_no("静默运行（不向终端输出模型分片）？", default=is_enabled(agent.get("quiet"), True))
     if quiet != is_enabled(agent.get("quiet"), True):
         agent_changes["quiet"] = quiet
@@ -673,7 +795,7 @@ def _step_gateway_runtime(existing: dict) -> Optional[dict]:
         ("soft_timeout_seconds", "软超时秒数", 90),
         ("hard_timeout_seconds", "硬超时秒数", 1200),
     ):
-        value = _ask_int(label, int(sessions.get(key, default)))
+        value = _ask_int(label, _as_int(sessions.get(key), default))
         if value != sessions.get(key, default):
             session_changes[key] = value
     persist = _ask_yes_no("持久化会话历史？", default=is_enabled(sessions.get("persist"), True))
@@ -704,10 +826,14 @@ def _step_workspace_and_prompt(existing: dict) -> Optional[dict]:
     workspace_changes: dict[str, Any] = {}
     # permission.workspace is the runtime source of truth.  Keep the
     # workspace section in sync because it is exposed by the WebUI settings.
-    current_path = str(permission.get("workspace", workspace.get("path", "./workspace")))
-    path = _ask("工作区路径", current_path)
-    if path != workspace.get("path", "./workspace"):
-        workspace_changes["path"] = path
+    # 回车不静默改写：仅当用户显式输入了不同于默认值的路径才记录变更。
+    default_path = str(permission.get("workspace", workspace.get("path", "./workspace")))
+    path = _ask("工作区路径", default_path)
+    if path != default_path:
+        if path != workspace.get("path", "./workspace"):
+            workspace_changes["path"] = path
+        if path != permission.get("workspace", "./workspace"):
+            changes["permission"] = {"workspace": path}
     # Older configs stored descriptions as an object; use its directory names
     # as the editable list without silently replacing it unless the user edits.
     stored_dirs = workspace.get("dirs", []) or []
@@ -718,15 +844,13 @@ def _step_workspace_and_prompt(existing: dict) -> Optional[dict]:
         workspace_changes["dirs"] = new_dirs
     if workspace_changes:
         changes["workspace"] = workspace_changes
-    if path != permission.get("workspace", "./workspace"):
-        changes["permission"] = {"workspace": path}
 
     prompt_changes: dict[str, Any] = {}
     for key, label, default in (
         ("bootstrap_max_chars_per_file", "单个引导文件最大字符数", 8000),
         ("bootstrap_max_chars_total", "引导文件总最大字符数", 32000),
     ):
-        value = _ask_int(label, int(prompt.get(key, default)))
+        value = _ask_int(label, _as_int(prompt.get(key), default))
         if value != prompt.get(key, default):
             prompt_changes[key] = value
     warning = _ask_choice("提示词截断警告:", [
@@ -741,20 +865,11 @@ def _step_workspace_and_prompt(existing: dict) -> Optional[dict]:
 
 
 def _step_tool_security(existing: dict) -> Optional[dict]:
-    """Optionally collect explicit tool rules and sandbox network deny lists."""
-    if not _ask_yes_no("配置工具权限和网络封锁策略？", default=False):
+    """Optionally collect sandbox network deny lists (permission follows four-tier)."""
+    if not _ask_yes_no("配置网络封锁策略？", default=False):
         return None
-    permission = existing.get("permission", {})
     sandbox = existing.get("sandbox", {})
     changes: dict[str, Any] = {}
-    if _ask_yes_no("编辑工具规则（每行 工具名=ask/allow/deny）？", default=False):
-        rules = _ask_kv_lines("工具规则")
-        invalid = {k: v for k, v in rules.items() if v not in {"ask", "allow", "deny"}}
-        if invalid:
-            print("  ⚠️ 已忽略无效规则值，仅允许 ask/allow/deny")
-            rules = {k: v for k, v in rules.items() if k not in invalid}
-        if rules:
-            changes["permission"] = {"tool_rules": rules}
     if _ask_yes_no("编辑网络封锁域名/IP 列表？", default=False):
         network = sandbox.get("network", {})
         domains = _ask("封锁域名（逗号分隔）", ",".join(network.get("blocked_domains", [])))
@@ -811,10 +926,13 @@ def _step_advanced(existing: dict) -> Optional[dict]:
     perm_cfg = existing.get("permission", {})
     current_mode = perm_cfg.get("default_mode", "ask")
     print(f"\n  📋 权限管理（当前: {current_mode}）")
+    # 只提供运行时的四档真实模式（core/policy_engine.VALID_MODES）；
+    # 旧菜单里的 deny 不是有效档位，运行时会被静默强制回退为 ask，属于展示漂移
     mode = _ask_choice("默认权限模式:", [
         ("ask", "ask — 每次询问（推荐）"),
         ("allow", "allow — 全部允许（⚠️ 不安全）"),
-        ("deny", "deny — 全部拒绝（最严格）"),
+        ("readonly", "readonly — 只读，禁止写操作"),
+        ("unreviewed", "unreviewed — 不审查"),
     ], default=1)
     perm_changes: dict[str, Any] = {}
     if mode != current_mode:
@@ -837,7 +955,8 @@ def _step_advanced(existing: dict) -> Optional[dict]:
 
     # ---- Sandbox ----
     sb_cfg = existing.get("sandbox", {})
-    current_enabled = sb_cfg.get("enabled", True)
+    # L2 沙箱硬闸门默认关闭（与 sandbox 配置默认一致）
+    current_enabled = sb_cfg.get("enabled", False)
     print(f"\n  🛡️ 沙箱（当前: {'开启' if current_enabled else '关闭'}）")
     sb_enabled = _ask_yes_no("启用沙箱？", default=current_enabled)
     sb_changes: dict[str, Any] = {}
@@ -896,13 +1015,27 @@ def _print_summary(fragments: list[dict], existing: dict) -> None:
             elif section == "sandbox":
                 for k, v in value.items():
                     print(f"  sandbox.{k}:  → {v}")
+            elif section == "workspace":
+                for k, v in value.items():
+                    print(f"  workspace.{k}: → {v}")
+            elif section == "prompt":
+                for k, v in value.items():
+                    print(f"  prompt.{k}:    → {v}")
             elif section == "gateway":
-                for k, v in value.get("webui", {}).items():
-                    print(f"  gateway.webui.{k}: → {v}")
+                for k, v in value.items():
+                    if isinstance(v, dict):
+                        for k2, v2 in v.items():
+                            print(f"  gateway.{k}.{k2}: → {v2}")
+                    else:
+                        print(f"  gateway.{k}:   → {v}")
 
-    # 未修改的 section
+    # 未修改的 section（覆盖向导可能触及的全部顶层段）
     touched = {k for frag in fragments for k in frag}
-    untouched = [s for s in ("llm", "mcp", "hooks", "permission", "sandbox", "gateway") if s not in touched]
+    untouched = [s for s in (
+        "llm", "mcp", "hooks", "permission", "sandbox", "gateway",
+        "agent_runtime", "task_runtime", "runtime_store", "goal",
+        "subagent", "retention", "artifacts", "workspace", "prompt",
+    ) if s not in touched]
     if untouched:
         print(f"  {'/'.join(untouched)}: 不修改")
 
@@ -924,6 +1057,66 @@ def _print_banner(status: str, existing: dict) -> None:
         print("\n  📄 检测到已有配置 config.json（增量修改模式）")
         print()
         _overview(existing)
+
+
+# ============================================================
+# 配置补齐工具（嵌套键级，不覆盖已有值）
+# ============================================================
+
+def _nested_missing(defaults: dict, existing: dict) -> bool:
+    """递归判断 existing 相对 defaults 是否有缺失的嵌套键。"""
+    for key, value in defaults.items():
+        if key not in existing:
+            return True
+        if isinstance(value, dict) and isinstance(existing.get(key), dict):
+            if _nested_missing(value, existing[key]):
+                return True
+    return False
+
+
+def _sections_needing_backfill(defaults: dict, existing: dict) -> list[str]:
+    """返回需要补齐默认值的顶层 section。
+
+    不仅包含完全缺失的 section，还包含内部新增了默认键的既有 section
+    （例如 agent_runtime.max_parallel_tools、workspace 新增键），确保
+    后续版本新增的配置在重新初始化时以本地现有值为主、缺失键补默认值。
+    """
+    need: list[str] = []
+    for key, default in defaults.items():
+        if key not in existing:
+            need.append(key)
+            continue
+        if isinstance(default, dict) and isinstance(existing.get(key), dict):
+            if _nested_missing(default, existing[key]):
+                need.append(key)
+    return need
+
+
+def _strip_default_equal_leaves(node: dict, defaults: dict) -> dict:
+    """剥离与 _DEFAULT_CONFIG 完全相同的键值，保留 section 骨架（稀疏写入）。
+
+    规则：
+      - 双方都是 dict → 递归；子级全部剥空时保留空 dict 占位（骨架可见）；
+      - 叶子值（list 视为整体）与当前默认完全相等 → 剥离，运行期由代码内
+        默认回落，日后版本调整默认值才能对老配置生效；
+      - 其余（用户显式设置、版本新增/扩展键）原样保留。
+
+    用户在向导中改过的值必然不同于当前默认，因此不会被误删。
+    """
+    result: dict = {}
+    for key, value in node.items():
+        default_value = defaults.get(key)
+        if isinstance(value, dict):
+            if isinstance(default_value, dict):
+                result[key] = _strip_default_equal_leaves(value, default_value)
+            else:
+                # 默认配置中不是 dict（或缺失）：无法逐键比较，整块视为用户数据
+                result[key] = copy.deepcopy(value)
+        elif key in defaults and value == default_value:
+            continue  # 与当前默认完全一致 → 不固化进文件
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
 
 
 # ============================================================
@@ -967,7 +1160,19 @@ def run_init_wizard() -> int:
             frag = _step_task_runtime(existing)
             if frag:
                 fragments.append(frag)
+            frag = _step_goal(existing)
+            if frag:
+                fragments.append(frag)
+            frag = _step_subagent(existing)
+            if frag:
+                fragments.append(frag)
+            frag = _step_retention(existing)
+            if frag:
+                fragments.append(frag)
             frag = _step_artifacts(existing)
+            if frag:
+                fragments.append(frag)
+            frag = _step_runtime_store(existing)
             if frag:
                 fragments.append(frag)
             frag = _step_gateway_runtime(existing)
@@ -983,24 +1188,24 @@ def run_init_wizard() -> int:
             if frag:
                 fragments.append(frag)
 
-        # ---- 检查是否有新增 section 需要补齐 ----
+        # ---- 检查是否有新增配置需要补齐（顶层 section 或 section 内缺失默认键）----
         merged_with_defaults = copy.deepcopy(_DEFAULT_CONFIG)
         _deep_merge(merged_with_defaults, existing)
-        missing_sections = [k for k in _DEFAULT_CONFIG if k not in existing]
+        missing_sections = _sections_needing_backfill(_DEFAULT_CONFIG, existing)
 
         # ---- 无修改且无缺失 ----
         if not fragments and not missing_sections:
             print("\n  😴 没有任何修改，config.json 保持不变")
             return 0
 
-        # ---- 有缺失 section 但无用户修改 → 提示补齐 ----
+        # ---- 有缺失配置但无用户修改 → 提示补齐 ----
         if not fragments and missing_sections:
-            print(f"\n  📋 检测到 config.json 缺少以下配置段: {', '.join(missing_sections)}")
-            if not _ask_yes_no("自动补齐默认值？", default=True):
+            print(f"\n  📋 检测到 config.json 缺少以下配置段或默认键: {', '.join(missing_sections)}")
+            if not _ask_yes_no("自动补齐默认值（保留现有值）？", default=True):
                 print("  ✋ 已放弃，未做任何修改")
                 return 0
-            # 将补齐视为一个 fragment
-            fragments.append({k: merged_with_defaults[k] for k in missing_sections})
+            # 将补齐视为一个 fragment；deep_merge 只填缺失键，绝不覆盖已有值
+            fragments.append({k: _DEFAULT_CONFIG[k] for k in missing_sections})
 
         # ---- 预览 & 确认 ----
         _print_summary(fragments, existing)
@@ -1010,20 +1215,36 @@ def run_init_wizard() -> int:
             return 0
 
         # ---- 备份 & 合并 & 写入 ----
-        bak = _backup_file(cfg_path)
-        # 以 _DEFAULT_CONFIG 为底座，确保所有 section 都有完整默认值
-        # 用户已有配置覆盖默认值，向导收集的 fragments 最后覆盖
-        final = copy.deepcopy(_DEFAULT_CONFIG)
-        _deep_merge(final, existing)
+        # 备份失败仅告警，不中断主写入
+        try:
+            bak = _backup_file(cfg_path)
+        except OSError as e:
+            print(f"  ⚠️ 备份失败（{e}），继续写入")
+            bak = None
+        # 稀疏写入：以用户现有 config 为底座（全新安装才用完整骨架），
+        # 只叠加向导中用户实际输入/确认的 fragments，最后剥离一切与
+        # _DEFAULT_CONFIG 完全相同的键值 —— 避免把当前版本的默认值固化进
+        # config.json 导致日后版本新默认永不生效。用户改过的值必然不同于
+        # 当前默认，不受剥离影响；缺失的键由运行期默认回落提供。
+        if existing:
+            final = copy.deepcopy(existing)
+        else:
+            final = copy.deepcopy(_DEFAULT_CONFIG)
         for frag in fragments:
             _deep_merge(final, frag)
+        final = _strip_default_equal_leaves(final, _DEFAULT_CONFIG)
 
-        runtime = final.get("agent_runtime", {})
-        final["agent_runtime"] = {
-            "native_tool_streaming": is_enabled(
-                runtime.get("native_tool_streaming"), True),
-            "max_tool_result_chars": max(0, int(runtime.get("max_tool_result_chars", 10000))),
-        }
+        # Normalize known values in place — 仅规范化已存在的键，不向稀疏
+        # 配置注入默认值。Never reconstruct this mapping:
+        # future runtime options and vendor extensions must survive init.
+        runtime = final.get("agent_runtime")
+        if isinstance(runtime, dict):
+            if "native_tool_streaming" in runtime:
+                runtime["native_tool_streaming"] = is_enabled(
+                    runtime.get("native_tool_streaming"), True)
+            if "max_tool_result_chars" in runtime:
+                runtime["max_tool_result_chars"] = max(
+                    0, _as_int(runtime.get("max_tool_result_chars"), 12000))
 
         try:
             _write_config(cfg_path, final)
@@ -1037,7 +1258,7 @@ def run_init_wizard() -> int:
         print(f"  ✅ 已写入 config.json（{change_count} 处变更）")
 
         print(f"\n  🚀 下一步:")
-        print(f"     python agent.py          启动交互模式（新配置生效）")
+        print(f"     jkagent-gateway run      启动 Gateway / WebUI（新配置生效）")
         print(f"     提示: config.json 已被 .gitignore 忽略，不会提交；")
         print(f"           云端 key 也可改用环境变量提供，避免落盘。")
         return 0

@@ -1,28 +1,39 @@
 # -*- coding: utf-8 -*-
 """
-Gateway CLI 入口 —— python agent.py gateway [子命令]
+Gateway CLI 入口 —— jkagent-gateway [子命令]
 
 子命令:
-  (无)          启动 gateway 服务
-  login weixin  微信扫码登录（获取凭据）
-  doctor        检查配置和环境（--dry-run）
+  (无)                 启动 gateway 服务
+  login weixin         微信扫码登录（获取凭据）
+  doctor               检查配置和环境（--dry-run）
+  migrate-sessions     迁移旧会话转录 sessions/*.json → 统一会话库
+                       （--dry-run 只预览不写库）
 """
 
 import logging
 import sys
+from pathlib import Path
 
 logger = logging.getLogger("jk_agent.gateway")
 
 
-def main(args: list[str], debug: bool = False) -> int:
-    """gateway 子命令主入口，返回退出码"""
-    # 设置日志
-    level = logging.DEBUG if debug else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+def main(args: list[str] | None = None, debug: bool = False) -> int:
+    """Gateway console entry point; accepts argv for tests and embedding."""
+    if args is None:
+        args = sys.argv[1:]
+    # 日志初始化：basicConfig 语义交由 core.debug.setup_logging 的进程级
+    # once-guard 统一管理（幂等：重复调用直接返回，避免 handler 叠加）。
+    # gateway-run.log 落盘于 gateway/ 目录，RotatingFileHandler 10MB × 5，
+    # 与 sandbox-audit.log 同策略。
+    from core.debug import setup_logging, set_debug
+    setup_logging(
+        debug=debug,
+        log_file=str(Path(__file__).resolve().parent / "gateway-run.log"),
+        console_format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    if debug:
+        set_debug(True)
 
     if not args or args[0] == "run":
         return _cmd_run(args[1:], debug)
@@ -30,9 +41,11 @@ def main(args: list[str], debug: bool = False) -> int:
         return _cmd_login(args[1:])
     elif args[0] == "doctor":
         return _cmd_doctor(args[1:])
+    elif args[0] == "migrate-sessions":
+        return _cmd_migrate_sessions(args[1:])
     else:
         print(f"❌ 未知子命令: {args[0]}")
-        print("用法: python agent.py gateway [run|login weixin|doctor]")
+        print("用法: jkagent-gateway [run|login weixin|doctor|migrate-sessions]")
         return 1
 
 
@@ -55,8 +68,24 @@ def _cmd_run(extra_args: list[str], debug: bool) -> int:
             except ValueError:
                 print(f"❌ 无效端口: {extra_args[i + 1]}")
                 return 1
-    if port:
+    # is not None：--port 0（绑定随机可用端口）也必须生效
+    if port is not None:
         config["port"] = port
+
+    # C2 退役检查：未迁移的旧会话转录文件 > 0 时告警（不打断启动）。
+    # 选择在 cli 侧做（本组文件边界内，零跨组接线）；session_migrate.count_legacy()
+    # 为公共 API，server 组如需在服务内部提示亦可一行接入。
+    try:
+        from gateway.session_migrate import count_legacy
+        legacy_count = count_legacy()
+        if legacy_count > 0:
+            logger.warning(
+                "检测到 %d 个旧会话转录文件（sessions/*.json）未迁移到统一"
+                "会话库，建议先预览后迁移: "
+                "jkagent-gateway migrate-sessions --dry-run",
+                legacy_count)
+    except Exception:
+        logger.debug("旧会话迁移检查失败（忽略，不阻断启动）", exc_info=True)
 
     server = GatewayServer(config)
     try:
@@ -69,7 +98,7 @@ def _cmd_run(extra_args: list[str], debug: bool) -> int:
 def _cmd_login(args: list[str]) -> int:
     """登录子命令"""
     if not args or args[0] != "weixin":
-        print("用法: python agent.py gateway login weixin")
+        print("用法: jkagent-gateway login weixin")
         return 1
     return _login_weixin()
 
@@ -93,11 +122,47 @@ def _login_weixin() -> int:
     try:
         weixin_login(save_to=creds_file)
         print(f"\n✅ 登录成功，凭据已保存到 {creds_file}")
-        print("   现在可以启动 gateway: python agent.py gateway")
+        print("   现在可以启动 gateway: jkagent-gateway run")
         return 0
     except Exception as e:
         print(f"\n❌ 登录失败: {e}")
         return 1
+
+
+def _cmd_migrate_sessions(args: list[str]) -> int:
+    """迁移旧会话转录（sessions/*.json → runtime DB conversations）"""
+    from gateway.session_migrate import migrate_sessions
+
+    dry_run = "--dry-run" in args
+    print(f"\n📦 会话存储迁移（C2 退役）{'—— dry-run 预览，不写库' if dry_run else ''}\n")
+    report = migrate_sessions(dry_run=dry_run)
+
+    print(f"  扫描目录:   {report['sessions_dir']}")
+    print(f"  会话库:     {report['db_path']}")
+    print(f"  扫描文件:   {report['scanned']} 个"
+          f"（已覆盖 {report['covered']} / 待迁移 {report['pending']}）")
+    if dry_run:
+        print(f"  将迁移:     {report['migrated']} 个（dry-run，未写库）")
+    else:
+        print(f"  已迁移:     {report['migrated']} 个"
+              f"（跳过 {report['skipped']}，错误 {report['errors']}）")
+    if report["errors"]:
+        print(f"  ⚠️  错误: {report['errors']} 个")
+
+    print()
+    for item in report["items"]:
+        mark = {
+            "covered": "⬜", "pending": "🔜", "migrated": "✅",
+            "skipped": "⏭️", "error": "❌",
+        }.get(item["status"], "·")
+        detail = f"  {item['detail']}" if item["detail"] else ""
+        print(f"  {mark} {item['session_id']:<22} → {item['session_key']}{detail}")
+
+    if dry_run:
+        print()
+        print("  预览无误后执行（迁移幂等，可重复运行）:")
+        print("    jkagent-gateway migrate-sessions")
+    return 1 if report["errors"] else 0
 
 
 def _cmd_doctor(args: list[str]) -> int:
@@ -136,7 +201,7 @@ def _cmd_doctor(args: list[str]) -> int:
         status = "✅" if exists else f"❌ 凭据文件不存在: {creds}"
         print(f"  微信:       {status}")
         if not exists:
-            print(f"             运行: python agent.py gateway login weixin")
+            print(f"             运行: jkagent-gateway login weixin")
             ok = False
     else:
         print(f"  微信:       ⬜ 未启用")
@@ -172,6 +237,22 @@ def _cmd_doctor(args: list[str]) -> int:
             print(f"  定时任务:   ✅ 已启用（{len(jobs)} 个 job）")
     else:
         print(f"  定时任务:   ⬜ 未启用")
+
+    # Retention: doctor exposes active policy and candidates without deleting anything.
+    try:
+        from core.config_loader import _find_project_root, load_config
+        from core.runtime import ArtifactStore, RetentionManager, RuntimeStore
+        root_cfg = load_config()
+        retention = root_cfg.get("retention", {})
+        store_cfg = root_cfg.get("runtime_store", {})
+        configured = Path(str(store_cfg.get("path") or "./workspace/.agent/state/runtime.db"))
+        store_path = configured if configured.is_absolute() else _find_project_root() / configured
+        store = RuntimeStore(store_path, wal=store_cfg.get("wal", True), busy_timeout_ms=store_cfg.get("busy_timeout_ms", 5000))
+        artifact_cfg = root_cfg.get("artifacts", {})
+        report = RetentionManager(store, ArtifactStore(store, artifact_cfg.get("root") or None), terminal_days=retention.get("terminal_days", 30), artifact_days=retention.get("artifact_days", 30)).collect(dry_run=True)
+        print(f"  Retention:   {'✅' if retention.get('enabled', True) else '⬜'} {retention.get('terminal_days', 30)} 天终态 / {retention.get('artifact_days', 30)} 天 Artifact；候选 task={len(report['tasks'])} artifact={len(report['artifacts'])}，引用保护={len(report['protected'])}")
+    except Exception as exc:
+        print(f"  Retention:   ⚠️ 检查失败: {exc}")
 
     # 心跳
     hb = config.get("heartbeat", {})

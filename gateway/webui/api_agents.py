@@ -10,6 +10,7 @@ api_agents.py —— Agent Profile CRUD / duplicate / references / preview
 
 import json
 import logging
+from pathlib import Path
 
 from aiohttp import web
 
@@ -90,8 +91,15 @@ def _make_list(module):
             offset = int(request.query.get("offset", 0))
         except (TypeError, ValueError):
             return _err("limit/offset 必须是整数", code="INVALID_PAGINATION")
-        items = store.list(status=status, q=q, limit=limit, offset=offset)
-        total = store.count(status=status, q=q)
+        try:
+            items = store.list(status=status, q=q, limit=limit, offset=offset)
+            total = store.count(status=status, q=q)
+        except WorkspaceStoreError as exc:
+            logger.exception("智能体列表读取失败")
+            return _handle_store_error(exc)
+        except (TypeError, ValueError) as exc:
+            logger.exception("智能体列表包含无效记录")
+            return _err(str(exc), 500, "AGENT_PROFILE_DATA_INVALID")
         return web.json_response({
             "agents": [_payload(p) for p in items],
             "total": total,
@@ -239,30 +247,39 @@ def _make_preview(module):
             })
         except ValueError as exc:
             return _err(str(exc), code="INVALID_PROFILE")
-        from tools import ToolRegistry
-        from tools.builtin_tools import register_all_tools
-        from tools.web_tools import register_web_tools
-        registry = ToolRegistry()
-        register_all_tools(registry, memory_manager=None, sandbox=None,
-                           process_manager=None)
-        register_web_tools(registry)
-        from skills.manager import SkillManager
-        from core.config_loader import _find_project_root
-        skill_mgr = SkillManager(skills_dir=str(_find_project_root() / "SKILLS"))
+        # B8：复用 catalog_service 的注册表单例（只读）与 SkillManager 单例，
+        # 避免每次 preview 重建 ~40 个内置工具实例与重复读盘解析。
+        registry = catalog_service.get_catalog_registry()
+        skill_mgr = catalog_service.get_skills_manager()
         try:
             skill_mgr.load_all()
         except Exception:
             pass
         try:
+            from core.config_loader import _find_project_root, load_config
+            project_root = body.get("project_root") or str(_find_project_root())
+            framework_root = body.get("framework_root") or project_root
+            working_directory = body.get("working_directory")
+            if not working_directory:
+                config = load_config()
+                configured = (config.get("permission", {}).get("workspace")
+                              or "./workspace")
+                configured_path = Path(configured)
+                if not configured_path.is_absolute():
+                    configured_path = _find_project_root() / configured_path
+                working_directory = str(configured_path.resolve())
+            selected_mcp = list(getattr(profile, "mcp_servers", None) or [])
+            live_mcp_tools = prompt_preview.live_mcp_tools(module, selected_mcp)
             result = prompt_preview.build_preview(
                 profile,
                 workspace=body.get("workspace"),
                 session=body.get("session"),
                 tool_registry=registry,
                 skill_manager=skill_mgr,
-                framework_root=body.get("framework_root"),
-                project_root=body.get("project_root"),
-                working_directory=body.get("working_directory"),
+                framework_root=framework_root,
+                project_root=project_root,
+                working_directory=working_directory,
+                mcp_tools=live_mcp_tools,
             )
         except Exception as exc:  # pragma: no cover
             logger.exception("preview failed")
@@ -276,5 +293,7 @@ def _make_preview(module):
 def _make_catalog(module):
     async def handler(request):
         _require_store(module)
+        # B8：get_all_catalogs 内部 tools/skills 已走缓存
+        # （get_tools_catalog TTL 30s + SkillManager mtime 签名失效）
         return web.json_response(catalog_service.get_all_catalogs(module))
     return handler

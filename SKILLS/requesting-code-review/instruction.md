@@ -1,90 +1,92 @@
 # Requesting Code Review
 
-Dispatch a code reviewer subagent to catch issues before they cascade. The reviewer gets precisely crafted context for evaluation — never your session's history.
+Use a focused code-review Subagent to obtain an independent review of a completed, bounded change. The Subagent receives only the review brief you provide, not the parent conversation transcript.
 
-**Core principle:** Review early, review often.
+**Runtime contract:** Call the native `create_subagent` tool only when it is available. JKagent permits one child level only: the reviewer must not create or request another Subagent. The parent remains responsible for interpreting findings, making changes, testing, and reporting the result.
+
+**Core principle:** Review early, review often—but do not delegate an ambiguous or still-moving task.
 
 ## When to Request Review
 
-**Mandatory:**
-- After each task in subagent-driven development
-- After completing major feature
-- Before merge to main
+**Recommended:**
+- After a completed, independently testable plan task
+- After a major feature or risky refactor
+- Before merging or handing over a change
+- After a complex bug fix, especially where regressions are plausible
 
-**Optional but valuable:**
-- When stuck (fresh perspective)
-- Before refactoring (baseline check)
-- After fixing complex bug
+**Do not create a Subagent merely to avoid understanding the change.** If the review scope is tiny or the runtime does not expose `create_subagent`, perform the review in the current session using the same checklist.
 
-## How to Request
+## Review Workflow
 
-**1. Get git SHAs:**
+### 1. Stabilize the review target
+
+Before delegation:
+1. Finish the bounded change and run its relevant tests.
+2. Identify the comparison range and changed files:
+
 ```bash
 BASE_SHA=$(git rev-parse HEAD~1)  # or origin/main
 HEAD_SHA=$(git rev-parse HEAD)
+git diff --stat "$BASE_SHA" "$HEAD_SHA"
 ```
 
-**2. Dispatch code reviewer subagent:**
+3. Write a concise brief using [code-reviewer.md](code-reviewer.md). Include:
+   - `DESCRIPTION`: what changed and why
+   - `PLAN_OR_REQUIREMENTS`: expected behavior and constraints
+   - `BASE_SHA` / `HEAD_SHA`: review range, if Git history exists
+   - exact test commands already run and their outcomes
+   - explicit review boundaries (for example, “review only API compatibility and error handling”)
 
-Dispatch a `general-purpose` subagent, filling the template at [code-reviewer.md](code-reviewer.md)
+Never ask the reviewer to infer requirements from the parent transcript.
 
-**Placeholders:**
-- `{DESCRIPTION}` - Brief summary of what you built
-- `{PLAN_OR_REQUIREMENTS}` - What it should do
-- `{BASE_SHA}` - Starting commit
-- `{HEAD_SHA}` - Ending commit
+### 2. Delegate one reviewer when appropriate
 
-**3. Act on feedback:**
-- Fix Critical issues immediately
-- Fix Important issues before proceeding
-- Note Minor issues for later
-- Push back if reviewer is wrong (with reasoning)
+Use `create_subagent` with the completed brief as its task. Ask for a structured report with:
+- strengths;
+- findings grouped as Critical, Important, or Minor;
+- evidence with file/line references;
+- missing or weak tests;
+- a clear ready/not-ready assessment.
+
+The reviewer is advisory. It must inspect and report; it must not make unrelated changes, start a new Plan or Goal, or spawn child agents.
+
+### 3. Act on the report
+
+- Fix **Critical** findings before proceeding.
+- Fix **Important** findings before handoff unless the user explicitly accepts the risk.
+- Record **Minor** findings with a reason if deferred.
+- Challenge an incorrect finding with concrete code or test evidence.
+- Re-run affected tests after fixes; request a follow-up review only when the change materially alters the reviewed scope.
 
 ## Example
 
+```text
+A bounded implementation task is complete and its tests pass.
+
+Create one code-review Subagent with this brief:
+
+DESCRIPTION: Added verifyIndex() and repairIndex() for four corruption cases.
+PLAN_OR_REQUIREMENTS: Task 2 in docs/plans/deployment-plan.md; preserve existing API behavior.
+BASE_SHA: a7981ec
+HEAD_SHA: 3df7661
+TESTS RUN: pytest tests/test_index.py -v (12 passed)
+BOUNDARY: Validate correctness, error handling, and test coverage; do not modify files.
+
+Review report:
+  Important: Missing progress visibility for repairs.
+  Minor: Reporting interval uses an unexplained constant (100).
+  Assessment: Not ready until progress visibility is added.
+
+Parent: add the progress behavior, run tests again, then report the verified result.
 ```
-[Just completed Task 2: Add verification function]
-
-You: Let me request code review before proceeding.
-
-BASE_SHA=$(git log --oneline | grep "Task 1" | head -1 | awk '{print $1}')
-HEAD_SHA=$(git rev-parse HEAD)
-
-[Dispatch code reviewer subagent]
-  DESCRIPTION: Added verifyIndex() and repairIndex() with 4 issue types
-  PLAN_OR_REQUIREMENTS: Task 2 from docs/superpowers/plans/deployment-plan.md
-  BASE_SHA: a7981ec
-  HEAD_SHA: 3df7661
-
-[Subagent returns]:
-  Strengths: Clean architecture, real tests
-  Issues:
-    Important: Missing progress indicators
-    Minor: Magic number (100) for reporting interval
-  Assessment: Ready to proceed
-
-You: [Fix progress indicators]
-[Continue to Task 3]
-```
-
-## Common Rationalizations
-
-| Excuse | Reality |
-|--------|---------|
-| "I'll just review the diff myself instead of dispatching a reviewer" | You're the coordinator — reviewing the diff inline burns the context window you need to keep driving the work. Dispatch a reviewer subagent: the diff and the evaluation live in its context, and only the findings come back to you. |
-| "The reviewer needs my whole session history to understand the change" | Hand it precisely crafted context, never your session's history. That keeps the reviewer on the work product, not your thought process. |
 
 ## Red Flags
 
 **Never:**
-- Skip review because "it's simple"
-- Ignore Critical issues
-- Proceed with unfixed Important issues
-- Argue with valid technical feedback
+- Delegate an unclear task and expect the reviewer to discover its requirements.
+- Treat a review report as proof that tests are unnecessary.
+- Ignore Critical findings.
+- Continue with unresolved Important findings without explicit user acceptance.
+- Ask the reviewer to create more agents or run a parallel team.
 
-**If reviewer wrong:**
-- Push back with technical reasoning
-- Show code/tests that prove it works
-- Request clarification
-
-See template at: [code-reviewer.md](code-reviewer.md)
+See the review-brief template: [code-reviewer.md](code-reviewer.md)

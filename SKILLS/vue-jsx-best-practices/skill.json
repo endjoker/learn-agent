@@ -1,0 +1,7 @@
+{
+  "name": "vue-jsx-best-practices",
+  "description": "Vue.js skill from vuejs-ai/skills (security-cleaned)",
+  "version": "1.0.0",
+  "source": "https://github.com/vuejs-ai/skills/tree/main/skills/vue-jsx-best-practices",
+  "license": "MIT"
+}

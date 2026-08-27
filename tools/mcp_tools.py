@@ -20,9 +20,13 @@ MCPTool 包装 MCP Server 暴露的工具，使 LLM 无需感知工具是本地�
 
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from .base_tool import BaseTool
+
+if TYPE_CHECKING:
+    # 仅供注解；运行期经构造参数传入，避免与 core.mcp_client 循环导入
+    from core.mcp_client import MCPConnection
 
 logger = logging.getLogger('jk_agent')
 
@@ -41,6 +45,26 @@ class MCPTool(BaseTool):
     parameters: dict = {"type": "object", "properties": {}, "required": []}
     # MCP 工具是远程调用，SecurityGate 据此走 remote:call 策略
     capabilities = ("remote:call",)
+    # 外层事件循环等待在协议层超时之上加少量宽限：保证内层
+    # _send_request 先到期并抛出带方法名/服务器名的精确 TimeoutError，
+    # 而不是外层先触发笼统的 future 超时。
+    OUTER_TIMEOUT_GRACE_SECONDS = 5.0
+    # 连接未暴露 default_call_timeout 时的兜底值（与协议层旧默认一致）。
+    FALLBACK_CALL_TIMEOUT = 30.0
+
+    def _call_timeout(self) -> float:
+        """实际生效的工具调用超时（秒）。
+
+        取连接级 default_call_timeout——由 MCPClientManager 按服务器配置
+        tool_call_timeout > timeout 注入，默认 30s（P2-3）。外层事件循环与
+        内层 tools/call 请求共用同一配置口径，不再出现"内层 30s / 外层
+        硬编码 60s / 文案写死 60秒"三方分叉。
+        """
+        try:
+            timeout = float(getattr(self._connection, "default_call_timeout", None))
+        except (TypeError, ValueError):
+            return self.FALLBACK_CALL_TIMEOUT
+        return timeout if timeout > 0 else self.FALLBACK_CALL_TIMEOUT
 
     def __init__(self, connection: 'MCPConnection', tool_desc: dict, trust: bool = False):
         """
@@ -73,10 +97,17 @@ class MCPTool(BaseTool):
 
         在 MCP 专用常驻事件循环中执行底层异步调用——该循环与初始化时
         使用的同一循环，保证连接状态与后台接收循环跨调用复用。
+
+        超时口径（P2-3）：内层 tools/call 与外层事件循环等待都由服务器配置
+        的 tool_call_timeout（回退 timeout，默认 30s）决定；外层额外加少量
+        宽限，让协议层的精确超时错误先浮出。
         """
+        timeout = self._call_timeout()
         try:
             from core.mcp_client import run_in_mcp_loop
-            result = run_in_mcp_loop(self._execute_async(**kwargs), timeout=60)
+            result = run_in_mcp_loop(
+                self._execute_async(dict(kwargs), timeout=timeout),
+                timeout=timeout + self.OUTER_TIMEOUT_GRACE_SECONDS)
             return self._format_result(result)
         except ConnectionError as e:
             logger.error(f"MCP 工具 '{self.name}' 连接失败: {e}")
@@ -85,10 +116,14 @@ class MCPTool(BaseTool):
                 f"请检查该服务是否正常运行。"
             )
         except TimeoutError:
-            logger.error(f"MCP 工具 '{self.name}' 调用超时")
+            # Py3.11+ concurrent.futures.TimeoutError 与内置 TimeoutError 同义，
+            # 内外两层超时都会落到这里。
+            logger.error(
+                f"MCP 工具 '{self.name}' 调用超时（>{timeout:g}s）")
             return (
-                f"❌ MCP 工具 '{self.name}' 调用超时（60秒）\n"
-                f"可能是网络延迟或服务繁忙，请重试。"
+                f"❌ MCP 工具 '{self.name}' 调用超时（>{timeout:g}秒）\n"
+                f"可能是网络延迟或服务繁忙；如需更长等待窗口，可在 mcp 配置中"
+                f"增大该服务器的 tool_call_timeout 后重试。"
             )
         except Exception as e:
             logger.error(
@@ -96,9 +131,16 @@ class MCPTool(BaseTool):
             )
             return f"❌ MCP 工具执行出错: {type(e).__name__}: {e}"
 
-    async def _execute_async(self, **kwargs) -> dict:
-        """异步底层调用（协议层面用原始名，不含注册前缀）"""
-        return await self._connection.call_tool(self._mcp_tool_name, kwargs)
+    async def _execute_async(self, arguments: dict,
+                             timeout: Optional[float] = None) -> dict:
+        """异步底层调用（协议层面用原始名，不含注册前缀）。
+
+        timeout 透传到 call_tool/_send_request，与外层事件循环等待保持一致。
+        注意 arguments 必须是独立 dict 参数而非 **kwargs 展开——工具参数里
+        可能恰好有名为 ``timeout`` 的键，展开会与本参数冲突。
+        """
+        return await self._connection.call_tool(
+            self._mcp_tool_name, arguments, timeout=timeout)
 
     def _format_result(self, result: dict) -> str:
         """
@@ -108,7 +150,11 @@ class MCPTool(BaseTool):
             - text: 纯文本
             - resource: 资源引用（文件等）
             - json: JSON 数据
+
+        结果统一截断到 20k 字符并做基础脱敏（API Key / 私钥 → ****）。
         """
+        from core.sandbox.guard import sanitize_output
+
         if result.get("isError"):
             error_texts = [
                 item["text"]
@@ -116,7 +162,9 @@ class MCPTool(BaseTool):
                 if item.get("type") == "text"
             ]
             error_msg = "\n".join(error_texts) if error_texts else "未知错误"
-            return f"❌ MCP 工具返回错误: {error_msg}"
+            if len(error_msg) > 20000:
+                error_msg = error_msg[:20000] + "\n……（MCP 错误过长，已截断）"
+            return sanitize_output(f"❌ MCP 工具返回错误: {error_msg}")
 
         parts = []
         for item in result.get("content", []):
@@ -136,4 +184,7 @@ class MCPTool(BaseTool):
             else:
                 parts.append(str(item))
 
-        return "\n".join(parts)
+        text = "\n".join(parts)
+        if len(text) > 20000:
+            text = text[:20000] + "\n\n……（MCP 结果过长，已截断）"
+        return sanitize_output(text)

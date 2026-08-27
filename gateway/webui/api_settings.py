@@ -43,6 +43,20 @@ async def _body(request):
         return None
 
 
+def _parse_int(value, default=None):
+    """安全解析整数参数；缺失/空返回 default，非法值抛 ValueError（调用方转 400）。"""
+    if value is None or value == "":
+        if default is not None:
+            return default
+        raise ValueError("参数必须是整数")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        if default is not None:
+            return default
+        raise ValueError(f"参数必须是整数，收到 {value!r}")
+
+
 def _make_config_get(module):
     async def handler(request):
         data, rev, status = module.config_service.read_masked()
@@ -66,7 +80,10 @@ def _make_config_patch(module):
             rev = await module.config_service.patch_section(
                 section, patch, base_rev)
         except ConfigConflictError as e:
-            return _err(str(e), 409)
+            return web.json_response({
+                "error": str(e),
+                "rev": getattr(e, "current_rev", 0),
+            }, status=409)
         except PermissionError as e:
             return _err(str(e), 403)
         except ValueError as e:
@@ -131,19 +148,24 @@ def _make_model_write(module):
 
         cfg = {}
         mtype = body.get("type")
+        try:
+            local_ctx = _parse_int(body.get("context_length"), default=131072)
+            cloud_ctx = _parse_int(body.get("context_length"), default=128000)
+        except ValueError:
+            return _err("context_length 必须是整数")
         if mtype == "local":
             provider = body.get("provider", "")
             cfg["provider"] = provider
             cfg["base_url"] = body.get("base_url", "")
             cfg["api_key"] = body.get("api_key", "")
-            cfg["context_length"] = int(body.get("context_length", 131072))
+            cfg["context_length"] = local_ctx
         elif mtype == "cloud":
             protocol = body.get("protocol", "")
             if protocol:
                 cfg["protocol"] = protocol
             cfg["base_url"] = body.get("base_url", "")
             cfg["api_key"] = body.get("api_key", "")
-            cfg["context_length"] = int(body.get("context_length", 128000))
+            cfg["context_length"] = cloud_ctx
         else:
             # 直接透传字段（PUT 更新场景）
             for k in ("provider", "protocol", "base_url", "api_key",
@@ -186,7 +208,7 @@ def _make_model_write(module):
         merged.update(cfg)
         models[model_name] = merged
 
-        backup_and_write(module, data)
+        await backup_and_write(module, data)
         module.bus.publish("config.updated", {"section": "llm"})
         return web.json_response({"ok": True, "name": model_name})
     return handler
@@ -206,7 +228,7 @@ def _make_model_delete(module):
         if llm.get("model_id") == name:
             return _err("不能删除默认模型（请先切换默认模型）", 409)
         del models[name]
-        backup_and_write(module, data)
+        await backup_and_write(module, data)
         module.bus.publish("config.updated", {"section": "llm"})
         return web.json_response({"ok": True, "name": name})
     return handler
@@ -228,7 +250,10 @@ def _make_llm_default(module):
                 return _err(f"模型不存在: {mid}", 404)
             llm["model_id"] = mid
         if "timeout" in body:
-            llm["timeout"] = int(body["timeout"])
+            try:
+                llm["timeout"] = _parse_int(body["timeout"])
+            except ValueError:
+                return _err("timeout 必须是整数")
         if "reasoning" in body:
             reasoning = body["reasoning"]
             if not isinstance(reasoning, dict):
@@ -238,14 +263,12 @@ def _make_llm_default(module):
                     reasoning.get("level"), source="reasoning.level")}
             except ValueError as e:
                 return _err(str(e))
-        backup_and_write(module, data)
+        await backup_and_write(module, data)
         module.bus.publish("config.updated", {"section": "llm"})
         return web.json_response({"ok": True})
     return handler
 
 
-def backup_and_write(module, data: dict):
-    from core.config_writer import backup_file, write_config
-    backup_file()
-    write_config(None, data)
-    ConfigService._force_reload()
+async def backup_and_write(module, data: dict) -> int:
+    """配置写盘统一走 ConfigService 持锁管线（backup + write + force_reload）。"""
+    return await module.config_service.write_full(data)

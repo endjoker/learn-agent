@@ -17,8 +17,10 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
 import logging
 from pathlib import Path
+from typing import Sequence
 
 from .guard import (
     check_command_safety,
@@ -31,12 +33,40 @@ from .guard import (
 )
 from .audit import log_interception, log_bypass, log_error
 from . import profiles as profile_loader
+from .. import shell as _shell
 
 logger = logging.getLogger("jk_agent")
 
 
+def _child_pids(pid: int) -> list[int]:
+    """枚举 pid 的直接子进程 pid（ps 不可用/超时返回空列表）。"""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "pid=", "--ppid", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+        return [int(line.strip()) for line in out.stdout.splitlines()
+                if line.strip().isdigit()]
+    except Exception:
+        return []
+
+
+def _kill_pid_tree(pid: int) -> None:
+    """SIGKILL pid 及其全部子孙（先子后父，best-effort）。"""
+    for child in _child_pids(pid):
+        _kill_pid_tree(child)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
 def _kill_process_tree(proc: subprocess.Popen) -> None:
-    """Kill the whole process tree rooted at proc (Windows: taskkill /T)."""
+    """Kill the whole process tree rooted at proc (Windows: taskkill /T).
+
+    非 Windows：优先 killpg（start_new_session 保证 proc 是会话组长）；
+    killpg 失败（进程组已退出/不可用）时回退为逐个 kill 子进程树（P1）。
+    """
     try:
         if os.name == "nt":
             subprocess.run(
@@ -47,7 +77,8 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
-                proc.kill()
+                # 进程组不可用：逐个 kill 子进程树（含 proc.pid 自身）
+                _kill_pid_tree(proc.pid)
     except Exception:
         try:
             proc.kill()
@@ -68,6 +99,7 @@ class SandboxResult:
         block_reason: str = "",
         full_output_path: str = "",
         spilled: bool = False,
+        interrupted: bool = False,
     ):
         self.stdout = stdout
         self.stderr = stderr
@@ -77,6 +109,8 @@ class SandboxResult:
         self.block_reason = block_reason
         self.full_output_path = full_output_path
         self.spilled = spilled
+        # 用户停止中断：进程树已被杀、当前输出丢弃（工具层转 ⏹️ 提示）
+        self.interrupted = interrupted
 
     @property
     def success(self) -> bool:
@@ -160,17 +194,38 @@ class OutputDrainer:
                     break
                 if self._kill_on_exceed:
                     if self._spill_threshold > 0:
-                        # spill mode: keep full output on disk, only tail in memory
-                        if self._spill_fh is None and (self._spill_bytes + len(chunk)) > self._spill_threshold:
-                            self._ensure_spill()
-                        if self._spill_fh is not None:
-                            self._spill_fh.write(chunk)
-                            self._spill_bytes += len(chunk)
-                            self.truncated = True
+                        # spill mode: 全程累计字节数；超 spill 阈值 → 完整输出落盘 +
+                        # 内存只留尾部（不杀进程，命令可继续产出，spill 文件保证完整）。
+                        # 旧实现 _spill_bytes 只在落盘后才累加，导致触发条件恒假、分支不可达（P0-4）。
+                        # 硬上限 max_bytes 仍生效：超出才杀进程树防 OOM，spill 文件保留供续读。
+                        self._spill_bytes += len(chunk)
                         self._sink.append(chunk)
-                        total = sum(len(c) for c in self._sink)
-                        while total > self._tail_limit and len(self._sink) > 1:
-                            total -= len(self._sink.pop(0))
+                        if self._spill_fh is None and self._spill_bytes > self._spill_threshold:
+                            self._ensure_spill()
+                            try:
+                                # 阈值前已积累的内存 chunk 一并落盘，保证 spill 文件为完整输出
+                                for c in self._sink:
+                                    self._spill_fh.write(c)
+                            except OSError:
+                                pass
+                            self.truncated = True
+                        elif self._spill_fh is not None:
+                            try:
+                                self._spill_fh.write(chunk)
+                            except OSError:
+                                pass
+                        if self._spill_fh is not None:
+                            # 内存只留尾部（tail_limit）
+                            total = sum(len(c) for c in self._sink)
+                            while total > self._tail_limit and len(self._sink) > 1:
+                                total -= len(self._sink.pop(0))
+                        if self._spill_bytes > self._max_bytes:
+                            self.truncated = True
+                            try:
+                                _kill_process_tree(self._proc)
+                            except Exception:
+                                pass
+                            break
                     else:
                         if sum(len(c) for c in self._sink) + len(chunk) > self._max_bytes:
                             self.truncated = True
@@ -205,7 +260,7 @@ class SandboxExecutor:
 
     两层防护：
       L2-A: 内容拦截（敏感文件/防泄露/系统路径/Python AST/网络黑名单）
-      L2-C: subprocess 执行 + 超时控制 + 输出脱敏
+      L2-C: subprocess 执行 + 超时控制 + 输出上限/落盘（脱敏下沉到工具层截断后统一执行，C6）
 
     L2-B 资源隔离层（nanosandbox）为设计预留，暂未实现。
 
@@ -219,18 +274,32 @@ class SandboxExecutor:
     def __init__(
         self,
         workspace: str | None = None,
+        extra_workspace_roots: Sequence[str | Path] = (),
     ):
         self._workspace = Path(workspace or os.getcwd()).resolve()
+        self._extra_workspace_roots = tuple(
+            Path(p).expanduser().resolve() for p in (extra_workspace_roots or ()))
         self._config = profile_loader.load_config()
 
-        # 沙箱开关
-        self.enabled: bool = self._config.get("enabled", True)
+        # 沙箱开关（默认关闭；config.json → sandbox.enabled = true 开启）
+        self.enabled: bool = self._config.get("enabled", False)
         self.current_profile: str = self._config.get("default_profile", "agent")
+
+        # spill 阈值（沙箱路径）：默认 256KB，可配 sandbox.spill_threshold_kb；
+        # <=0 表示禁用 spill，回退为超 max_output_mb 直接杀进程的旧行为。
+        spill_kb = self._config.get("spill_threshold_kb", 256)
+        if spill_kb is None:
+            spill_kb = 256
+        try:
+            spill_kb = int(spill_kb)
+        except (TypeError, ValueError):
+            spill_kb = 256
+        self.spill_threshold_bytes = spill_kb * 1024 if spill_kb > 0 else 0
 
         # 临时绕过标志（下一条命令绕过，执行后自动复位）
         self._bypass_once: bool = False
-        # Session-level switch set by PermissionChecker/Glue for unreviewed mode.
-        # Central SecurityGate has already requested approval for its exceptions.
+        # Permission mode is an approval policy, not an L2 bypass. Keep this
+        # field only for compatibility with older callers.
         self._unreviewed_mode: bool = False
 
         logger.info(
@@ -311,11 +380,7 @@ class SandboxExecutor:
         return self._bypass_once
 
     def set_unreviewed_mode(self, enabled: bool) -> None:
-        """Skip ordinary L2 checks for a session in unreviewed mode.
-
-        The Agent's central SecurityGate remains responsible for routing high-risk
-        commands and sensitive paths through explicit user approval.
-        """
+        """Allow policy-sensitive paths in unreviewed mode, never hard L2 rules."""
         self._unreviewed_mode = bool(enabled)
 
     # ================================================================
@@ -329,6 +394,7 @@ class SandboxExecutor:
         cwd: str | None = None,
         env: dict | None = None,
         tool_name: str = "bash",
+        timeout: float | None = None,
     ) -> SandboxResult:
         """
         在沙箱中执行命令
@@ -339,26 +405,28 @@ class SandboxExecutor:
             cwd:     工作目录
             env:     环境变量
             tool_name: 工具名称（用于内容拦截判断）
+            timeout:  调用方指定的超时秒数（可选）；提供时优先生效并覆盖
+                      profile 默认值，None 时保持 profile 默认行为不变。
         """
         full_cmd = f"{command} {' '.join(args or [])}"
 
-        # ===== 沙箱关闭、unreviewed 或临时绕过 =====
-        if not self.enabled or self._unreviewed_mode or self._bypass_once:
+        if not self.enabled or self._bypass_once:
             if self._bypass_once:
                 self._bypass_once = False
                 log_bypass(tool_name, "bypass_once")
-            return self._execute(command, args, cwd, env)
+            return self._execute(command, args, cwd, env, timeout)
 
-        # ===== L2-A: 内容拦截 =====
+        # ``unreviewed`` only bypasses policy-sensitive path matching. The
+        # command/content hard checks below remain enabled.
         is_safe, reason = check_command_safety(
-            full_cmd, tool_name, str(self._workspace)
-        )
+            full_cmd, tool_name, str(self._workspace),
+            check_policy_paths=not self._unreviewed_mode)
         if not is_safe:
             log_interception(tool_name, full_cmd, reason)
             return SandboxResult(blocked=True, block_reason=reason)
 
         # ===== L2-C: subprocess 执行 =====
-        return self._execute(command, args, cwd, env)
+        return self._execute(command, args, cwd, env, timeout)
 
     def _execute(
         self,
@@ -366,6 +434,7 @@ class SandboxExecutor:
         args: list | None = None,
         cwd: str | None = None,
         env: dict | None = None,
+        timeout: float | None = None,
     ) -> SandboxResult:
         """L2-C subprocess 执行（L2-A 内容拦截已在前置步骤完成）
 
@@ -373,7 +442,7 @@ class SandboxExecutor:
         避免 ``yes``/``cat /dev/zero`` 类命令把输出全量读进内存导致 OOM。
         超时/取消时杀掉整个进程树，避免残留子进程。
         """
-        timeout = self._get_timeout()
+        timeout = self._get_timeout() if timeout is None else timeout
         max_bytes = self.get_max_output_bytes()
         popen_kwargs = {
             "stdout": subprocess.PIPE,
@@ -404,25 +473,48 @@ class SandboxExecutor:
         err_sink: list[bytes] = []
         out_drainer = OutputDrainer(
             proc, proc.stdout, out_sink, max_bytes, kill_on_exceed=True,
-            spill_threshold=max_bytes, tail_limit=8192,
+            spill_threshold=self.spill_threshold_bytes, tail_limit=8192,
         )
         err_drainer = OutputDrainer(
             proc, proc.stderr, err_sink, max_bytes, kill_on_exceed=True,
-            spill_threshold=max_bytes, tail_limit=8192,
+            spill_threshold=self.spill_threshold_bytes, tail_limit=8192,
         )
         out_drainer.start()
         err_drainer.start()
 
         timed_out = False
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _kill_process_tree(proc)
+        user_interrupted = False
+        # 轮询等待：0.2s 粒度同时检查 超时 / 用户停止——停止请求立即杀进程
+        # 树（与 run_killable 同模式），不再等满 timeout（默认 1200s）。
+        deadline = (time.monotonic() + timeout) if timeout is not None else None
+        stop_check = _shell.get_stop_check()
+        while True:
             try:
-                proc.wait(timeout=3)
+                proc.wait(timeout=0.2)
+                break
             except subprocess.TimeoutExpired:
                 pass
+            if stop_check is not None:
+                try:
+                    should_stop = bool(stop_check())
+                except Exception:
+                    should_stop = False
+                if should_stop:
+                    user_interrupted = True
+                    _kill_process_tree(proc)
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    break
+            if deadline is not None and time.monotonic() >= deadline:
+                timed_out = True
+                _kill_process_tree(proc)
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+                break
 
         # 给 drainer 一段收尾时间；Windows 上孙进程可能继承管道句柄，
         # 超过 grace 后主动关闭管道，避免阻塞在 read。
@@ -442,23 +534,26 @@ class SandboxExecutor:
 
         if timed_out:
             return SandboxResult(timeout=True, full_output_path=full_path, spilled=spilled)
+        if user_interrupted:
+            # 用户停止：杀进程树后立即返回，当前输出丢弃（转录由上层合成
+            # "⏹️ 已中断"占位结果，保证 tool_call/result 配对完整）。
+            return SandboxResult(interrupted=True, full_output_path=full_path, spilled=spilled)
 
         stdout = out_drainer.result_bytes().decode("utf-8", errors="replace")
         stderr = err_drainer.result_bytes().decode("utf-8", errors="replace")
-        if out_drainer.truncated or err_drainer.truncated:
-            if spilled:
-                stderr = (
-                    (stderr + "\n" if stderr else "")
-                    + f"[沙箱] 输出超过阈值，已落盘到 {full_path}"
-                )
-            else:
-                stderr = (
-                    (stderr + "\n" if stderr else "")
-                    + f"[沙箱] 输出超过 max_output_mb 上限（{max_bytes // (1024 * 1024)}MB），已截断"
-                )
+        if (out_drainer.truncated or err_drainer.truncated) and not spilled:
+            # spill 路径的落盘提示由工具层 _format_output 附“完整输出已落盘: <path>”；
+            # 这里只保留无 spill（kill 截断）模式的提示，避免重复。
+            stderr = (
+                (stderr + "\n" if stderr else "")
+                + f"[沙箱] 输出超过 max_output_mb 上限（{max_bytes // (1024 * 1024)}MB），已截断"
+            )
 
+        # C6：不再对全量输出预脱敏——返回原始 stdout/stderr，由工具层
+        # _format_output 先截断再统一 sanitize_output（幂等安全，避免对
+        # MB 级输出做全量正则脱敏）。
         return SandboxResult(
-            stdout=sanitize_output(stdout),
+            stdout=stdout,
             stderr=stderr,
             exit_code=proc.returncode,
             full_output_path=full_path,
@@ -470,35 +565,52 @@ class SandboxExecutor:
     # ================================================================
 
     def check_write_file(
-        self, file_path: str, content: str
+        self, file_path: str, content: str, *,
+        check_policy_paths: bool = True,
     ) -> tuple[bool, str]:
         """检查文件写入操作（L2-A 文件保护）
 
         委托 guard.check_write_content 做敏感文件 / 系统路径 / 内容注入扫描，
         再补充工作区边界检查（guard 不感知 workspace）。
-        """
-        if self._unreviewed_mode:
-            return True, ""
 
-        is_safe, reason = check_write_content(file_path, content)
+        沙箱未启用时不拦截（整体权限遵循 PolicyEngine 四档裁决）；启用后才执行
+        内容/边界硬检查，与 SecurityGate 的 L2 一致。
+        """
+        if not self.enabled:
+            return True, ""
+        is_safe, reason = check_write_content(
+            file_path, content, check_policy_paths=check_policy_paths)
         if not is_safe:
             log_interception("write", file_path, reason)
             return False, reason
 
-        # 工作区外写入需要额外确认（走 L1 权限）
+        # 工作区边界由统一 PolicyEngine 裁决；工具直调时仍保持本地边界。
+        # 与 PolicyEngine 的 allowed_roots（project_root + extra_workspace_roots）一致，
+        # 避免 extra 根下的合法写入被单工作区误判为 OUTSIDE_WORKSPACE。
         path = Path(file_path).resolve()
-        if not _is_within_workspace(path, self._workspace):
+        if check_policy_paths and not self._is_within_any_workspace(path):
             log_interception("write", file_path, "OUTSIDE_WORKSPACE")
             return False, f"写入路径不在工作区内: {path}"
 
         return True, ""
+
+    def _is_within_any_workspace(self, path: Path) -> bool:
+        """路径是否落在任一受信工作区根下（主工作区 + extra_workspace_roots）。"""
+        if _is_within_workspace(path, self._workspace):
+            return True
+        for root in self._extra_workspace_roots:
+            if _is_within_workspace(path, root):
+                return True
+        return False
 
     # ================================================================
     # Python 代码检查接口（供 PythonTool 调用）
     # ================================================================
 
     def check_python(self, code: str) -> tuple[bool, str]:
-        """检查 Python 代码安全性"""
+        """检查 Python 代码安全性（沙箱启用时才拦截，否则交由四档裁决）"""
+        if not self.enabled:
+            return True, ""
         return check_python_code(code)
 
     # ================================================================
@@ -510,7 +622,11 @@ class SandboxExecutor:
 
         1. 当前配置档 network 开关为 False → 直接拒绝所有外发
         2. 域名/IP 黑名单（注：blocked_ips 由 check_network_target 处理）
+
+        沙箱未启用时不拦截（整体权限遵循 PolicyEngine 四档裁决）。
         """
+        if not self.enabled:
+            return True, ""
         # 1. per-profile 网络开关：restricted 档 network=False 时禁网
         if not self.is_profile_network_enabled():
             reason = f"当前配置档 '{self.current_profile}' 禁止网络访问"

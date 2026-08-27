@@ -34,13 +34,37 @@ logger = logging.getLogger("jk_agent.gateway")
 _STATE_FILE = Path(__file__).parent / "scheduler_state.json"
 _PREVIEW_CHARS = 120  # state/history 中回复预览截断长度
 _POLL_CAP = 30.0      # tick 轮询上限（秒），保证 reload/pause 及时生效
+# Agent 硬超时兜底默认值：与 server.py sessions 段缺省一致。
+_DEFAULT_HARD_TIMEOUT_SECONDS = 1200.0
+# 多实例选主（leader_lease，见 docs/multi-instance.md）：
+_LEASE_TTL_SECONDS = 60.0   # scheduler 租约 TTL：须大于最大 tick 间隔（30s）
+_LEASE_RETRY_SECONDS = 5.0  # 非 leader 时轮询抢占的间隔
 
 # 模块级调度器引用（LLM 工具 / CronTool 通过此获取活动实例）
 _scheduler_instance: Optional["Scheduler"] = None
+# jobs 配置读改写互斥（CronTool / /api/scheduler 可能并发写 config.json）
+_jobs_lock = threading.RLock()
 
 
 def get_scheduler() -> Optional["Scheduler"]:
     return _scheduler_instance
+
+
+def acquire_leader_lease(dispatcher, name: str, ttl_seconds: float) -> bool:
+    """经 runtime.db 的 leader_lease 表抢占/续租单点执行权（多实例防双跑）。
+
+    - 无共享 DB（runtime_store 为 None）或缺实例身份 → 恒真（保持单实例行为）；
+    - 租约异常只记日志并放行（fail-open：不因租约故障阻断 cron/heartbeat）。
+    """
+    store = getattr(dispatcher, "_runtime_store", None)
+    holder = getattr(dispatcher, "instance_id", None)
+    if store is None or not holder:
+        return True
+    try:
+        return bool(store.try_acquire_lease(name, holder, ttl_seconds))
+    except Exception as exc:
+        logger.warning("leader_lease(%s) 获取失败，本轮按持有者处理: %s", name, exc)
+        return True
 
 
 def _write_jobs_to_config(jobs: list):
@@ -50,13 +74,14 @@ def _write_jobs_to_config(jobs: list):
     """
     from core.config_writer import read_raw_config, write_config as cw_write, backup_file
 
-    data, status = read_raw_config()
-    if status == "corrupt":
-        raise RuntimeError("config.json 损坏，请人工修复")
-    data.setdefault("gateway", {}).setdefault("scheduler", {})["jobs"] = jobs
-    backup_file()
-    cw_write(None, data)
-    load_config(force_reload=True)
+    with _jobs_lock:
+        data, status = read_raw_config()
+        if status == "corrupt":
+            raise RuntimeError("config.json 损坏，请人工修复")
+        data.setdefault("gateway", {}).setdefault("scheduler", {})["jobs"] = jobs
+        backup_file()
+        cw_write(None, data)
+        load_config(force_reload=True)
 
 
 def add_job(name: str, schedule: str, prompt: str,
@@ -81,28 +106,29 @@ def add_job(name: str, schedule: str, prompt: str,
         return "❌ name 和 prompt 不能为空"
 
     src = get_scheduler()
-    jobs = list(src.jobs) if src else []
+    with _jobs_lock:
+        jobs = list(src.jobs) if src else []
 
-    deliver = {"mode": deliver_mode}
-    if deliver_mode == "announce" and deliver_channel and deliver_target:
-        deliver["channel"] = deliver_channel
-        deliver["target"] = deliver_target
-    elif deliver_mode == "webhook" and deliver_target:
-        deliver["target"] = deliver_target
+        deliver = {"mode": deliver_mode}
+        if deliver_mode == "announce" and deliver_channel and deliver_target:
+            deliver["channel"] = deliver_channel
+            deliver["target"] = deliver_target
+        elif deliver_mode == "webhook" and deliver_target:
+            deliver["target"] = deliver_target
 
-    job = {
-        "name": name, "schedule": schedule, "prompt": prompt,
-        "session": session, "deliver": deliver,
-        "timeout": timeout, "enabled": enabled,
-    }
+        job = {
+            "name": name, "schedule": schedule, "prompt": prompt,
+            "session": session, "deliver": deliver,
+            "timeout": timeout, "enabled": enabled,
+        }
 
-    jobs = [j for j in jobs if j.get("name") != name]
-    jobs.append(job)
+        jobs = [j for j in jobs if j.get("name") != name]
+        jobs.append(job)
 
-    try:
-        _write_jobs_to_config(jobs)
-    except Exception as e:
-        return f"❌ 写入 config 失败: {e}"
+        try:
+            _write_jobs_to_config(jobs)
+        except Exception as e:
+            return f"❌ 写入 config 失败: {e}"
 
     if src:
         src.reload_config()
@@ -112,36 +138,49 @@ def add_job(name: str, schedule: str, prompt: str,
 def delete_job(name: str) -> str:
     """删除定时任务（LLM 工具直接调用）"""
     src = get_scheduler()
-    jobs = list(src.jobs) if src else []
-    new = [j for j in jobs if j.get("name") != name]
-    if len(new) == len(jobs):
-        return f"❌ 未找到任务: {name}"
+    with _jobs_lock:
+        jobs = list(src.jobs) if src else []
+        new = [j for j in jobs if j.get("name") != name]
+        if len(new) == len(jobs):
+            return f"❌ 未找到任务: {name}"
 
-    try:
-        _write_jobs_to_config(new)
-    except Exception as e:
-        return f"❌ 写入 config 失败: {e}"
+        try:
+            _write_jobs_to_config(new)
+        except Exception as e:
+            return f"❌ 写入 config 失败: {e}"
 
     if src:
         src.reload_config()
     return f"✅ 已删除定时任务: {name}"
 
 
+def _log_trigger_future(future) -> None:
+    """run_coroutine_threadsafe 返回 future：统一记录未观察到的异常。"""
+    try:
+        future.result()
+    except Exception as e:
+        logger.error("手动触发定时任务失败: %s", e, exc_info=True)
+
+
 def run_job(name: str) -> str:
-    """手动触发定时任务"""
+    """手动触发定时任务（经主事件循环执行，不依赖调用线程的事件循环）。
+
+    server 启动时把主循环引用注入 Scheduler（set_event_loop），
+    这里用 run_coroutine_threadsafe 投递，避免在工作线程里
+    asyncio.get_event_loop() 拿到错误/不存在的循环。
+    """
     src = get_scheduler()
     if src is None:
         return "❌ scheduler 未启动"
-    import asyncio
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        return "❌ 无事件循环，无法触发"
-    if loop.is_running():
-        asyncio.create_task(src.handle_command(f"run {name}"))
-        return f"▶ 已触发: {name}"
-    else:
+    loop = getattr(src, "_loop", None)
+    if loop is None or loop.is_closed():
+        return "❌ 事件循环不可用（scheduler 未启动或已停止）"
+    if not loop.is_running():
         return "❌ 事件循环未运行"
+    future = asyncio.run_coroutine_threadsafe(
+        src.handle_command(f"run {name}"), loop)
+    future.add_done_callback(_log_trigger_future)
+    return f"▶ 已触发: {name}"
 
 
 def _now_dt() -> datetime:
@@ -197,8 +236,12 @@ async def deliver_reply(dispatcher, deliver: dict, label: str, text: str):
 
 
 def _post_webhook(label: str, url: str, text: str):
-    """守护线程 HTTP POST（复用 webhook_notifier 范式）"""
-    import requests
+    """守护线程 HTTP POST（复用 webhook_notifier 范式）。
+
+    SSRF 防护：接入 core.safe_http 的 URL 校验——禁私网/链路本地/元数据
+    地址，且禁止重定向；非法目标记日志并跳过投递。
+    """
+    from core.safe_http import UnsafeUrl, request as safe_request, validate_url
     payload = {
         "source": label,
         "at": _now_dt().isoformat(timespec="seconds"),
@@ -207,7 +250,14 @@ def _post_webhook(label: str, url: str, text: str):
 
     def _post():
         try:
-            requests.post(url, json=payload, timeout=10)
+            validate_url(url)
+        except UnsafeUrl as e:
+            logger.error("%s webhook URL 非法，跳过投递: %s", label, e)
+            return
+        try:
+            # max_redirects=0：重定向响应直接按非法处理，防止跳到内网地址
+            safe_request("POST", url, max_redirects=0,
+                         json=payload, timeout=10)
         except Exception as e:
             logger.error("%s webhook POST 失败: %s", label, e)
 
@@ -217,10 +267,24 @@ def _post_webhook(label: str, url: str, text: str):
 class Scheduler:
     """定时任务调度器（janitor 范式：start() 内 create_task，stop() 内取消）"""
 
-    def __init__(self, config: dict, dispatcher, session_mgr):
+    def __init__(self, config: dict, dispatcher, session_mgr,
+                 *, hard_timeout_seconds: Optional[float] = None):
         self._cfg = config or {}
         self._dispatcher = dispatcher
         self._session_mgr = session_mgr
+        # Agent 硬超时（秒）：与 dispatcher 同源——server.py 把 sessions 段的
+        # hard_timeout_seconds 注入 agent_config 传给 Dispatcher，这里优先读
+        # 同一来源，构造参数仅作显式覆盖（避免再造配置双源）。
+        if hard_timeout_seconds is None:
+            agent_cfg = getattr(dispatcher, "agent_config", None) or {}
+            hard_timeout_seconds = agent_cfg.get("hard_timeout_seconds")
+        try:
+            self.hard_timeout_seconds = max(
+                0.0, float(hard_timeout_seconds)
+                if hard_timeout_seconds is not None
+                else _DEFAULT_HARD_TIMEOUT_SECONDS)
+        except (TypeError, ValueError):
+            self.hard_timeout_seconds = _DEFAULT_HARD_TIMEOUT_SECONDS
         self._task: Optional[asyncio.Task] = None
         self._next_fire: dict[str, datetime] = {}
         self._running_jobs: set[str] = set()   # 正在运行的 job name（overlap/busy 判定）
@@ -229,6 +293,21 @@ class Scheduler:
         self._state: dict = {"jobs": {}, "paused": [], "history": []}
         self._state_lock = threading.Lock()
         self.channel = SchedulerChannel(self)
+        # 无回复 job 看门：session_key -> {job, trigger, fired_at, deadline}
+        self._watchdogs: dict[str, dict] = {}
+        # 看门已触发（按超时收尾）的 session_key -> {job}：迟到回复到达时
+        # 尽力补投递，不再静默丢弃（见 on_reply）。
+        self._expired: dict[str, dict] = {}
+        # misfire 补跑任务追踪（stop() 统一取消）
+        self._misfire_tasks: set[asyncio.Task] = set()
+        # 主事件循环引用（run_job 经 run_coroutine_threadsafe 投递）
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # 多实例选主：上一轮租约持有状态（None=未知），用于领导权变更日志
+        self._lease_held: Optional[bool] = None
+
+    def set_event_loop(self, loop) -> None:
+        """注入主事件循环（server 启动时保存），供 run_job 跨线程投递。"""
+        self._loop = loop
 
     # ---------- 配置 ----------
 
@@ -244,11 +323,49 @@ class Scheduler:
     def misfire_policy(self) -> str:
         return self._cfg.get("misfire_policy", "skip")
 
+    @property
+    def lease_ttl_seconds(self) -> float:
+        """scheduler 选主租约 TTL（gateway.scheduler.lease_ttl_seconds，默认 60s）。
+
+        必须大于最大 tick 间隔（_POLL_CAP=30s），否则存活 leader 在两次续租
+        之间被误抢，造成 cron 双跑。"""
+        try:
+            return max(1.0, float(self._cfg.get("lease_ttl_seconds", _LEASE_TTL_SECONDS)))
+        except (TypeError, ValueError):
+            return _LEASE_TTL_SECONDS
+
     def job_by_name(self, name: str) -> Optional[dict]:
         for j in self.jobs:
             if j.get("name") == name:
                 return j
         return None
+
+    # ---------- 公开只读快照（供 LLM 工具 / 展示层使用） ----------
+
+    def job_stats(self) -> dict:
+        """各任务最近执行统计的只读快照（name -> {runs, failures, ...}）。
+
+        供 cron_list 等工具读取，避免外部直接访问私有 ``_state``。
+        """
+        with self._state_lock:
+            jobs = self._state.get("jobs") or {}
+            return {name: dict(stats) if isinstance(stats, dict) else {}
+                    for name, stats in jobs.items()}
+
+    def paused_jobs(self) -> set:
+        """当前暂停中的任务名集合（只读副本）。"""
+        return set(self._paused)
+
+    def _watchdog_deadline(self, job: dict, fired_at: float) -> float:
+        """看门时限：max(job.timeout + 60, 硬超时 + 30)。
+
+        - job.timeout + 60：job 自报时限的宽限；
+        - hard_timeout + 30：Agent 真实执行上限（sessions.hard_timeout_seconds）
+          再加投递余量——job.timeout 配得比硬超时短时，看门不得早于硬超时触发，
+          否则会把仍在正常执行的 job 误判为"无回复"而提前收尾。"""
+        job_timeout = int(job.get("timeout") or 600)
+        return fired_at + max(job_timeout + 60.0,
+                              self.hard_timeout_seconds + 30.0)
 
     def reload_config(self) -> int:
         """热重载 scheduler 配置段（/cron reload）"""
@@ -258,6 +375,8 @@ class Scheduler:
         return len(self.jobs)
 
     def _job_active(self, job: dict) -> bool:
+        if not isinstance(job, dict):
+            return False
         if not is_enabled(job.get("enabled"), True):
             return False
         if not job.get("name") or not job.get("prompt"):
@@ -345,6 +464,11 @@ class Scheduler:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        for t in list(self._misfire_tasks):
+            t.cancel()
+        self._misfire_tasks.clear()
+        self._watchdogs.clear()
+        self._expired.clear()
         with self._state_lock:
             self._save_state_locked()
         logger.info("⏰ Scheduler 已停止")
@@ -359,7 +483,9 @@ class Scheduler:
         for job in self.jobs:
             if not self._job_active(job):
                 continue
-            name = job["name"]
+            name = job.get("name", "")
+            if not name:
+                continue  # 畸形 job：无 name，跳过
             last_s = jobs_state.get(name, {}).get("last_fire")
             if not last_s:
                 continue  # 从未运行过不算错过
@@ -372,13 +498,29 @@ class Scheduler:
                 logger.info("⏰ 定时任务 %s 停机期间错过触发（计划 %s），"
                             "misfire_policy=run_once → 补跑一次",
                             name, prev.strftime("%m-%d %H:%M"))
-                asyncio.create_task(self._try_fire(job, trigger="misfire_run"))
+                task = asyncio.create_task(
+                    self._try_fire(job, trigger="misfire_run"))
+                self._misfire_tasks.add(task)
+                task.add_done_callback(self._misfire_tasks.discard)
 
     # ---------- tick 循环 ----------
 
     async def _tick_loop(self):
         while True:
             try:
+                # 多实例选主：每轮先抢占/续租 leader_lease（name='scheduler'），
+                # 只有租约持有者执行 tick；租约过期后其他实例可抢占（故障转移）。
+                if not acquire_leader_lease(self._dispatcher, "scheduler",
+                                            self.lease_ttl_seconds):
+                    if self._lease_held is not False:
+                        self._lease_held = False
+                        logger.info("⏰ scheduler 非 leader（租约被其他实例持有），本轮跳过")
+                    await asyncio.sleep(_LEASE_RETRY_SECONDS)
+                    continue
+                if self._lease_held is not True:
+                    self._lease_held = True
+                    logger.info("⏰ scheduler 成为 leader（instance_id=%s）",
+                                getattr(self._dispatcher, "instance_id", "?"))
                 delay = await self._tick_once()
             except asyncio.CancelledError:
                 break
@@ -388,11 +530,12 @@ class Scheduler:
             await asyncio.sleep(delay)
 
     async def _tick_once(self) -> float:
+        self._sweep_watchdogs()
         now = _now_dt()
         nearest: Optional[datetime] = None
         for job in self.jobs:
-            name = job["name"]
-            if not self._job_active(job):
+            name = job.get("name", "")
+            if not name or not self._job_active(job):
                 self._next_fire.pop(name, None)
                 continue
             nf = self._next_fire.get(name)
@@ -407,6 +550,32 @@ class Scheduler:
         if nearest is None:
             return _POLL_CAP
         return max(1.0, min(_POLL_CAP, (nearest - _now_dt()).total_seconds()))
+
+    def _sweep_watchdogs(self) -> None:
+        """看门狗：清理超时未收到回复的 job。
+
+        看门时限 = max(job.timeout + 60, 硬超时 + 30)（见 _watchdog_deadline）。
+        Agent 硬超时/取消/异常吞掉回复时避免 _running_jobs/_pending 永久泄漏；
+        按 error 收尾并清空登记，同时把 job 记入 _expired：此后到达的迟到回复
+        仍尽力补投递（见 on_reply），不再静默丢弃。
+        """
+        now = time.time()
+        for key, wd in list(self._watchdogs.items()):
+            if now < wd["deadline"]:
+                continue
+            self._watchdogs.pop(key, None)
+            info = self._pending.pop(key, None)
+            if info is None:
+                continue  # 已正常收尾
+            job = info["job"]
+            name = job.get("name", "?")
+            self._running_jobs.discard(name)
+            self._expired[key] = {"job": job}
+            duration = round(now - info["fired_at"], 1)
+            self._record(name, info["trigger"], "error", duration,
+                         "看门狗：job 超时未收到回复")
+            if job.get("session", "isolated") == "isolated":
+                asyncio.create_task(self._cleanup_isolated(key))
 
     # ---------- 触发 ----------
 
@@ -424,6 +593,13 @@ class Scheduler:
 
     async def _fire(self, job: dict, trigger: str):
         name = job.get("name", "?")
+        capability = str(job.get("capability") or "plan").lower()
+        if capability not in {"plan", "subagent", "goal"}:
+            self._record(name, trigger, "skipped_invalid_capability", 0, capability)
+            return
+        if capability == "goal" and not bool(job.get("goal_enabled", False)):
+            self._record(name, trigger, "skipped_goal_disabled", 0, "goal_enabled=false")
+            return
         fired_at = time.time()
         if job.get("session", "isolated") == "persist":
             session_key = f"sched:{name}"
@@ -433,6 +609,12 @@ class Scheduler:
             "job": job, "trigger": trigger, "fired_at": fired_at,
         }
         self._running_jobs.add(name)
+        # 看门狗：job 无回复时按 error 收尾
+        # （时限 = max(job.timeout + 60, 硬超时 + 30)，见 _watchdog_deadline）
+        self._watchdogs[session_key] = {
+            "job": job, "trigger": trigger, "fired_at": fired_at,
+            "deadline": self._watchdog_deadline(job, fired_at),
+        }
         msg = InboundMessage(
             channel="scheduler",
             session_key=session_key,
@@ -470,19 +652,50 @@ class Scheduler:
         try:
             fired_at = float(fired_at)
         except (TypeError, ValueError):
-            fired_at = time.time()
+            fired_at = 0.0
+        # 健全性校验：恢复数据里的 fired_at 必须落在合理区间。实测曾出现
+        # last_duration_s≈5.6e9（约 56.7 年）的脏数据——异常时间戳会让看门
+        # deadline/时长统计完全失真，这里直接归零按"未知触发时刻"处理。
+        now = time.time()
+        if not (0.0 < fired_at <= now):
+            logger.warning(
+                "调度恢复上下文的 fired_at 非法（%r），按当前时刻处理: %s",
+                context.get("fired_at") if isinstance(context, dict) else None,
+                msg.session_key)
+            fired_at = now
         self._pending[msg.session_key] = {
             "job": job, "trigger": trigger, "fired_at": fired_at,
         }
         self._running_jobs.add(job.get("name", job_name))
+        self._watchdogs[msg.session_key] = {
+            "job": job, "trigger": trigger, "fired_at": fired_at,
+            "deadline": self._watchdog_deadline(job, fired_at),
+        }
         logger.info("Restored scheduler context: %s", msg.session_key)
 
     # ---------- 回复处理（SchedulerChannel 调用） ----------
 
     async def on_reply(self, msg: InboundMessage, text: str):
-        info = self._pending.pop(msg.session_key, None)
+        key = msg.session_key
+        info = self._pending.pop(key, None)
+        self._watchdogs.pop(key, None)
         if info is None:
-            logger.debug("scheduler 收到未登记的会话回复: %s", msg.session_key)
+            expired = self._expired.pop(key, None)
+            if expired is not None:
+                # 迟到回复：看门已按超时收尾，但回复最终到达。记 warning 并
+                # 尽力按 job.deliver 补投递（announce/webhook），不再静默丢弃。
+                # 投递失败只记日志——登记已清、看门已收尾，无需重试路径。
+                job = expired.get("job") or {}
+                logger.warning(
+                    "⏰ 定时任务 %s 的回复在看门收尾后到达（迟到），仍尽力投递",
+                    job.get("name", "?"))
+                try:
+                    await self._deliver(job, text)
+                except Exception as e:
+                    logger.warning("定时任务迟到回复补投递失败: %s", e,
+                                   exc_info=True)
+            else:
+                logger.debug("scheduler 收到未登记的会话回复: %s", key)
             return
         job = info["job"]
         name = job.get("name", "?")
@@ -517,20 +730,18 @@ class Scheduler:
     # ---------- isolated 会话清理 ----------
 
     async def _cleanup_isolated(self, session_key: str):
-        """isolated 投递完成后删除会话文件与 map 条目（防无限增长）"""
+        """isolated 会话收尾：仅驱逐内存实例。
+
+        注意归属：持久化侧的 conversation 数据由 WebUI retention loop
+        （service.cleanup → delete_stale_system_conversations，覆盖
+        sched:/heartbeat:/system: 键）按 7 天保留期清理；runtime.db 任务域
+        sessions 表由 RuntimeStore.delete_stale_sessions（RetentionManager）
+        清理。本函数不负责任何持久化删除；sessions_map 条目自一次性会话键
+        停写后不再产生（agent_factory._is_ephemeral_session_key）。"""
         await asyncio.sleep(2)  # 等 worker 收尾（is_busy 复位等）
         try:
-            entry = self._session_mgr._sessions.get(session_key)
-            sid = None
-            if entry is not None and entry.agent is not None:
-                sid = getattr(entry.agent.store, "session_id", None)
-            await self._session_mgr.evict(session_key, save=False)
-            from gateway.agent_factory import remove_map_entry
-            remove_map_entry(session_key)
-            if sid:
-                from core.message_store import MessageStore
-                MessageStore.delete_session_file(sid)
-            logger.debug("isolated 定时会话已清理: %s", session_key)
+            await self._session_mgr.evict(session_key, save=True)
+            logger.debug("isolated 定时会话 archived_pending: %s", session_key)
         except Exception as e:
             logger.warning("isolated 定时会话清理失败 %s: %s", session_key, e)
 
@@ -560,6 +771,8 @@ class Scheduler:
             return "⏰ 当前无定时任务（config gateway.scheduler.jobs 为空）"
         lines = ["⏰ 定时任务列表:"]
         for job in self.jobs:
+            if not isinstance(job, dict):
+                continue
             name = job.get("name", "?")
             if self._job_active(job):
                 mark = "✅"

@@ -111,7 +111,7 @@ class TaskEnvelope:
     budget: Budget = field(default_factory=Budget)
 
     VALID_SOURCES: ClassVar[set[str]] = {
-        "user", "plan", "heartbeat", "scheduler", "system", "retry",
+        "user", "plan", "goal", "subagent", "heartbeat", "scheduler", "system", "retry",
     }
 
     def __post_init__(self) -> None:
@@ -148,15 +148,13 @@ class TaskEnvelope:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskEnvelope":
         value = dict(data)
-        # Runtime databases created by earlier releases can contain retired
-        # linkage fields. Ignore them when reading persisted tasks.
-        value.pop("goal_id", None)
-        value.pop("team_id", None)
-        # Earlier runtime experiments emitted retired producer labels. They
-        # are historical records, not resumable work, so map them to a valid
-        # neutral source when reading instead of rejecting the whole database.
-        if value.get("source") in {"goal", "subagent"}:
-            value["source"] = "system"
+        # Preserve recognized Goal/Subagent lineage in metadata when loading
+        # older snapshots; these are valid producers in the unified runtime.
+        metadata = dict(value.get("metadata") or {})
+        for relation in ("goal_id", "team_id"):
+            if relation in value:
+                metadata.setdefault(relation, value.pop(relation))
+        value["metadata"] = metadata
         value["context_refs"] = tuple(value.get("context_refs") or ())
         value["budget"] = Budget.from_dict(value.get("budget"))
         return cls(**value)

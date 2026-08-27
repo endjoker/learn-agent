@@ -15,10 +15,10 @@ class PlanManager:
         self.store = store
 
     def create_preview(self, session_id: str, raw_plan: dict[str, Any], *, source_prompt: str,
-                       title: str = "执行方案") -> Plan:
+                       title: str = "执行方案", goal_id: str | None = None) -> Plan:
         tasks = self._tasks_from_raw(raw_plan)
         plan = Plan.create(session_id=session_id, title=title, tasks=tasks,
-                           source_prompt=source_prompt)
+                           source_prompt=source_prompt, goal_id=goal_id)
         self._save(plan, "plan.created")
         plan.transition(PlanStatus.AWAITING_APPROVAL)
         self._save(plan, "plan.awaiting_approval")
@@ -38,34 +38,36 @@ class PlanManager:
         return [Plan.from_dict(item) for item in self.store.list_plans_by_status(statuses, limit=limit)]
 
     def archive_terminal_for_session(self, session_id: str) -> int:
-        """Hide completed/cancelled Plan cards without deleting audit data.
+        """Remove terminal Plan business records for one session after clearing.
 
-        A clear operation must never cancel or alter a live Plan.  Terminal
-        snapshots remain durable for audit/recovery but are omitted from the
-        normal WebUI list after they have been cleared by the user.
+        Human-visible content stays in the conversation/memory history; the
+        runtime state-machine record and per-task linkage are deleted.  Live
+        Plans are never touched.
         """
         count = 0
-        for plan in self.list(session_id, limit=1000, include_archived=True):
-            if not plan.is_terminal or plan.archived_at:
-                continue
-            now = utc_now()
-            plan.archived_at = now
-            plan.updated_at = now
-            self._save(plan, "plan.archived")
-            count += 1
+        # list 单次上限 1000；删除终态 Plan 后循环重扫，保证 >1000 条也全部归档。
+        while True:
+            terminal_seen = False
+            for plan in self.list(session_id, limit=1000, include_archived=True):
+                if not plan.is_terminal:
+                    continue
+                terminal_seen = True
+                if self.store.delete_plan(plan.plan_id):
+                    count += 1
+            if not terminal_seen:
+                break
         return count
 
     def archive_terminal(self, plan_id: str) -> Plan:
-        """Hide one terminal Plan card without deleting its audit record."""
+        """Clear one terminal Plan: delete its business record.
+
+        Conversation/memory keep the plan content; only the runtime Plan row
+        and its PlanTask rows are removed from the store.
+        """
         plan = self._require(plan_id)
         if not plan.is_terminal:
             raise ValueError("only a completed, failed, or cancelled Plan can be cleared")
-        if plan.archived_at:
-            return plan
-        now = utc_now()
-        plan.archived_at = now
-        plan.updated_at = now
-        self._save(plan, "plan.archived")
+        self.store.delete_plan(plan.plan_id)
         return plan
 
     def approve(self, plan_id: str, *, actor: str = "user") -> Plan:
@@ -210,6 +212,32 @@ class PlanManager:
         if not tasks:
             raise ValueError("plan needs at least one step")
         return tasks
+
+    @staticmethod
+    def task_prior_summaries_block(plan: "Plan", task: "PlanTask", *,
+                                   max_items: int = 5) -> str:
+        """Build the (capped) prior-summary block for a PlanTask prompt.
+
+        L4#12: 复刻 ``PlanExecutor._task_prompt`` 的前序已完成 step 摘要线性注入，
+        但只注入最近 ``max_items``（默认 K=5）条，长 Plan 不再让 prompt 无界增长。
+        返回空串表示无可注入摘要；返回值与 _task_prompt 现有 ``prior_block`` 格式一致，
+        runtime 侧改为直接取本方法结果即可（见需协调项）。
+        """
+        max_items = max(1, int(max_items))
+        prior = []
+        for t in plan.tasks:
+            if t.plan_task_id == task.plan_task_id:
+                continue
+            if t.status is not PlanTaskStatus.COMPLETED:
+                continue
+            summary = str(t.result_summary or "").strip()
+            if not summary:
+                continue
+            prior.append(f"- {t.plan_task_id}: {summary[:500]}")
+        if not prior:
+            return ""
+        recent = prior[-max_items:]
+        return "\n已完成的前置步骤结果：\n" + "\n".join(recent) + "\n"
 
     @staticmethod
     def _refresh_ready(plan: Plan) -> None:

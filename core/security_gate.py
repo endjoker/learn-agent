@@ -1,186 +1,94 @@
 # -*- coding: utf-8 -*-
-"""
-中央安全闸门 —— 在 agent action 执行点统一跑 L1 权限 + L2 沙箱
-
-设计动机：
-    L2 沙箱原本是 opt-in（每个工具在 execute() 内自己调 check_*），
-    file_mgr / skill / MCP 没接就绕过。本模块把 L2 上移到与 L1 同一个
-    执行点——对每次工具调用（内置/skill/MCP/未来）都按 capability 跑
-    L1+L2，覆盖不再依赖工具自觉。
-
-    L2 检查按工具声明的 capability 选；L1 策略按工具名查 PermissionChecker，
-    未知工具名默认 ASK（修复原 trusted 时未知工具自动 ALLOW 的缺口）。
-
-调用方：agent 的 run / stream_run 在执行每个 action 前调用
-    level, reason = gate.check(tool, params, tool_name)
-    level ∈ {ALLOW, ASK, DENY}
-"""
+"""Compatibility security gate backed by the unified PolicyEngine."""
+from __future__ import annotations
 
 import logging
 from typing import Optional, Tuple
 
 from core.permission import PermissionChecker, ALLOW, ASK, DENY
+from core.policy_engine import PolicyEngine
 from core.sandbox.guard import check_command_safety, check_python_code, check_proc_send_input
 
 logger = logging.getLogger("jk_agent")
 
 
 class SecurityGate:
-    """统一安全闸门：L1 权限 + L2 沙箱内容检查。"""
+    """L2 硬检查（默认关闭）→ 4 档权限决策。
 
-    def __init__(
-        self,
-        permission: PermissionChecker,
-        sandbox=None,            # SandboxExecutor | None
-        workspace: Optional[str] = None,
-    ):
+    沙箱未挂载或 sandbox.enabled=false 时只做 PolicyEngine 权限决策；
+    开启后先跑非覆盖式内容检查（命令/代码/进程/写盘/外发），再决策。
+    """
+
+    def __init__(self, permission: PermissionChecker, sandbox=None,
+                 workspace: Optional[str] = None):
         self.permission = permission
         self.sandbox = sandbox
-        self.workspace = workspace or ""
-
-    # ================================================================
-    # 主入口
-    # ================================================================
+        self.workspace = workspace or str(permission.workspace)
 
     def check(self, tool, params: dict, tool_name: Optional[str] = None) -> Tuple[str, str]:
-        """
-        对一次工具调用做安全检查。
-
-        参数:
-            tool:      BaseTool 实例（可能为 None，表示未知工具）
-            params:    工具参数
-            tool_name: 工具名（LLM 给的；可能与 tool.name 一致）
-
-        返回:
-            (level, reason) — level ∈ {ALLOW, ASK, DENY}
-        """
-        name = tool_name or (tool.name if tool else "") or ""
-        caps = self._resolve_caps(tool, params)
-
-        # unreviewed 先走 L1 例外判定：高危命令、敏感文件/目录会返回
-        # ASK 并进入审批桥；其他操作明确跳过普通 L2 内容/路径规则。
-        if self.permission.is_unreviewed_mode():
-            # 直接交给 PermissionChecker 的 unreviewed 例外判定（普通工具/
-            # 路径全部 ALLOW，仅高危命令与敏感/系统路径 ASK）。不要走
-            # _policy —— 其中的 MCP trust / 未知工具分支不感知 unreviewed
-            # 模式，会把 web-search、cron_* 等普通操作也拦成 ASK。
-            level = self.permission.check(name, params)
-            return level, ""
-
-        # ---- L2 内容硬拦（按 capability + 参数形状）----
-        if self._l2_active():
-            l2 = self._l2_check(caps, params, name)
-            if l2 is not None:
-                ok, reason = l2
-                if not ok:
-                    logger.info(f"SecurityGate L2 拦截 [{name}]: {reason}")
-                    return DENY, reason
-
-        # ---- L1 策略 ----
-        return self._policy(name, params, caps, tool)
-
-    # ================================================================
-    # 内部
-    # ================================================================
+        name = tool_name or (getattr(tool, "name", "") if tool else "") or ""
+        caps = self._resolve_caps(tool, params, name)
+        hard = self._hard_checks(caps, params or {}, name)
+        if hard is not None:
+            ok, reason = hard
+            if not ok:
+                logger.info("SecurityGate hard deny [%s]: %s", name, reason)
+                return DENY, reason
+        decision = self.permission.decide(name, params or {}, caps)
+        return decision.level, decision.reason
 
     @staticmethod
-    def _resolve_caps(tool, params) -> tuple:
-        """取工具能力（支持 resolve_capabilities 钩子，按 action 决定）"""
-        if tool is None:
-            return ()
-        try:
-            caps = tool.resolve_capabilities(params)
-            return tuple(caps or ())
-        except Exception:
-            return tuple(getattr(tool, "capabilities", ()) or ())
+    def _resolve_caps(tool, params, name: str = "") -> tuple:
+        if tool is not None:
+            try:
+                resolved = tool.resolve_capabilities(params)
+                if resolved:
+                    return tuple(dict.fromkeys(resolved))
+            except Exception:
+                logger.warning("capability resolver failed for %s", name, exc_info=True)
+            static = tuple(getattr(tool, "capabilities", ()) or ())
+            if static:
+                return static
+        return PolicyEngine.infer_capabilities(name, params or {})
 
     def _l2_active(self) -> bool:
-        """L2 是否生效（沙箱开启且未临时绕过）"""
         sb = self.sandbox
-        if sb is None:
-            return False
-        if not getattr(sb, "enabled", False):
-            return False
-        if getattr(sb, "is_bypass_active", False):
-            return False
-        return True
+        return bool(sb is not None and getattr(sb, "enabled", False)
+                    and not getattr(sb, "is_bypass_active", False))
 
-    def _l2_check(self, caps: tuple, params: dict, name: str):
-        """
-        按 capability 跑 L2 内容检查。
-
-        返回:
-            (ok, reason) — 有对应检查时
-            None —— 该工具无对应 L2 检查（交给 L1）
-        """
+    def _hard_checks(self, caps: tuple, params: dict, name: str):
+        # L2 沙箱硬闸门默认关闭：沙箱未挂载或 sandbox.enabled=false 时，
+        # 命令/代码/进程内容检查与写盘/外发检查整体跳过，交回 4 档
+        # PolicyEngine 裁决（readonly/ask/allow/unreviewed 仍是唯一权限层；
+        # 高危命令、只读禁执行等策略级拒绝不受影响）。
+        if not self._l2_active():
+            return None
         cap_set = set(caps)
-        # 文件写入类：path/file_path/dest/paths
-        if cap_set & {"fs:write", "fs:delete", "fs:move"}:
-            content = params.get("content", "") or ""
-            checked = []
-            for key in ("path", "file_path", "dest"):
-                v = params.get(key)
-                if v:
-                    checked.append(v)
-            paths = params.get("paths") or []
-            if isinstance(paths, list):
-                checked.extend(p for p in paths if p)
-            if not checked:
-                return None  # 没有路径参数，交给 L1
-            for p in checked:
-                ok, reason = self.sandbox.check_write_file(p, content)
+        command = params.get("command")
+        if "exec:shell" in cap_set and command:
+            ok, reason = check_command_safety(str(command), "bash", self.workspace,
+                                              check_policy_paths=False)
+            if not ok:
+                return False, reason
+        if "exec:code" in cap_set and params.get("code"):
+            ok, reason = check_python_code(str(params["code"]))
+            if not ok:
+                return False, reason
+        if "proc:manage" in cap_set and params.get("input"):
+            ok, reason = check_proc_send_input(str(params["input"]))
+            if not ok:
+                return False, reason
+        if cap_set & {"fs:write", "fs:edit", "fs:delete", "fs:move"}:
+            content = params.get("content") or params.get("new_string") or ""
+            for path in self.permission.engine.extract_paths(params):
+                ok, reason = self.sandbox.check_write_file(
+                    path, str(content), check_policy_paths=self.permission.permission_mode != "unreviewed")
                 if not ok:
                     return False, reason
-            return None  # 路径都通过 L2，继续走 L1
-
-        # 网络外发
-        if "net:egress" in caps:
+        if "net:egress" in cap_set:
             url = params.get("url") or params.get("uri")
-            if not url:
-                return None
-            ok, reason = self.sandbox.check_egress(url)
-            return (ok, reason) if not ok else None
-
-        # shell 命令
-        if "exec:shell" in caps:
-            cmd = params.get("command")
-            if not cmd:
-                return None
-            ok, reason = check_command_safety(cmd, "bash", self.workspace)
-            return (ok, reason) if not ok else None
-
-        # python 代码
-        if "exec:code" in caps:
-            code = params.get("code")
-            if not code:
-                return None
-            ok, reason = check_python_code(code)
-            return (ok, reason) if not ok else None
-
-        # proc_send 内容检查（投喂到 REPL 的 input，shell+python 危险模式）
-        # 注意：此处硬编码 params["input"] 与 proc_send 的参数名耦合；
-        # 若未来新增 proc:manage 工具用了不同参数名（如 data/content），
-        # 需同步更新此处或改为按 capability 注册检查函数。
-        if "proc:manage" in cap_set:
-            inp = params.get("input")
-            if not inp:
-                return None   # 无 input（如 proc_stop）→ 交 L1
-            ok, reason = check_proc_send_input(inp)
-            return (ok, reason) if not ok else None
-
+            if url:
+                ok, reason = self.sandbox.check_egress(str(url))
+                if not ok:
+                    return False, reason
         return None
-
-    def _policy(self, name: str, params: dict, caps: tuple, tool) -> Tuple[str, str]:
-        """L1 策略：MCP trust / 已知规则 / 未知→ASK"""
-        # MCP 远程工具：按服务器 trust 标志
-        if "remote:call" in caps:
-            if tool is not None and getattr(tool, "trust", False):
-                return ALLOW, ""
-            return ASK, "MCP 远程工具需确认（可在 config.json 的 mcp.servers 中配 trust:true 放行）"
-
-        # 未知工具名 → ASK（修复原 trusted 时自动 ALLOW 的缺口）
-        if self.permission.get_rule(name) is None:
-            return ASK, f"未知工具 '{name}'，需确认"
-
-        level = self.permission.check(name, params)
-        return level, ""

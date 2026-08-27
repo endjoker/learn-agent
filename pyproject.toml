@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jkagent"
+version = "0.1.0"
+description = "JKagent Gateway runtime"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # Gateway HTTP/SSE server and remote MCP transports.
+    "aiohttp>=3.9.0",
+    # Default OpenAI-compatible provider (also used by DeepSeek/Ollama/vLLM).
+    "openai>=2.0.0",
+    # llm_client 重试分类直接引用其异常类型（try 导入；openai/anthropic 的传递依赖，显式声明以自文档化）。
+    "httpx>=0.24.0",
+    # Built-in HTTP tools and fail-closed egress helper.
+    "requests>=2.31.0",
+    # Durable memory search is imported by the default Agent runtime.
+    "rank-bm25>=0.2.2",
+    "jieba>=0.42.1",
+    # Scheduler is enabled by default and doctor validates cron expressions.
+    "croniter>=2.0.0",
+    # Tool argument validation fails closed when unavailable.
+    "jsonschema>=4.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+anthropic = ["anthropic>=0.50.0"]
+gemini = ["google-genai>=1.0.0"]
+web = [
+    "beautifulsoup4>=4.12.0",
+    "ddgs>=8.0.0",
+]
+vision = ["Pillow>=10.0.0"]
+feishu = ["lark-oapi>=1.7.0"]
+weixin = ["weixin-ilink[qr]>=0.3.5"]
+all = [
+    "anthropic>=0.50.0",
+    "google-genai>=1.0.0",
+    "beautifulsoup4>=4.12.0",
+    "ddgs>=8.0.0",
+    "Pillow>=10.0.0",
+    "lark-oapi>=1.7.0",
+    "weixin-ilink[qr]>=0.3.5",
+]
+
+[project.scripts]
+jkagent-gateway = "gateway.cli:main"
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
+
+# 渐进式静态检查：仅启用"必然是 bug"的规则类，避免对存量代码产生海量告警。
+# F821 未定义名称 / F811 重复定义 / E9x 语法错误 / F63 非法比较 / F7 混淆转义。
+# 后续可逐步收紧（如追加 "F", "B"）。
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82", "F811"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["core", "gateway", "tools", "memory", "skills"]
+
+[tool.setuptools]
+py-modules = ["agent"]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["core*", "gateway*", "memory*", "prompt*", "SKILLS*", "skills*", "tools*"]
+
+[tool.setuptools.package-data]
+prompt = ["*.md"]
+SKILLS = ["*/*.json", "*/*.md", "*/scripts/*", "*/assets/*", "*/reference/**/*"]
+"gateway.webui" = ["static/**/*"]

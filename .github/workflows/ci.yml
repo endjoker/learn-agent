@@ -1,0 +1,62 @@
+name: CI
+
+# 最小可持续门禁：后端 pytest + ruff（运行时错误类检查）+ 前端 vitest/tsc/eslint。
+# 依赖版本锁定见 requirements.lock（由 .venv pip freeze 生成，升级依赖时重新生成）。
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          # 与本地开发/全量验证环境对齐（3.14）；升 Python 时同步此处
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[all]" pytest
+
+      - name: Ruff (runtime-error classes only)
+        run: |
+          pip install ruff
+          ruff check core gateway tools memory skills scripts tests agent.py
+
+      - name: Pytest
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m pytest tests/ -q --import-mode=importlib
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gateway/webui/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.19"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npx tsc -b
+
+      - name: Lint (zero warnings)
+        run: npm run lint --if-present
+
+      - name: Unit tests
+        run: npm run test

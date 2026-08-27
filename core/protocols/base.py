@@ -5,7 +5,12 @@
 定义所有协议适配器的统一接口。
 内部消息格式保持 OpenAI 风格：
     [{"role": "system/user/assistant", "content": "...",
-      "name"?: "tool_result"}]
+      "name"?: "tool_result"},
+     {"role": "assistant", "content": str|None,
+      "tool_calls": [{"id", "type": "function",
+                      "function": {"name", "arguments"}}]},
+     {"role": "tool", "tool_call_id": "...", "name": "...",
+      "content": "..."}]
 
 各适配器负责：
   1. 将内部消息格式翻译为目标协议格式
@@ -14,6 +19,7 @@
 """
 
 from abc import ABC, abstractmethod
+import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -122,6 +128,122 @@ class ProtocolAdapter(ABC):
     # ============================================================
 
     @staticmethod
+    def _parse_json_arguments(raw: Any) -> tuple:
+        """把工具参数原始值解析为 (arguments_dict, raw_str)。
+
+        OpenAI 风格的 ``function.arguments`` 约定为 JSON 字符串；部分服务端
+        会直接返回 dict/对象，这里统一归一为 JSON 字符串再解析。解析失败或
+        结果不是 object 时回退为 ``{"__invalid_raw_arguments__": raw}``，
+        与 openai_adapter 保持同一约定：保留畸形参数交给 Runtime 拒绝，
+        不静默吞成空对象。
+        """
+        if not isinstance(raw, str):
+            raw = json.dumps(raw, ensure_ascii=False) if raw is not None else "{}"
+        raw_arguments = raw or "{}"
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            arguments = None
+        if not isinstance(arguments, dict):
+            arguments = {"__invalid_raw_arguments__": raw_arguments}
+        return arguments, raw_arguments
+
+    @staticmethod
+    def _normalize_tool_roles(messages: List[Dict]) -> List[Dict]:
+        """把 assistant.tool_calls / role:"tool" 展开为中性 content 块。
+
+        内部格式沿用 OpenAI 风格（assistant.tool_calls / role:"tool"），但
+        Anthropic（tool_use / tool_result）与 Gemini（functionCall /
+        functionResponse）的原生 function calling 往返都需要把这些角色翻译
+        成 provider 专属块。这里在消息合并前统一展开为中性块，各适配器再把
+        中性块映射到目标协议：
+
+          - assistant 且带 tool_calls → content 变为块列表：原文本（str 或
+            多模态 list）在前，每个 tool call 追加一个
+            {"type": "tool_call", "id", "name", "arguments"} 块；
+          - role == "tool" → 改写为 role "user"，content 为单个
+            {"type": "tool_result", "tool_call_id", "name", "content",
+             "is_error"} 块。连续多条 tool 结果随后由
+            _merge_consecutive_same_role 合并为同一条 user 消息——恰好满足
+            Anthropic「tool_result 必须紧随对应 assistant 轮且可批量回传」
+            与 Gemini「functionResponse 与 user 同 role」的形状要求。
+
+        健壮性：content 为 None（agent 在纯工具轮会写入 None）、缺失字段、
+        arguments 非字符串等均兜底处理，不抛异常。
+        """
+        normalized: List[Dict] = []
+        for msg in messages:
+            role = msg.get("role")
+            tool_calls = msg.get("tool_calls")
+            if role == "assistant" and tool_calls:
+                content = msg.get("content")
+                blocks: List[Dict] = []
+                if isinstance(content, str):
+                    if content.strip():
+                        blocks.append({"type": "text", "text": content})
+                elif isinstance(content, list):
+                    blocks.extend(b for b in content if isinstance(b, dict))
+                for tc in tool_calls or []:
+                    fn = tc.get("function") if isinstance(tc, dict) else None
+                    if not isinstance(fn, dict):
+                        continue
+                    arguments, raw_arguments = ProtocolAdapter._parse_json_arguments(
+                        fn.get("arguments"))
+                    blocks.append({
+                        "type": "tool_call",
+                        "id": str(tc.get("id") or ""),
+                        "name": str(fn.get("name") or ""),
+                        "arguments": arguments,
+                    })
+                new_msg = {k: v for k, v in msg.items() if k != "tool_calls"}
+                new_msg["content"] = blocks
+                normalized.append(new_msg)
+            elif role == "tool":
+                content = msg.get("content")
+                if not isinstance(content, str):
+                    # None / 多模态 list 等统一序列化为文本，避免下游崩溃。
+                    content = ("" if content is None
+                               else json.dumps(content, ensure_ascii=False))
+                normalized.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_call_id": str(msg.get("tool_call_id") or ""),
+                        "name": str(msg.get("name") or ""),
+                        "content": content,
+                        "is_error": bool(msg.get("is_error")),
+                    }],
+                })
+            else:
+                normalized.append(dict(msg))
+        return normalized
+
+    @staticmethod
+    def _openai_function_defs(tools: Optional[List[Dict]]) -> List[Dict]:
+        """provider tools 参数 → 中性 (name/description/parameters) 定义列表。
+
+        工具注册表下发的形状是 OpenAI 格式
+        ``{"type": "function", "function": {...}}``；兼容直接给扁平定义
+        ``{"name", ...}`` 的第三方调用方。
+        """
+        defs: List[Dict] = []
+        for tool in tools or []:
+            if not isinstance(tool, dict):
+                continue
+            fn = tool.get("function")
+            if not isinstance(fn, dict):
+                fn = tool if tool.get("name") else None
+            if not isinstance(fn, dict) or not fn.get("name"):
+                continue
+            params = fn.get("parameters")
+            defs.append({
+                "name": str(fn["name"]),
+                "description": str(fn.get("description") or ""),
+                "parameters": params if isinstance(params, dict) else {},
+            })
+        return defs
+
+    @staticmethod
     def _split_system_messages(messages: List[Dict]) -> tuple:
         """
         从消息列表中提取 system 消息，返回 (system_text, non_system_messages)。
@@ -183,7 +305,10 @@ class ProtocolAdapter(ABC):
 
         for msg in messages:
             role = msg.get("role", "user")
-            content = msg.get("content", "")
+            content = msg.get("content")
+            if content is None:
+                # 纯工具轮的 assistant 消息 content 为 None，兜底为空串。
+                content = ""
             name = msg.get("name", "")
 
             # 添加标记（str 直接加前缀；多模态 list 在最前面插入文本块）

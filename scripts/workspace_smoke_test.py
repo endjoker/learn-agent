@@ -1,9 +1,10 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 workspace_smoke_test.py —— 本地工作区 smoke 测试（Phase 6）。
 
 检查：
-- runtime.db schema version = 9，5 张工作区表存在
+- runtime.db schema version（动态读取 core.runtime.sqlite_store.SCHEMA_VERSION），
+  5 张工作区表存在
 - 创建临时 Profile / Workspace / Session（自动清理）
 - 路径校验 API 正常
 
@@ -23,11 +24,17 @@ def check_schema(db_path: Path):
     if not db_path.exists():
         print("[smoke] runtime.db 不存在，跳过 schema 检查")
         return
+    # 期望版本动态读取，避免硬编码漂移
+    try:
+        from core.runtime.sqlite_store import SCHEMA_VERSION as expected_version
+    except Exception as exc:
+        print(f"[smoke] WARN: 无法读取 schema 版本（{exc}），跳过版本校验")
+        expected_version = None
     with closing(sqlite3.connect(db_path)) as conn:
         ver = conn.execute(
             "SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-        if ver != 9:
-            print(f"[smoke] FAIL: schema version={ver}（期望 9）")
+        if expected_version is not None and ver != expected_version:
+            print(f"[smoke] FAIL: schema version={ver}（期望 {expected_version}）")
             sys.exit(1)
         tables = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}

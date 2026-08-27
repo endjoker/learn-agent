@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/ui/favicon.svg" />
+    <title>JKagent 控制台</title>
+    <script>
+      (() => {
+        try {
+          document.documentElement.dataset.theme =
+            localStorage.getItem("jkagent.theme") === "dark" ? "dark" : "light";
+        } catch {
+          document.documentElement.dataset.theme = "light";
+        }
+      })();
+    </script>
+    <link rel="stylesheet" href="./style.css" />
+    <link rel="stylesheet" href="./workspace.css" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="toast-root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
